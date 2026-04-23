@@ -1,207 +1,155 @@
-"""Classifier tests. No DB required — pure logic.
+"""Slate type classifier.
 
-Run with: pytest backend/tests/test_slate_classifier.py -v
+Tennis DFS on DraftKings comes in a few flavors. We want Classic by default
+(full-day ATP/WTA main draw), fall back to Showdown when no Classic exists
+(Grand Slam finals days, isolated single-match events), and reject everything
+else (Tiers, Pick'Em, various promo formats).
+
+Detection strategy, in order of confidence:
+  1. Keyword match on DK's contest_type / slate_label
+  2. Structural check: roster_position set (CPT/FLEX present = Showdown)
+  3. Default: Classic, unless contradicted by the above
+
+We explicitly do NOT use game-count heuristics (e.g. "NBA Classic has 4+
+games") because rain-delayed or schedule-oddity days produce legitimate
+Classics with fewer games, and we'd misclassify them.
 """
-from datetime import datetime
+from __future__ import annotations
+
+import logging
+from enum import Enum
+from typing import Iterable
 
 from app.models import DKDraftable, DKDraftGroup
-from app.services.slate_classifier import (
-    SlateType,
-    classify_slate,
-    pick_slates_to_ingest,
-)
+
+logger = logging.getLogger(__name__)
 
 
-# ── Fixture builders ─────────────────────────────────────────────────
-
-def _dg(
-    dgid: int = 1,
-    contest_type: str = "Classic",
-    slate_label: str | None = None,
-    sport: str = "tennis",
-) -> DKDraftGroup:
-    return DKDraftGroup(
-        draft_group_id=dgid,
-        sport=sport,
-        contest_type=contest_type,
-        slate_label=slate_label,
-        salary_cap=50000,
-        lock_time=datetime(2026, 4, 23, 16, 0, 0),
-    )
+class SlateType(str, Enum):
+    CLASSIC = "classic"
+    SHOWDOWN = "showdown"
+    OTHER = "other"
 
 
-def _draftable(pos: str = "P", pid: int = 100, name: str = "Test Player") -> DKDraftable:
-    return DKDraftable(
-        dk_player_id=pid,
-        display_name=name,
-        salary=8000,
-        roster_position=pos,
-        competition_id=1,
-        competition_name="A vs B",
-    )
+# Keywords that indicate a NON-Classic slate. Match case-insensitively
+# against the combined contest_type + slate_label string.
+_SHOWDOWN_KEYWORDS = frozenset([
+    "showdown",
+    "single game",
+    "single-game",
+    "singlegame",
+    "captain mode",
+    "captain",
+    "cpt mode",
+])
+
+_OTHER_KEYWORDS = frozenset([
+    "tiers",
+    "pick",       # pick'em, pick6, pickem
+    "pick6",
+    "pick'em",
+    "satellite",
+    "qualifier",
+    "express",
+    "turbo",
+    "afternoon",
+    "primetime",
+    "madness",    # promotional formats
+    "best ball",
+    # Reduced-game variants. DK tennis uses contest_type='Classic' for both
+    # the main slate AND the reduced-game variants — the differentiator is
+    # slate_label (e.g. "(TEN Short Slate)"). These are filtered via label.
+    "short slate",
+    "short",
+])
 
 
-def _classic_draftables() -> list[DKDraftable]:
-    """Standard tennis Classic: all roster_position='P'."""
-    return [_draftable(pos="P", pid=i, name=f"P{i}") for i in range(1, 5)]
+def _contains_any(text: str, keywords: Iterable[str]) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in keywords)
 
 
-def _showdown_draftables() -> list[DKDraftable]:
-    """Showdown: each player appears with CPT and FLEX roster positions."""
-    out = []
-    for i in range(1, 4):
-        out.append(_draftable(pos="CPT", pid=i, name=f"P{i}"))
-        out.append(_draftable(pos="FLEX", pid=i + 100, name=f"P{i}"))
-    return out
+def classify_slate(
+    draft_group: DKDraftGroup,
+    draftables: list[DKDraftable],
+) -> SlateType:
+    """Classify a DK draft group.
+
+    Returns SlateType.CLASSIC for standard full-field main slates.
+    Returns SlateType.SHOWDOWN for single-game / captain-mode slates.
+    Returns SlateType.OTHER for Tiers / Pick'Em / Express / promotional formats.
+    """
+    contest_type = (draft_group.contest_type or "").strip()
+    slate_label = (draft_group.slate_label or "").strip()
+    combined = f"{contest_type} {slate_label}".strip()
+
+    # ── Layer 1: explicit "other" formats ─────────────────────────
+    # These are rejected outright — user never wants them in the DB.
+    if _contains_any(combined, _OTHER_KEYWORDS):
+        logger.info(
+            "Classified as OTHER (keyword match): dgid=%d contest_type=%r label=%r",
+            draft_group.draft_group_id,
+            contest_type,
+            slate_label,
+        )
+        return SlateType.OTHER
+
+    # ── Layer 2: explicit "showdown" keywords ──────────────────────
+    if _contains_any(combined, _SHOWDOWN_KEYWORDS):
+        return SlateType.SHOWDOWN
+
+    # ── Layer 3: structural — roster positions ────────────────────
+    # Showdown slates have CPT (captain) and FLEX positions. Classic has
+    # a single position per sport (tennis: "P"; NBA: "G"/"F"/"C"/etc.).
+    # Tennis Classic typically uses "P" for all players.
+    positions = {d.roster_position for d in draftables if d.roster_position}
+    if {"CPT", "FLEX"}.issubset(positions) or "CPT" in positions:
+        return SlateType.SHOWDOWN
+
+    # ── Layer 4: default to Classic ──────────────────────────────
+    # If nothing above triggered, it's a standard full-field slate.
+    return SlateType.CLASSIC
 
 
-# ── classify_slate tests ────────────────────────────────────────────
+def pick_slates_to_ingest(
+    classified: list[tuple[DKDraftGroup, list[DKDraftable], SlateType]],
+    allowed_types: set[SlateType],
+    fallback_to_showdown: bool = True,
+) -> list[tuple[DKDraftGroup, list[DKDraftable], SlateType, bool]]:
+    """Given all draft groups for a sport and their classifications, decide
+    which ones to actually ingest.
 
-def test_classic_basic():
-    """Standard tennis Classic → CLASSIC."""
-    assert classify_slate(_dg(contest_type="Classic"), _classic_draftables()) == SlateType.CLASSIC
+    Returns a list of (draft_group, draftables, slate_type, is_fallback) tuples.
 
+    Rules:
+      - Ingest all slates matching allowed_types
+      - If no Classic exists AND fallback_to_showdown AND Showdown exists:
+          ingest the Showdown(s) with is_fallback=True
+      - OTHER is never ingested
+    """
+    results: list[tuple] = []
 
-def test_classic_by_structure_only():
-    """No keyword match, roster=P only → CLASSIC (the default)."""
-    assert classify_slate(_dg(contest_type=""), _classic_draftables()) == SlateType.CLASSIC
+    # Classic-first path: if any Classic exists and CLASSIC is allowed, ingest them
+    classics = [(dg, d, t) for dg, d, t in classified if t == SlateType.CLASSIC]
+    if classics and SlateType.CLASSIC in allowed_types:
+        for dg, d, t in classics:
+            results.append((dg, d, t, False))
 
+    # Showdown path:
+    #   - If SHOWDOWN is explicitly allowed, ingest all showdowns
+    #   - OR if no Classic was ingested and fallback_to_showdown is on, ingest as fallback
+    showdowns = [(dg, d, t) for dg, d, t in classified if t == SlateType.SHOWDOWN]
+    if showdowns:
+        if SlateType.SHOWDOWN in allowed_types:
+            for dg, d, t in showdowns:
+                results.append((dg, d, t, False))
+        elif not classics and fallback_to_showdown:
+            for dg, d, t in showdowns:
+                results.append((dg, d, t, True))
+                logger.warning(
+                    "Ingesting Showdown as fallback (no Classic today): dgid=%d",
+                    dg.draft_group_id,
+                )
 
-def test_showdown_by_keyword():
-    """contest_type='Showdown' → SHOWDOWN regardless of roster."""
-    assert classify_slate(_dg(contest_type="Showdown"), _classic_draftables()) == SlateType.SHOWDOWN
-
-
-def test_showdown_by_label():
-    """Keyword in slate_label → SHOWDOWN."""
-    assert classify_slate(
-        _dg(contest_type="Classic", slate_label="Single Game"),
-        _classic_draftables(),
-    ) == SlateType.SHOWDOWN
-
-
-def test_showdown_by_roster_positions():
-    """CPT/FLEX roster positions → SHOWDOWN, even without keyword match."""
-    assert classify_slate(_dg(contest_type=""), _showdown_draftables()) == SlateType.SHOWDOWN
-
-
-def test_captain_mode_keyword():
-    """'Captain Mode' → SHOWDOWN."""
-    assert classify_slate(
-        _dg(contest_type="Captain Mode"), _classic_draftables()
-    ) == SlateType.SHOWDOWN
-
-
-def test_tiers_is_other():
-    """Tiers → OTHER."""
-    assert classify_slate(_dg(contest_type="Tiers"), _classic_draftables()) == SlateType.OTHER
-
-
-def test_pickem_is_other():
-    """Pick'Em → OTHER."""
-    assert classify_slate(
-        _dg(contest_type="Pick'Em"), _classic_draftables()
-    ) == SlateType.OTHER
-
-
-def test_express_is_other():
-    """Express → OTHER."""
-    assert classify_slate(_dg(contest_type="Express"), _classic_draftables()) == SlateType.OTHER
-
-
-def test_turbo_is_other():
-    """Turbo → OTHER."""
-    assert classify_slate(_dg(slate_label="Turbo"), _classic_draftables()) == SlateType.OTHER
-
-
-def test_other_takes_precedence_over_showdown():
-    """A slate that's both Tiers AND showdown should classify as OTHER
-    (we reject all non-standard formats before showdown check)."""
-    assert classify_slate(
-        _dg(contest_type="Tiers Showdown"), _showdown_draftables()
-    ) == SlateType.OTHER
-
-
-# ── pick_slates_to_ingest tests ─────────────────────────────────────
-
-def test_pick_ingests_classic_only_by_default():
-    """Classic + Showdown → ingest Classic only, skip Showdown."""
-    classic = (_dg(dgid=1), _classic_draftables(), SlateType.CLASSIC)
-    showdown = (_dg(dgid=2, contest_type="Showdown"), _showdown_draftables(), SlateType.SHOWDOWN)
-    result = pick_slates_to_ingest(
-        [classic, showdown],
-        allowed_types={SlateType.CLASSIC},
-        fallback_to_showdown=True,
-    )
-    assert len(result) == 1
-    assert result[0][0].draft_group_id == 1
-    assert result[0][2] == SlateType.CLASSIC
-    assert result[0][3] is False  # not a fallback
-
-
-def test_pick_falls_back_to_showdown_when_no_classic():
-    """No Classic + Showdown exists + fallback on → ingest Showdown as fallback."""
-    showdown = (_dg(dgid=2, contest_type="Showdown"), _showdown_draftables(), SlateType.SHOWDOWN)
-    result = pick_slates_to_ingest(
-        [showdown],
-        allowed_types={SlateType.CLASSIC},
-        fallback_to_showdown=True,
-    )
-    assert len(result) == 1
-    assert result[0][0].draft_group_id == 2
-    assert result[0][2] == SlateType.SHOWDOWN
-    assert result[0][3] is True  # is_fallback = True
-
-
-def test_pick_skips_showdown_when_fallback_disabled():
-    """No Classic + Showdown exists + fallback OFF → ingest nothing."""
-    showdown = (_dg(dgid=2, contest_type="Showdown"), _showdown_draftables(), SlateType.SHOWDOWN)
-    result = pick_slates_to_ingest(
-        [showdown],
-        allowed_types={SlateType.CLASSIC},
-        fallback_to_showdown=False,
-    )
-    assert result == []
-
-
-def test_pick_ingests_both_when_allowed():
-    """Classic + Showdown, both in allowed_types → ingest both, neither is fallback."""
-    classic = (_dg(dgid=1), _classic_draftables(), SlateType.CLASSIC)
-    showdown = (_dg(dgid=2, contest_type="Showdown"), _showdown_draftables(), SlateType.SHOWDOWN)
-    result = pick_slates_to_ingest(
-        [classic, showdown],
-        allowed_types={SlateType.CLASSIC, SlateType.SHOWDOWN},
-        fallback_to_showdown=True,
-    )
-    assert len(result) == 2
-    # Neither is fallback — both were explicitly allowed
-    assert all(r[3] is False for r in result)
-
-
-def test_pick_skips_other_always():
-    """Tiers/PickEm slates never ingest, even if OTHER is somehow 'allowed'."""
-    tiers = (_dg(dgid=3, contest_type="Tiers"), _classic_draftables(), SlateType.OTHER)
-    result = pick_slates_to_ingest(
-        [tiers],
-        allowed_types={SlateType.CLASSIC, SlateType.SHOWDOWN},
-        fallback_to_showdown=True,
-    )
-    # OTHER is excluded from pick_slates_to_ingest regardless of allowed set
-    assert result == []
-
-
-def test_pick_multiple_classics_all_ingest():
-    """Early Classic + Main Classic both in same day → ingest both."""
-    early = (_dg(dgid=1, slate_label="Early"), _classic_draftables(), SlateType.CLASSIC)
-    main = (_dg(dgid=2, slate_label="Main"), _classic_draftables(), SlateType.CLASSIC)
-    result = pick_slates_to_ingest(
-        [early, main],
-        allowed_types={SlateType.CLASSIC},
-        fallback_to_showdown=True,
-    )
-    assert len(result) == 2
-
-
-def test_empty_input():
-    """No draft groups at all → nothing to ingest."""
-    assert pick_slates_to_ingest([], {SlateType.CLASSIC}, True) == []
+    # OTHER slates never get ingested
+    return results
