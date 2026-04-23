@@ -114,6 +114,47 @@ def test_turbo_is_other():
     assert classify_slate(_dg(slate_label="Turbo"), _classic_draftables()) == SlateType.OTHER
 
 
+# ── Real-world regression tests from production DK data ────────────
+# These come from actual DK tennis slate metadata observed on 2026-04-24.
+# DK uses contest_type='Classic' for BOTH the main slate and the Short
+# Slate — the only distinguishing field is slate_label. Our classifier
+# must reject Short via label matching.
+
+def test_real_world_short_slate_pattern():
+    """DK tennis: contest_type='Classic', slate_label='(TEN Short Slate)' → OTHER.
+
+    This is the exact pattern from production. Both the main Classic and the
+    Short Slate report contest_type='Classic'; the differentiator is label.
+    Without this rule the Short slate leaks through every ingestion cycle.
+    """
+    assert classify_slate(
+        _dg(contest_type="Classic", slate_label="(TEN Short Slate)"),
+        _classic_draftables(),
+    ) == SlateType.OTHER
+
+
+def test_real_world_featured_is_classic():
+    """DK tennis: contest_type='Classic', slate_label='Featured' → CLASSIC.
+
+    'Featured' is DK's branding for the main Classic — not a promotional
+    format, not a reduced-game variant. Must NOT be filtered.
+    """
+    assert classify_slate(
+        _dg(contest_type="Classic", slate_label="Featured"),
+        _classic_draftables(),
+    ) == SlateType.CLASSIC
+
+
+def test_short_keyword_case_insensitive():
+    """Upper/lower/mixed case 'Short' all → OTHER."""
+    assert classify_slate(
+        _dg(slate_label="SHORT SLATE"), _classic_draftables()
+    ) == SlateType.OTHER
+    assert classify_slate(
+        _dg(slate_label="short slate"), _classic_draftables()
+    ) == SlateType.OTHER
+
+
 def test_other_takes_precedence_over_showdown():
     """A slate that's both Tiers AND showdown should classify as OTHER
     (we reject all non-standard formats before showdown check)."""
