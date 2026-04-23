@@ -1,0 +1,538 @@
+{
+  "date": "2026-04-18",
+  "matches": [
+    {
+      "player_a": "Andrey Rublev",
+      "player_b": "Hamad Medjedovic",
+      "start_time": "04/18/2026 07:30AM",
+      "tournament": "ATP Barcelona",
+      "odds": {
+        "ml_a": -175,
+        "ml_b": 137,
+        "set_a_20": 150,
+        "set_a_21": 275,
+        "set_b_20": 333,
+        "set_b_21": 375,
+        "gw_a_line": 12.5,
+        "gw_a_over": -138,
+        "gw_b_line": 12.5,
+        "gw_b_over": 100,
+        "brk_a_line": 2.5,
+        "brk_a_over": -150,
+        "brk_b_line": 2.5,
+        "brk_b_over": 125,
+        "ace_a_5plus": 120,
+        "ace_a_10plus": 1400,
+        "ace_b_5plus": -200,
+        "ace_b_10plus": 400,
+        "df_a_2plus": -250,
+        "df_a_3plus": 110,
+        "df_b_2plus": -300,
+        "df_b_3plus": -120
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Alexander Zverev",
+      "player_b": "Flavio Cobolli",
+      "start_time": "04/18/2026 07:30AM",
+      "tournament": "ATP Munich",
+      "odds": {
+        "ml_a": -600,
+        "ml_b": 400,
+        "set_a_20": -163,
+        "set_a_21": 250,
+        "set_b_20": 900,
+        "set_b_21": 700,
+        "gw_a_line": 12.5,
+        "gw_a_over": -138,
+        "gw_b_line": 9.5,
+        "gw_b_over": -110,
+        "brk_a_line": 3.5,
+        "brk_a_over": 162,
+        "brk_b_line": 1.5,
+        "brk_b_over": 125,
+        "ace_a_5plus": -138,
+        "ace_a_10plus": 800,
+        "ace_b_5plus": 450,
+        "ace_b_10plus": 2500,
+        "df_a_2plus": -150,
+        "df_a_3plus": 150,
+        "df_b_2plus": -700,
+        "df_b_3plus": -300
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Elina Svitolina",
+      "player_b": "Karolina Muchova",
+      "start_time": "04/18/2026 08:00AM",
+      "tournament": "WTA Stuttgart",
+      "odds": {
+        "ml_a": -125,
+        "ml_b": 100,
+        "set_a_20": 175,
+        "set_a_21": 333,
+        "set_b_20": 240,
+        "set_b_21": 350,
+        "gw_a_line": 12.5,
+        "gw_a_over": 110,
+        "gw_b_line": 12.5,
+        "gw_b_over": 120,
+        "brk_a_line": 3.5,
+        "brk_a_over": -150,
+        "brk_b_line": 3.5,
+        "brk_b_over": -138,
+        "ace_a_5plus": -200,
+        "ace_a_10plus": 400,
+        "ace_b_5plus": 125,
+        "ace_b_10plus": 1400,
+        "df_a_2plus": -1200,
+        "df_a_3plus": -400,
+        "df_b_2plus": -200,
+        "df_b_3plus": 150
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Ben Shelton",
+      "player_b": "Alex Molcan",
+      "start_time": "04/18/2026 09:00AM",
+      "tournament": "ATP Munich",
+      "odds": {
+        "ml_a": -250,
+        "ml_b": 200,
+        "set_a_20": 120,
+        "set_a_21": 240,
+        "set_b_20": 450,
+        "set_b_21": 400,
+        "gw_a_line": 12.5,
+        "gw_a_over": -175,
+        "gw_b_line": 12.5,
+        "gw_b_over": 110,
+        "brk_a_line": 2.5,
+        "brk_a_over": 100,
+        "brk_b_line": 1.5,
+        "brk_b_over": -110,
+        "ace_a_5plus": -400,
+        "ace_a_10plus": 200,
+        "ace_b_5plus": 275,
+        "ace_b_10plus": 2500,
+        "df_a_2plus": -500,
+        "df_a_3plus": -175,
+        "df_b_2plus": 110,
+        "df_b_3plus": 400
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Marta Kostyuk",
+      "player_b": "Tatjana Maria",
+      "start_time": "04/18/2026 09:30AM",
+      "tournament": "WTA Rouen",
+      "odds": {
+        "ml_a": -1400,
+        "ml_b": 800,
+        "set_a_20": -350,
+        "set_a_21": 350,
+        "set_b_20": 1800,
+        "set_b_21": 1400,
+        "gw_a_line": 12.5,
+        "gw_a_over": 160,
+        "gw_b_line": 6.5,
+        "gw_b_over": 105,
+        "brk_a_line": 5.5,
+        "brk_a_over": 110,
+        "brk_b_line": 2.5,
+        "brk_b_over": 125,
+        "ace_a_5plus": 400,
+        "ace_a_10plus": 2500,
+        "ace_b_5plus": 400,
+        "ace_b_10plus": 2500,
+        "df_a_2plus": -500,
+        "df_a_3plus": -200,
+        "df_b_2plus": -300,
+        "df_b_3plus": 100
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Arthur Fils",
+      "player_b": "Rafael Jodar",
+      "start_time": "04/18/2026 10:00AM",
+      "tournament": "ATP Barcelona",
+      "odds": {
+        "ml_a": -163,
+        "ml_b": 130,
+        "set_a_20": 162,
+        "set_a_21": 260,
+        "set_b_20": 300,
+        "set_b_21": 333,
+        "gw_a_line": 12.5,
+        "gw_a_over": -125,
+        "gw_b_line": 12.5,
+        "gw_b_over": 100,
+        "brk_a_line": 3.5,
+        "brk_a_over": 100,
+        "brk_b_line": 2.5,
+        "brk_b_over": -150,
+        "ace_a_5plus": 400,
+        "ace_a_10plus": 2000,
+        "ace_b_5plus": 150,
+        "ace_b_10plus": 1800,
+        "df_a_2plus": -250,
+        "df_a_3plus": 110,
+        "df_b_2plus": -163,
+        "df_b_3plus": 150
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Elena Rybakina",
+      "player_b": "Mirra Andreeva",
+      "start_time": "04/18/2026 10:00AM",
+      "tournament": "WTA Stuttgart",
+      "odds": {
+        "ml_a": -150,
+        "ml_b": 120,
+        "set_a_20": 162,
+        "set_a_21": 275,
+        "set_b_20": 300,
+        "set_b_21": 350,
+        "gw_a_line": 12.5,
+        "gw_a_over": -120,
+        "gw_b_line": 12.5,
+        "gw_b_over": 120,
+        "brk_a_line": 3.5,
+        "brk_a_over": -150,
+        "brk_b_line": 3.5,
+        "brk_b_over": 100,
+        "ace_a_5plus": -500,
+        "ace_a_10plus": 150,
+        "ace_b_5plus": -138,
+        "ace_b_10plus": 700,
+        "df_a_2plus": -700,
+        "df_a_3plus": -250,
+        "df_b_2plus": -2000,
+        "df_b_3plus": -600
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Sorana Cirstea",
+      "player_b": "Veronika Podrez",
+      "start_time": "04/18/2026 10:40AM",
+      "tournament": "WTA Rouen",
+      "odds": {
+        "ml_a": -700,
+        "ml_b": 450,
+        "set_a_20": -225,
+        "set_a_21": 300,
+        "set_b_20": 1200,
+        "set_b_21": 900,
+        "gw_a_line": 12.5,
+        "gw_a_over": 110,
+        "gw_b_line": 7.5,
+        "gw_b_over": -115,
+        "brk_a_line": 4.5,
+        "brk_a_over": -138,
+        "brk_b_line": 2.5,
+        "brk_b_over": 110,
+        "ace_a_5plus": 333,
+        "ace_a_10plus": 2500,
+        "ace_b_5plus": 333,
+        "ace_b_10plus": 2500,
+        "df_a_2plus": -110,
+        "df_a_3plus": 250,
+        "df_b_2plus": -15000,
+        "df_b_3plus": -3300
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Petra Marcinko",
+      "player_b": "Sinja Kraus",
+      "start_time": "04/18/2026 06:00AM",
+      "tournament": "WTA ITF",
+      "odds": {
+        "ml_a": -150,
+        "ml_b": 120,
+        "set_a_20": 150,
+        "set_a_21": 275,
+        "set_b_20": 333,
+        "set_b_21": 400,
+        "gw_a_line": 10.5,
+        "gw_a_over": -120,
+        "gw_b_line": 9.5,
+        "gw_b_over": -120,
+        "brk_a_line": 4.5,
+        "brk_a_over": -120,
+        "brk_b_line": 4.5,
+        "brk_b_over": -120,
+        "ace_a_5plus": 200,
+        "ace_a_10plus": 1500,
+        "ace_b_5plus": 200,
+        "ace_b_10plus": 1500,
+        "df_a_2plus": -200,
+        "df_a_3plus": 150,
+        "df_b_2plus": -200,
+        "df_b_3plus": 150
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    },
+    {
+      "player_a": "Maja Chwalinska",
+      "player_b": "Robin Montgomery",
+      "start_time": "04/18/2026 06:00AM",
+      "tournament": "WTA ITF",
+      "odds": {
+        "ml_a": -150,
+        "ml_b": 120,
+        "set_a_20": 150,
+        "set_a_21": 275,
+        "set_b_20": 333,
+        "set_b_21": 400,
+        "gw_a_line": 10.5,
+        "gw_a_over": -120,
+        "gw_b_line": 9.5,
+        "gw_b_over": -120,
+        "brk_a_line": 5,
+        "brk_a_over": -120,
+        "brk_b_line": 4.5,
+        "brk_b_over": -120,
+        "ace_a_5plus": 200,
+        "ace_a_10plus": 1500,
+        "ace_b_5plus": 200,
+        "ace_b_10plus": 1500,
+        "df_a_2plus": -200,
+        "df_a_3plus": 150,
+        "df_b_2plus": -200,
+        "df_b_3plus": 150
+      },
+      "adj_a": 0,
+      "adj_b": 0
+    }
+  ],
+  "dk_players": [
+    {
+      "name": "Marta Kostyuk",
+      "id": 42680566,
+      "salary": 10700,
+      "avg_ppg": 58.48
+    },
+    {
+      "name": "Sorana Cirstea",
+      "id": 42680567,
+      "salary": 10100,
+      "avg_ppg": 62.86
+    },
+    {
+      "name": "Alexander Zverev",
+      "id": 42680568,
+      "salary": 9900,
+      "avg_ppg": 64.14
+    },
+    {
+      "name": "Ben Shelton",
+      "id": 42680569,
+      "salary": 9000,
+      "avg_ppg": 58.46
+    },
+    {
+      "name": "Andrey Rublev",
+      "id": 42680570,
+      "salary": 8400,
+      "avg_ppg": 56.26
+    },
+    {
+      "name": "Arthur Fils",
+      "id": 42680571,
+      "salary": 8200,
+      "avg_ppg": 57.16
+    },
+    {
+      "name": "Elena Rybakina",
+      "id": 42680572,
+      "salary": 8100,
+      "avg_ppg": 66.35
+    },
+    {
+      "name": "Elina Svitolina",
+      "id": 42680573,
+      "salary": 7700,
+      "avg_ppg": 61.95
+    },
+    {
+      "name": "Karolina Muchova",
+      "id": 42680574,
+      "salary": 7300,
+      "avg_ppg": 62.53
+    },
+    {
+      "name": "Mirra Andreeva",
+      "id": 42680575,
+      "salary": 7000,
+      "avg_ppg": 62.11
+    },
+    {
+      "name": "Rafael Jodar",
+      "id": 42680576,
+      "salary": 6900,
+      "avg_ppg": 57.61
+    },
+    {
+      "name": "Hamad Medjedovic",
+      "id": 42680577,
+      "salary": 6700,
+      "avg_ppg": 54.79
+    },
+    {
+      "name": "Alex Molcan",
+      "id": 42680578,
+      "salary": 6100,
+      "avg_ppg": 54.99
+    },
+    {
+      "name": "Flavio Cobolli",
+      "id": 42680579,
+      "salary": 5200,
+      "avg_ppg": 48.06
+    },
+    {
+      "name": "Veronika Podrez",
+      "id": 42680580,
+      "salary": 4900,
+      "avg_ppg": 70.82
+    },
+    {
+      "name": "Tatjana Maria",
+      "id": 42680581,
+      "salary": 4400,
+      "avg_ppg": 39.56
+    },
+    {
+      "name": "Petra Marcinko",
+      "id": 0,
+      "salary": 0,
+      "avg_ppg": 0
+    },
+    {
+      "name": "Sinja Kraus",
+      "id": 0,
+      "salary": 0,
+      "avg_ppg": 0
+    },
+    {
+      "name": "Maja Chwalinska",
+      "id": 0,
+      "salary": 0,
+      "avg_ppg": 0
+    },
+    {
+      "name": "Robin Montgomery",
+      "id": 0,
+      "salary": 0,
+      "avg_ppg": 0
+    }
+  ],
+  "pp_lines": [
+    {
+      "player": "Andrey Rublev",
+      "stat": "Fantasy Score",
+      "line": 17
+    },
+    {
+      "player": "Alexander Zverev",
+      "stat": "Fantasy Score",
+      "line": 21.5
+    },
+    {
+      "player": "Elina Svitolina",
+      "stat": "Fantasy Score",
+      "line": 13.5
+    },
+    {
+      "player": "Ben Shelton",
+      "stat": "Fantasy Score",
+      "line": 19.5
+    },
+    {
+      "player": "Marta Kostyuk",
+      "stat": "Fantasy Score",
+      "line": 22
+    },
+    {
+      "player": "Arthur Fils",
+      "stat": "Fantasy Score",
+      "line": 15.5
+    },
+    {
+      "player": "Sorana Cirstea",
+      "stat": "Fantasy Score",
+      "line": 22.5
+    },
+    {
+      "player": "Elena Rybakina",
+      "stat": "Fantasy Score",
+      "line": 15
+    },
+    {
+      "player": "Petra Marcinko",
+      "stat": "Breaks",
+      "line": 4.5,
+      "mult": "normal"
+    },
+    {
+      "player": "Maja Chwalinska",
+      "stat": "Breaks",
+      "line": 5,
+      "mult": "normal"
+    },
+    {
+      "player": "Sinja Kraus",
+      "stat": "Breaks",
+      "line": 4.5,
+      "mult": "normal"
+    },
+    {
+      "player": "Andrey Rublev",
+      "stat": "Breaks",
+      "line": 2.5,
+      "mult": "normal"
+    },
+    {
+      "player": "Alexander Zverev",
+      "stat": "Breaks",
+      "line": 3.5,
+      "mult": "demon"
+    },
+    {
+      "player": "Flavio Cobolli",
+      "stat": "Breaks",
+      "line": 1.5,
+      "mult": "demon"
+    },
+    {
+      "player": "Arthur Fils",
+      "stat": "Breaks",
+      "line": 3.5,
+      "mult": "demon"
+    },
+    {
+      "player": "Rafael Jodar",
+      "stat": "Breaks",
+      "line": 2.5,
+      "mult": "normal"
+    }
+  ],
+  "last_updated": "2026-04-18 04:00 AM MT"
+}

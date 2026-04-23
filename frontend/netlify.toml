@@ -1,0 +1,33 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Netlify config for the OverOwned frontend.
+# This file lives at frontend/netlify.toml. In Netlify's UI, set:
+#   Base directory:     frontend
+#   Build command:      npm run build
+#   Publish directory:  dist   (relative to base directory)
+#
+# The [build] block below is a belt-and-suspenders backup — if the UI
+# settings get cleared, this config takes over.
+# ═══════════════════════════════════════════════════════════════════════
+
+[build]
+  # Relative to base (frontend/). After build, Netlify publishes frontend/dist.
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# SPA fallback — send all client-side routes to index.html so React
+# Router / hash-based routing keeps working on deep links and refreshes.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Sensible security headers
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options        = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy        = "strict-origin-when-cross-origin"

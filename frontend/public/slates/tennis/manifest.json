@@ -1,0 +1,35 @@
+{
+  "sport": "tennis",
+  "slates": [
+    {
+      "date": "2026-04-23",
+      "label": "Thu 4/23 \u2014 Mixed ATP/WTA R1",
+      "type": "classic"
+    },
+    {
+      "date": "2026-04-22",
+      "label": "Wed 4/22 \u2014 Mixed ATP/WTA R1",
+      "type": "classic"
+    },
+    {
+      "date": "2026-04-21",
+      "label": "Tue 4/21 \u2014 WTA Madrid R1",
+      "type": "classic"
+    },
+    {
+      "date": "2026-04-19",
+      "label": "Sun 4/19 \u2014 Showdown Finals",
+      "type": "showdown"
+    },
+    {
+      "date": "2026-04-18",
+      "label": "Sat 4/18 \u2014 Classic",
+      "type": "classic"
+    },
+    {
+      "date": "2026-04-17",
+      "label": "Fri 4/17 \u2014 Classic",
+      "type": "classic"
+    }
+  ]
+}
