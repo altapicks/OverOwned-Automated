@@ -100,6 +100,8 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         "dk_draft_group_id": slate["dk_draft_group_id"],
         "first_seen_at": slate["first_seen_at"],
         "last_synced_at": slate["last_synced_at"],
+        "contest_type": slate.get("contest_type") or "classic",
+        "is_fallback": bool(slate.get("is_fallback")),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -116,22 +118,52 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
 
 
 def get_today_slate(sport: str) -> Optional[FrontendSlate]:
-    """Return the most recent active slate for a sport. Used by /api/slates/today."""
+    """Return the most relevant active slate for a sport.
+
+    Preference order:
+      1. Classic slate for today (if any)
+      2. Classic slate for any date (most recent)
+      3. Showdown fallback for today (if is_fallback=true or no Classic at all)
+
+    This mirrors the watcher's classify/fallback logic — if a Classic got
+    ingested today, users see it; if only a Showdown fallback exists, they
+    see that instead. Used by /api/slates/today.
+    """
     db = get_client()
-    rows = (
+
+    # Most recent Classic, active status
+    classic = (
         db.table("slates")
         .select("id")
         .eq("sport", sport)
         .eq("status", "active")
+        .eq("contest_type", "classic")
         .order("slate_date", desc=True)
         .order("first_seen_at", desc=True)
         .limit(1)
         .execute()
         .data
     )
-    if not rows:
-        return None
-    return get_frontend_slate(rows[0]["id"])
+    if classic:
+        return get_frontend_slate(classic[0]["id"])
+
+    # Fall through to Showdown (fallback or otherwise)
+    showdown = (
+        db.table("slates")
+        .select("id")
+        .eq("sport", sport)
+        .eq("status", "active")
+        .eq("contest_type", "showdown")
+        .order("slate_date", desc=True)
+        .order("first_seen_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if showdown:
+        return get_frontend_slate(showdown[0]["id"])
+
+    return None
 
 
 def list_slates(sport: str, limit: int = 30) -> list[dict]:
