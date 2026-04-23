@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     dk_poll_interval_minutes: int = 15
     dk_sports: str = "TEN"
 
+    # Slate filtering
+    dk_slate_types: str = "classic"  # comma list: classic,showdown,other
+    dk_fallback_to_showdown: bool = True  # when no Classic found, ingest Showdown instead
+
     # Discord
     discord_webhook_slates: str = ""
     discord_webhook_errors: str = ""
@@ -39,6 +43,10 @@ class Settings(BaseSettings):
     @property
     def sports_list(self) -> list[str]:
         return [s.strip().upper() for s in self.dk_sports.split(",") if s.strip()]
+
+    @property
+    def slate_types_list(self) -> list[str]:
+        return [t.strip().lower() for t in self.dk_slate_types.split(",") if t.strip()]
 
     @property
     def cors_origins_list(self) -> list[str]:
