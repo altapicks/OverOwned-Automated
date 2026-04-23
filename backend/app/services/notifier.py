@@ -37,15 +37,27 @@ async def notify_new_slate(
     player_count: int,
     match_count: int,
     lock_time: Optional[str],
+    slate_type: str = "classic",
+    is_fallback: bool = False,
 ) -> None:
     """Posted when the watcher detects a newly-published draft group."""
     s = get_settings()
     if not s.discord_webhook_slates:
         return
 
+    if is_fallback:
+        title = f"⚠️  {sport.upper()} Showdown (fallback — no Classic today)"
+        color = 0xF59E0B  # amber
+    elif slate_type == "showdown":
+        title = f"🎯 New {sport.upper()} Showdown slate"
+        color = 0xA55EEA  # purple
+    else:
+        title = f"🎾 New {sport.upper()} Classic slate"
+        color = 0xF5C518  # OverOwned gold
+
     embed = {
-        "title": f"🎾 New {sport.upper()} slate detected",
-        "color": 0xF5C518,  # OverOwned gold
+        "title": title,
+        "color": color,
         "fields": [
             {"name": "Date", "value": slate_date, "inline": True},
             {"name": "Label", "value": slate_label or "—", "inline": True},
