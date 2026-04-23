@@ -29,13 +29,26 @@ async def ingest_draft_group(
     dk_client: DraftKingsClient,
     draft_group: DKDraftGroup,
     sport: str,
+    pre_fetched_draftables: list | None = None,
+    slate_type: str = "classic",
+    is_fallback: bool = False,
 ) -> dict:
     """Pull a draft group's draftables and upsert the whole slate.
 
     Returns a summary dict with counts suitable for ingestion_log.
+
+    Args:
+        pre_fetched_draftables: if provided, skip the DK fetch (the watcher
+            already fetched them for classification). Saves a redundant call.
+        slate_type: 'classic' or 'showdown' — set by the classifier.
+        is_fallback: True when this is a Showdown ingested because no Classic
+            was available for the day.
     """
     t0 = time.perf_counter()
-    draftables, _competitions = await dk_client.get_draftables(draft_group.draft_group_id)
+    if pre_fetched_draftables is not None:
+        draftables = pre_fetched_draftables
+    else:
+        draftables, _competitions = await dk_client.get_draftables(draft_group.draft_group_id)
     if not draftables:
         return {"status": "empty", "players": 0, "matches": 0}
 
@@ -49,9 +62,10 @@ async def ingest_draft_group(
         "dk_draft_group_id": draft_group.draft_group_id,
         "slate_date": slate_date.isoformat(),
         "slate_label": draft_group.slate_label,
-        "contest_type": draft_group.contest_type,
+        "contest_type": slate_type,  # 'classic' | 'showdown' — from classifier
         "salary_cap": draft_group.salary_cap,
         "lock_time": draft_group.lock_time.isoformat() if draft_group.lock_time else None,
+        "is_fallback": is_fallback,
     }
     existing = (
         db.table("slates")
@@ -179,6 +193,8 @@ async def ingest_draft_group(
             player_count=len(canonical_map),
             match_count=len(match_records),
             lock_time=draft_group.lock_time.isoformat() if draft_group.lock_time else None,
+            slate_type=slate_type,
+            is_fallback=is_fallback,
         )
 
     for raw_name, best_guess, score in unmatched_pings[:5]:  # cap to avoid spam
