@@ -1771,6 +1771,106 @@ export default function App() {
   // passed to optimizers. Reset on slate/sport change — new slate means different active players.
   const [lockedPlayers, setLockedPlayers] = useState([]);
   const [excludedPlayers, setExcludedPlayers] = useState([]);
+
+  // Manually-imported sim ownership, keyed per slate. When present, REPLACES
+  // the Monte Carlo sim for every player on the slate (via ss_pool_own
+  // injection into the player objects below). Persists in localStorage so
+  // reloading doesn't lose the import.
+  //
+  // Upload format: DFS CSV with a "My Own" column (column index 11, zero-
+  // based). We match by player Name (column 1). Surname fallback handles
+  // cases where DK has "Tomas Martin Etcheverry" but the import CSV has
+  // "Tomas Etcheverry" — same logic as the PP tab.
+  const [manualOwn, setManualOwn] = useState({});
+  const [manualOwnMeta, setManualOwnMeta] = useState(null);  // { filename, uploadedAt, rows }
+
+  // Load manual ownership for the active slate
+  useEffect(() => {
+    const sid = data?.meta?.id || data?.id || data?.meta?.slate_id;
+    if (!sid) return;
+    try {
+      const raw = localStorage.getItem(`manual_own_${sid}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setManualOwn(parsed.ownership || {});
+        setManualOwnMeta(parsed.meta || null);
+      } else {
+        setManualOwn({});
+        setManualOwnMeta(null);
+      }
+    } catch (e) { console.warn('[manual-own] load failed:', e); }
+  }, [data]);
+
+  // CSV import handler — parses DFS-format CSV, extracts Name + "My Own",
+  // stores per-slate. Returns count of matched rows so the button can show
+  // feedback.
+  const handleImportSimOwn = useCallback((file) => {
+    if (!file) return;
+    const sid = data?.meta?.id || data?.id || data?.meta?.slate_id;
+    if (!sid) { alert('No active slate — cannot import sim own.'); return; }
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const raw = String(evt.target.result).replace(/^\uFEFF/, '');
+        const lines = raw.split(/\r?\n/).filter(Boolean);
+        if (lines.length < 2) throw new Error('CSV is empty or has no data rows.');
+        // RFC4180-ish parser
+        const parseRow = (line) => {
+          const cols = [];
+          let cur = '', inQuotes = false;
+          for (let i = 0; i < line.length; i++) {
+            const c = line[i];
+            if (c === '"') {
+              if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }
+              else inQuotes = !inQuotes;
+            } else if (c === ',' && !inQuotes) { cols.push(cur); cur = ''; }
+            else cur += c;
+          }
+          cols.push(cur);
+          return cols;
+        };
+        const header = parseRow(lines[0]).map(h => h.trim());
+        const nameIdx = header.findIndex(h => h.toLowerCase() === 'name');
+        const ownIdx = header.findIndex(h => h.toLowerCase() === 'my own');
+        if (nameIdx < 0 || ownIdx < 0) {
+          throw new Error('CSV missing required columns "Name" and "My Own".');
+        }
+        const ownership = {};
+        let matched = 0;
+        for (let i = 1; i < lines.length; i++) {
+          const cols = parseRow(lines[i]);
+          if (cols.length <= ownIdx) continue;
+          const name = (cols[nameIdx] || '').trim();
+          const own = parseFloat(cols[ownIdx]);
+          if (!name || isNaN(own)) continue;
+          ownership[name] = own;
+          matched++;
+        }
+        if (matched === 0) throw new Error('No valid rows found in CSV.');
+        const meta = {
+          filename: file.name,
+          uploadedAt: new Date().toISOString(),
+          rows: matched,
+        };
+        setManualOwn(ownership);
+        setManualOwnMeta(meta);
+        localStorage.setItem(`manual_own_${sid}`, JSON.stringify({ ownership, meta }));
+      } catch (err) {
+        alert('Import failed: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
+  }, [data]);
+
+  const handleClearSimOwn = useCallback(() => {
+    const sid = data?.meta?.id || data?.id || data?.meta?.slate_id;
+    if (!sid) return;
+    if (!confirm('Clear imported sim own and return to Monte Carlo?')) return;
+    setManualOwn({});
+    setManualOwnMeta(null);
+    try { localStorage.removeItem(`manual_own_${sid}`); } catch {}
+  }, [data]);
+
   // NBA-only per-slot lock/exclude. Populated when the user clicks lock/exclude
   // while the NBA DK tab is in CPT or FLEX scope. Separate from the "any-slot"
   // sets above so users can e.g. lock SGA as FLEX-only (not CPT) without
@@ -1862,6 +1962,43 @@ export default function App() {
     sport === 'tennis' ? tennisProjections
     : sport === 'mma' ? mmaProjections
     : nbaProjections;
+
+  // Inject manual sim ownership (if imported for this slate) into each
+  // player's ss_pool_own field. The existing ownershipData memo already
+  // respects ss_pool_own as a Monte Carlo override — so simply setting
+  // this field flips every downstream consumer onto imported data without
+  // touching any ownership code path.
+  //
+  // Surname fallback matches the pattern from PrizePicksTab: if the
+  // import CSV has "Tomas Etcheverry" but the DK roster is "Tomas Martin
+  // Etcheverry", we still match via the last word.
+  const rawDkPlayersWithManualOwn = useMemo(() => {
+    if (!rawDkPlayers.length || Object.keys(manualOwn).length === 0) return rawDkPlayers;
+    const normalize = s => String(s || '').toLowerCase().replace(/[.,'’`]/g, '').replace(/\s+/g, ' ').trim();
+    const surname = s => {
+      const parts = normalize(s).split(' ').filter(Boolean);
+      return parts[parts.length - 1] || '';
+    };
+    // Build lookup maps from the import
+    const exact = {};
+    const bySurname = {};
+    Object.entries(manualOwn).forEach(([name, pct]) => {
+      exact[name.trim()] = pct;
+      const sn = surname(name);
+      if (sn) bySurname[sn] = bySurname[sn] === undefined ? pct : null;
+    });
+    const findPct = (playerName) => {
+      if (exact[playerName] != null) return exact[playerName];
+      const sn = surname(playerName);
+      if (sn && bySurname[sn] != null) return bySurname[sn];
+      return null;
+    };
+    return rawDkPlayers.map(p => {
+      const pct = findPct(p.name);
+      if (pct == null) return p;
+      return { ...p, ss_pool_own: pct };
+    });
+  }, [rawDkPlayers, manualOwn]);
   // Apply user projection overrides. For MMA, scale ceiling proportionally so proj:ceil ratio stays sane.
   // Value/cval are recomputed against salary so they reflect the new proj.
   const dkPlayers = useMemo(() => {
@@ -1891,7 +2028,7 @@ export default function App() {
   // projections, which doesn't change when the user privately edits their own
   // projections, so rawDkPlayers is also the semantically correct input.
   const ownershipData = useMemo(() => {
-    if (rawDkPlayers.length === 0) return { overall: {}, cpt: {}, missingPoolOwn: [] };
+    if (rawDkPlayersWithManualOwn.length === 0) return { overall: {}, cpt: {}, missingPoolOwn: [] };
     // v3.25: manual Pool Own replaces the Monte Carlo simOwn. Users paste
     // per-player pool ownership values into the slate JSON at build time.
     // If ANY player on the slate has ss_pool_own, we treat the slate as
@@ -1901,18 +2038,18 @@ export default function App() {
     //     net so the app still functions
     //   - surface missing players via a top banner so the user knows to fix
     //     the slate before going live
-    const anyHasPoolOwn = rawDkPlayers.some(p => typeof p.ss_pool_own === 'number');
+    const anyHasPoolOwn = rawDkPlayersWithManualOwn.some(p => typeof p.ss_pool_own === 'number');
     if (anyHasPoolOwn) {
-      const missing = rawDkPlayers.filter(p => typeof p.ss_pool_own !== 'number').map(p => p.name);
+      const missing = rawDkPlayersWithManualOwn.filter(p => typeof p.ss_pool_own !== 'number').map(p => p.name);
       let simmed = { overall: {}, cpt: {} };
       if (missing.length > 0) {
         // Fallback sim for the players without provided values
-        if (sport === 'tennis') simmed = simulateOwnership(rawDkPlayers);
-        else if (sport === 'mma') simmed = simulateMMAOwnership(rawDkPlayers);
-        else if (sport === 'nba') simmed = simulateNBAOwnership(rawDkPlayers, data?.slate_type || 'showdown');
+        if (sport === 'tennis') simmed = simulateOwnership(rawDkPlayersWithManualOwn);
+        else if (sport === 'mma') simmed = simulateMMAOwnership(rawDkPlayersWithManualOwn);
+        else if (sport === 'nba') simmed = simulateNBAOwnership(rawDkPlayersWithManualOwn, data?.slate_type || 'showdown');
       }
       const overall = {};
-      for (const p of rawDkPlayers) {
+      for (const p of rawDkPlayersWithManualOwn) {
         overall[p.name] = typeof p.ss_pool_own === 'number'
           ? p.ss_pool_own
           : (simmed.overall[p.name] || 0);
@@ -1920,11 +2057,11 @@ export default function App() {
       return { overall, cpt: simmed.cpt || {}, missingPoolOwn: missing };
     }
     // No manual values at all — behave like the original simulation.
-    if (sport === 'tennis') return { ...simulateOwnership(rawDkPlayers), missingPoolOwn: [] };
-    if (sport === 'mma')    return { ...simulateMMAOwnership(rawDkPlayers), missingPoolOwn: [] };
-    if (sport === 'nba')    return { ...simulateNBAOwnership(rawDkPlayers, data?.slate_type || 'showdown'), missingPoolOwn: [] };
+    if (sport === 'tennis') return { ...simulateOwnership(rawDkPlayersWithManualOwn), missingPoolOwn: [] };
+    if (sport === 'mma')    return { ...simulateMMAOwnership(rawDkPlayersWithManualOwn), missingPoolOwn: [] };
+    if (sport === 'nba')    return { ...simulateNBAOwnership(rawDkPlayersWithManualOwn, data?.slate_type || 'showdown'), missingPoolOwn: [] };
     return { overall: {}, cpt: {}, missingPoolOwn: [] };
-  }, [rawDkPlayers, sport, data]);
+  }, [rawDkPlayersWithManualOwn, sport, data]);
   const ownership = ownershipData.overall;
   const cptOwnership = ownershipData.cpt;
   const missingPoolOwn = ownershipData.missingPoolOwn || [];
@@ -2304,7 +2441,7 @@ export default function App() {
       }
     `}</style>
     <div className="cursor-glow" aria-hidden="true" />
-    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} />
+    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} onImportSimOwn={handleImportSimOwn} onClearSimOwn={handleClearSimOwn} manualOwnMeta={manualOwnMeta} />
     {missingPoolOwn.length > 0 && (
       <div style={{
         padding: '10px 24px', background: 'rgba(245, 158, 11, 0.09)',
@@ -2360,8 +2497,22 @@ export default function App() {
   </div>);
 }
 
-function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick }) {
+function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick, onImportSimOwn, onClearSimOwn, manualOwnMeta }) {
   const hasArchive = manifestSlates && manifestSlates.length > 0;
+  const fileInputRef = useRef(null);
+  const hasImport = !!manualOwnMeta;
+  // Human-readable "12m ago" for the pill subtitle
+  const timeAgoLocal = (iso) => {
+    if (!iso) return '';
+    try {
+      const then = new Date(iso).getTime();
+      const diff = Math.round((Date.now() - then) / 1000);
+      if (diff < 60) return `${diff}s ago`;
+      if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+      if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+      return new Date(iso).toLocaleDateString();
+    } catch { return ''; }
+  };
   return (<div className="topbar">
     <div
       className="topbar-brand"
@@ -2380,6 +2531,61 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
       <span>Over<span className="brand-o">O</span>wned</span>
     </div>
     <div className="topbar-right">
+      {/* Sim Own source pill — click to import, click "×" to revert.
+          Tennis-only for now (MMA/NBA still use Monte Carlo). Shows at-a-
+          glance whether ownership is Monte Carlo or imported, and when. */}
+      {onImportSimOwn && sport === 'tennis' && (<>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv"
+          onChange={(e) => {
+            const f = e.target.files && e.target.files[0];
+            if (f) onImportSimOwn(f);
+            e.target.value = '';
+          }}
+          style={{ display: 'none' }}
+        />
+        <div style={{
+          display: 'flex', alignItems: 'stretch',
+          background: hasImport ? 'rgba(245,197,24,0.08)' : 'var(--bg)',
+          border: `1px solid ${hasImport ? 'rgba(245,197,24,0.35)' : 'var(--border-light)'}`,
+          borderRadius: 6, overflow: 'hidden',
+        }}>
+          <button
+            onClick={() => fileInputRef.current && fileInputRef.current.click()}
+            title={hasImport ? `Replace imported sim own (${manualOwnMeta.filename}, ${manualOwnMeta.rows} rows, ${timeAgoLocal(manualOwnMeta.uploadedAt)})` : 'Import sim ownership from CSV'}
+            style={{
+              background: 'transparent', border: 'none',
+              color: hasImport ? '#F5C518' : 'var(--text-muted)',
+              padding: '6px 10px', cursor: 'pointer',
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              fontSize: 11, fontWeight: 600, letterSpacing: '0.03em',
+              textTransform: 'uppercase',
+            }}
+          >
+            {/* Upload arrow icon */}
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 3v14"/><path d="M5 10l7-7 7 7"/><path d="M5 21h14"/>
+            </svg>
+            <span style={{ whiteSpace: 'nowrap' }}>
+              {hasImport ? `Sim own · ${timeAgoLocal(manualOwnMeta.uploadedAt)}` : 'Import sim own'}
+            </span>
+          </button>
+          {hasImport && (
+            <button
+              onClick={onClearSimOwn}
+              title="Clear imported sim own — revert to Monte Carlo"
+              style={{
+                background: 'transparent', border: 'none',
+                borderLeft: '1px solid rgba(245,197,24,0.25)',
+                color: 'var(--text-muted)', padding: '0 8px', cursor: 'pointer',
+                display: 'inline-flex', alignItems: 'center', fontSize: 14,
+              }}
+            >×</button>
+          )}
+        </div>
+      </>)}
       <div style={{ display: 'flex', background: 'var(--bg)', border: '1px solid var(--border-light)', borderRadius: 6, overflow: 'hidden' }}>
         <button onClick={() => onSportChange('tennis')} title="Tennis" aria-label="Tennis" style={{
           background: sport === 'tennis' ? 'var(--primary)' : 'transparent',
@@ -4516,6 +4722,152 @@ function CsvDropZone({ label, hint, onFile, filled, count, countLabel = 'players
 // already wired for the DK tab.
 //
 // Persistence: parsed ownership map saved to localStorage keyed by
+// Animated "waiting for slate" state. Used by the Tracker tab empty state
+// (and eventually by global no-live-slate fallback). Reuses the exact same
+// tennis ball from the splash screen — radial-gradient fill, white curve
+// seam — and the same oo-preserve / oo-shadow-beat keyframes (already in
+// App.jsx at component root) so the motion ties visually to the product's
+// initial load animation.
+//
+// High-end treatment: serif-italic tagline from Instrument Serif, rotating
+// through a few phrases on a slow cycle, with an amber baseline glow under
+// the ball to match the product's gold accent. Transparent bg — inherits
+// whatever surface it's dropped onto.
+function SlateWaiting({ message, sub }) {
+  // Four phrases cycled subtly — gives the empty state life without
+  // hijacking attention. ~5s each, fade in/out via CSS animation.
+  const phrases = useMemo(() => [
+    "Markets are forming",
+    "Courts are quiet",
+    "Next slate on deck",
+    "Holding for first serve",
+  ], []);
+  const [phraseIdx, setPhraseIdx] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setPhraseIdx(i => (i + 1) % phrases.length), 5000);
+    return () => clearInterval(id);
+  }, [phrases.length]);
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', alignItems: 'center',
+      padding: '72px 24px 56px', position: 'relative',
+    }}>
+      <style>{`
+        @keyframes oo-preserve { 0%, 100% { transform: translateY(0) scaleX(1.18) scaleY(0.82); } 10% { transform: translateY(-8px) scaleX(1.04) scaleY(0.96); } 50% { transform: translateY(-58px) scaleX(0.95) scaleY(1.05); } 90% { transform: translateY(-8px) scaleX(1.04) scaleY(0.96); } }
+        @keyframes oo-shadow-beat { 0%, 100% { opacity: 0.65; transform: translateX(-50%) scaleX(1); } 50% { opacity: 0.18; transform: translateX(-50%) scaleX(0.5); } }
+        @keyframes oo-baseline-pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+        @keyframes oo-phrase-fade { 0%, 100% { opacity: 0; } 10%, 90% { opacity: 1; } }
+      `}</style>
+      {/* Baseline amber glow — subtle horizontal line under the ball, pulses
+          with the bounce cadence. Matches the splash's amber baseline tint. */}
+      <div style={{
+        position: 'relative', width: 160, height: 120, marginBottom: 40,
+      }}>
+        <div style={{
+          position: 'absolute', bottom: 14, left: '50%',
+          transform: 'translateX(-50%)',
+          width: 130, height: 2,
+          background: 'linear-gradient(90deg, transparent 0%, rgba(245,197,24,0.35) 50%, transparent 100%)',
+          animation: 'oo-baseline-pulse 1.4s ease-in-out infinite',
+        }} />
+        {/* Soft amber glow behind the ball — decorative only, barely there */}
+        <div style={{
+          position: 'absolute', bottom: 8, left: '50%',
+          transform: 'translateX(-50%)',
+          width: 80, height: 30, borderRadius: '50%',
+          background: 'radial-gradient(ellipse, rgba(245,197,24,0.12) 0%, transparent 70%)',
+          filter: 'blur(6px)',
+        }} />
+        {/* Ball + shadow container — matches splash construction exactly */}
+        <div style={{
+          position: 'absolute', bottom: 16, left: '50%',
+          marginLeft: -24, width: 48, height: 48,
+        }}>
+          <div style={{
+            position: 'absolute', bottom: -4, left: '50%',
+            width: 38, height: 7, background: 'rgba(0,0,0,0.6)',
+            borderRadius: '50%', filter: 'blur(3px)',
+            transform: 'translateX(-50%)',
+            animation: 'oo-shadow-beat 1.4s cubic-bezier(0.5, 0, 0.5, 1) infinite',
+          }} />
+          <div style={{
+            transformOrigin: '50% 100%',
+            animation: 'oo-preserve 1.4s cubic-bezier(0.5, 0, 0.5, 1) infinite',
+          }}>
+            <svg width="48" height="48" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <radialGradient id="slate-waiting-ball-grad" cx="0.35" cy="0.3" r="0.75">
+                  <stop offset="0%" stopColor="#F0FF7A"/>
+                  <stop offset="60%" stopColor="#DDFF4F"/>
+                  <stop offset="100%" stopColor="#B8D438"/>
+                </radialGradient>
+              </defs>
+              <circle cx="20" cy="20" r="18" fill="url(#slate-waiting-ball-grad)" stroke="#8BA132" strokeWidth="0.6"/>
+              <path d="M 3 20 C 9 13, 15 13, 20 20 C 25 27, 31 27, 37 20" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round"/>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      {/* Primary line — serif-italic for editorial weight. Instrument Serif
+          is the tagline face used by the splash; using it here ties the
+          empty state to the product's voice. */}
+      <div style={{
+        fontFamily: "'Instrument Serif', 'Cormorant Garamond', Georgia, serif",
+        fontSize: 28, fontStyle: 'italic', fontWeight: 400,
+        color: '#E8ECF4',
+        letterSpacing: '-0.015em',
+        marginBottom: 10,
+        textAlign: 'center',
+      }}>
+        {message || 'Waiting for the next slate.'}
+      </div>
+
+      {/* Rotating tagline — cycles every 5s, fades in/out. Small, muted,
+          sans-serif for contrast with the serif line above. */}
+      <div style={{
+        height: 18, position: 'relative', width: '100%',
+        maxWidth: 320, textAlign: 'center',
+      }}>
+        <div
+          key={phraseIdx}
+          style={{
+            fontFamily: "'Inter', sans-serif",
+            fontSize: 12, fontWeight: 500,
+            color: '#8B9ABA', letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+            animation: 'oo-phrase-fade 5s ease-in-out infinite',
+          }}
+        >
+          {sub || phrases[phraseIdx]}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// TRACKER TAB — post-lock field ownership vs sim + live Kalshi
+// ═══════════════════════════════════════════════════════════════════════
+// After contest lock, user uploads a DK contest export CSV (same format
+// the legacy LeverageTab parsed). We extract %Drafted per player and
+// compare against our sim_ownership to surface leverage opportunities:
+//
+//   • Δ Own = actual − sim. Positive = field over-concentrated (red);
+//     negative = field under-rostered (green). Threshold ±10pp.
+//   • "Field Needs Most" = top 3 by actual ownership (who breaks the
+//     field if they miss).
+//   • "Biggest Field Error" = top 3 by |Δ| (where field diverged from
+//     our model most — your leverage if you called it correctly).
+//
+// Kalshi prob column updates live via the existing 90s slate polling —
+// no extra fetch path needed. Kalshi delta (▲/▼ since first load) is
+// preserved via the OddsCell + getWpBaseline localStorage mechanism
+// already wired for the DK tab.
+//
+// Persistence: parsed ownership map saved to localStorage keyed by
 // slateId so it survives refreshes. Cross-device + historical browsing
 // would require a Supabase table (contest_ownership_archives) — queued
 // as a follow-up, not in tonight's scope.
@@ -4793,12 +5145,10 @@ function TrackerTab({ players: rp, ownership, slateId }) {
         </table>
       </div>
     ) : (
-      <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-dim)' }}>
-        <div style={{ fontSize: 14, marginBottom: 12 }}>Upload your DK contest export CSV</div>
-        <div style={{ fontSize: 12, maxWidth: 440, margin: '0 auto' }}>
-          The contest export includes each player's % Drafted. We'll compare it to our sim ownership and surface leverage + field errors live as Kalshi moves.
-        </div>
-      </div>
+      <SlateWaiting
+        message="Waiting for the contest export."
+        sub="Upload the DK contest CSV once the slate locks"
+      />
     )}
   </>);
 }
