@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app.config import get_settings
-from app.routes import health, players, prizepicks, slates
+from app.routes import health, players, prizepicks, slates, tracker
 
 
 def _configure_logging(level: str):
@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Start the scheduled watcher alongside the HTTP server."""
     settings = get_settings()
+
+    # Boot diagnostic — report each external provider's config status at startup
+    # so "why isn't X working?" is answerable from the first 20 log lines.
+    _log_provider_diagnostics(settings)
 
     if settings.enable_in_process_worker:
         try:
@@ -59,6 +63,54 @@ async def lifespan(app: FastAPI):
         yield
 
     logger.info("Application shutdown complete")
+
+
+def _log_provider_diagnostics(settings):
+    """Report provider config status at boot. Never crashes — purely informational."""
+    # Supabase (critical — app won't function without)
+    logger.info(
+        "Supabase config: url=%s, service_key=%s",
+        "OK" if settings.supabase_url else "MISSING",
+        "OK" if settings.supabase_service_key else "MISSING",
+    )
+
+    # The Odds API
+    oa_key = settings.odds_api_key or ""
+    logger.info(
+        "The Odds API config: key=%s",
+        f"set (len={len(oa_key)})" if oa_key else "MISSING — odds fetches will skip",
+    )
+
+    # Kalshi — eagerly try loading the key so PEM issues surface at boot
+    kk = settings.kalshi_key_id or ""
+    kpk = settings.kalshi_private_key or ""
+    kb = settings.kalshi_api_base or ""
+    logger.info(
+        "Kalshi config: key_id=%s, private_key=%s, base=%s",
+        f"set (prefix={kk[:8]}...)" if kk else "MISSING",
+        f"set (len={len(kpk)})" if kpk else "MISSING",
+        kb or "MISSING",
+    )
+    if kk and kpk:
+        # Trigger the eager load — logs success/failure from inside the loader
+        try:
+            from app.services.kalshi import _load_private_key
+            key = _load_private_key()
+            if key is None:
+                logger.warning(
+                    "Kalshi private key failed to load at boot. "
+                    "Kalshi calls will return 401 until this is fixed. "
+                    "Check the Failed to parse KALSHI_PRIVATE_KEY error above for details."
+                )
+        except Exception as e:
+            logger.warning("Kalshi eager-load raised: %s", e)
+
+    # Discord webhooks (optional)
+    logger.info(
+        "Discord webhooks: slates=%s, errors=%s",
+        "set" if settings.discord_webhook_slates else "not set",
+        "set" if settings.discord_webhook_errors else "not set",
+    )
 
 
 def create_app() -> FastAPI:
@@ -92,6 +144,7 @@ def create_app() -> FastAPI:
     app.include_router(slates.router)
     app.include_router(players.router)
     app.include_router(prizepicks.router)
+    app.include_router(tracker.router)
 
     return app
 
