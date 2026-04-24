@@ -82,6 +82,10 @@ class FrontendMatch(BaseModel):
     tournament: str = ""
     surface: Optional[str] = None
     odds: FrontendMatchOdds = Field(default_factory=FrontendMatchOdds)
+    # Opening odds — frozen on first ingest, never updated. Used by the
+    # archive view so the "moved from X to Y" delta is canonical across all
+    # users (live view still uses per-user localStorage baselines).
+    opening_odds: FrontendMatchOdds = Field(default_factory=FrontendMatchOdds)
     adj_a: float = 0
     adj_b: float = 0
 
