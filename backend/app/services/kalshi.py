@@ -356,12 +356,23 @@ def _parse_player_names_from_title(title: str) -> Optional[tuple[str, str]]:
 async def fetch_tick() -> dict:
     """One ingestion cycle for Kalshi tennis.
 
-    Matching strategy:
-      1. Pull open markets from KXATPMATCH + KXWTAMATCH series
-      2. Parse "LastA vs LastB" from each market's sub_title
-      3. Build a last-name → player_id map from DK slate roster
-      4. For each Kalshi market, look up both last names in the map
-      5. If both resolve and they're on the same match in our slate, write odds
+    Matching strategy (per Kalshi's actual data shape — verified live 2026-04-24):
+
+      Each matchup produces TWO Kalshi markets sharing an event_ticker:
+        ticker=KXWTAMATCH-26APR24PUTKOS-PUT, event_ticker=KXWTAMATCH-26APR24PUTKOS,
+          yes_sub_title="Yulia Putintseva", yes_bid_dollars=...
+        ticker=KXWTAMATCH-26APR24PUTKOS-KOS, event_ticker=KXWTAMATCH-26APR24PUTKOS,
+          yes_sub_title="Marta Kostyuk",   yes_bid_dollars=...
+
+      Each side is a binary "will this player win?" market. yes_sub_title
+      holds the full clean name. yes_bid_dollars/yes_ask_dollars hold the
+      market price in dollars (0.00-1.00), which IS the implied probability
+      of that player winning — no conversion needed.
+
+    So: group markets by event_ticker (should yield pairs), extract the two
+    full names via yes_sub_title, match full names against our DK roster
+    using the existing PlayerNormalizer (which handles accents, case,
+    common surname variants), and write odds using the per-side dollar prices.
     """
     s = get_settings()
     if not s.kalshi_key_id or not s.kalshi_private_key:
@@ -373,15 +384,23 @@ async def fetch_tick() -> dict:
     if not markets:
         return {"skipped": "no_markets", "markets_found": 0}
 
-    db = get_client()
+    # Group markets by event_ticker. Each event should have exactly two markets
+    # (one per player) — any count other than 2 is noise we skip.
+    events: dict[str, list[dict]] = {}
+    for mkt in markets:
+        et = mkt.get("event_ticker") or ""
+        if not et:
+            continue
+        events.setdefault(et, []).append(mkt)
 
-    # Pull all candidate matches + their player display names for last-name matching.
-    # We ask Supabase to expand player_a and player_b via the FK relationships so
-    # we don't need a separate round trip per player.
+    db = get_client()
+    normalizer = PlayerNormalizer(sport="tennis")
+
+    # Pull active-slate candidate matches with player display names
     candidate_matches = (
         db.table("matches")
         .select(
-            "id, slate_id, player_a_id, player_b_id, start_time,"
+            "id, slate_id, player_a_id, player_b_id,"
             " player_a:players!matches_player_a_id_fkey(canonical_id, display_name),"
             " player_b:players!matches_player_b_id_fkey(canonical_id, display_name),"
             " slates!inner(sport, status, contest_type, is_fallback)"
@@ -395,127 +414,129 @@ async def fetch_tick() -> dict:
         or []
     )
 
-    # Build last-name → match context lookup. Value is list because multiple
-    # players could share a last name across different matches.
-    last_name_index: dict[str, list[dict]] = {}
+    # Index: canonical_id → {match_id, slate_id, side}
+    player_to_match: dict[str, dict] = {}
     for m in candidate_matches:
         for side_key, player_field in [("a", "player_a"), ("b", "player_b")]:
             p = m.get(player_field) or {}
-            pname = p.get("display_name") or ""
-            key = _last_name_key(pname)
-            if not key:
-                continue
-            last_name_index.setdefault(key, []).append(
-                {
+            cid = p.get("canonical_id")
+            if cid:
+                player_to_match[cid] = {
                     "match_id": m["id"],
                     "slate_id": m["slate_id"],
                     "side": side_key,
-                    "canonical_id": p.get("canonical_id"),
-                    "opponent_key": _last_name_key(
-                        (m.get("player_a" if side_key == "b" else "player_b") or {}).get("display_name") or ""
-                    ),
                 }
-            )
 
     matched = 0
-    skipped_no_parse = 0
+    skipped_bad_event = 0
     skipped_no_match = 0
-    unmatched_samples: list[str] = []  # for diagnostics
+    unmatched_samples: list[str] = []
 
-    for mkt in markets:
-        # Kalshi puts the match description in sub_title. yes_sub_title sometimes
-        # has just one name ("Sinner") — fall back to title or event ticker as
-        # last resort.
-        subtitle = (
-            mkt.get("sub_title")
-            or mkt.get("subtitle")  # defensive: older API might use this
-            or mkt.get("title")
-            or ""
-        )
-        pair = _parse_player_names_from_title(subtitle)
-        if not pair:
-            skipped_no_parse += 1
+    for event_ticker, mkts in events.items():
+        if len(mkts) != 2:
+            skipped_bad_event += 1
             if len(unmatched_samples) < 5:
-                unmatched_samples.append(f"no_parse: {subtitle!r}")
+                unmatched_samples.append(f"event_has_{len(mkts)}_markets: {event_ticker}")
             continue
 
-        a_name, b_name = pair
-        a_key = _last_name_key(a_name)
-        b_key = _last_name_key(b_name)
-        if not a_key or not b_key:
-            skipped_no_parse += 1
+        # Extract the two sides. yes_sub_title holds the full player name.
+        side0, side1 = mkts[0], mkts[1]
+        name0 = (side0.get("yes_sub_title") or "").strip()
+        name1 = (side1.get("yes_sub_title") or "").strip()
+        if not name0 or not name1:
+            skipped_bad_event += 1
             continue
 
-        # Find matches where BOTH last-names exist and are opponents of each other
-        candidates_a = last_name_index.get(a_key, [])
-        candidates_b = last_name_index.get(b_key, [])
+        # Resolve each name to a canonical_id via the player normalizer.
+        # create_if_missing=False — we only care about players already in our DB.
+        r0 = normalizer.resolve(name0, source="kalshi", create_if_missing=False)
+        r1 = normalizer.resolve(name1, source="kalshi", create_if_missing=False)
 
-        best_match = None
-        for ca in candidates_a:
-            for cb in candidates_b:
-                if ca["match_id"] == cb["match_id"] and ca["side"] != cb["side"]:
-                    best_match = (ca, cb)
-                    break
-            if best_match:
-                break
+        cm0 = player_to_match.get(r0.canonical_id) if r0.canonical_id else None
+        cm1 = player_to_match.get(r1.canonical_id) if r1.canonical_id else None
 
-        if not best_match:
+        # Both players must resolve to the SAME match on an opposing side
+        if not cm0 or not cm1 or cm0["match_id"] != cm1["match_id"] or cm0["side"] == cm1["side"]:
             skipped_no_match += 1
             if len(unmatched_samples) < 5:
-                unmatched_samples.append(f"no_dk_match: {subtitle!r} ({a_key}/{b_key})")
+                unmatched_samples.append(
+                    f"no_dk_match: {name0!r} vs {name1!r} "
+                    f"(resolved: {r0.canonical_id}/{r1.canonical_id})"
+                )
             continue
 
-        ca, cb = best_match
-        # Our canonical A player — was that Kalshi's "a"?
-        our_a_id = candidate_matches[0]["player_a_id"] if False else None  # unused
-        # Determine orientation: if ca is our side "a", Kalshi's A == our A (no swap)
-        swap = ca["side"] == "b"
+        # Extract per-side implied probability.
+        # yes_bid_dollars / yes_ask_dollars are strings like "0.5600" — dollars,
+        # i.e. probability directly.
+        prob0 = _dollar_to_prob(side0.get("yes_bid_dollars"), side0.get("yes_ask_dollars"))
+        prob1 = _dollar_to_prob(side1.get("yes_bid_dollars"), side1.get("yes_ask_dollars"))
 
-        yes_price = (
-            mkt.get("yes_bid")
-            or mkt.get("yes_ask")
-            or mkt.get("last_price")
-        )
-        no_price = mkt.get("no_bid") or mkt.get("no_ask")
-        implied_a = None
-        if yes_price is not None:
-            try:
-                # Kalshi prices in cents (0-100). Yes price = prob of first-named outcome.
-                implied = float(yes_price) / 100.0
-                # If Kalshi's "Yes" refers to player A but our canonical a is player B
-                # (swap=True), invert.
-                implied_a = 1 - implied if swap else implied
-            except (TypeError, ValueError):
-                pass
+        # Map to our canonical A/B orientation
+        # cm0 is on side 'a' or 'b' in our match — place probs accordingly
+        if cm0["side"] == "a":
+            implied_a, implied_b = prob0, prob1
+        else:
+            implied_a, implied_b = prob1, prob0
 
         odds_block = {
             "implied_prob_a": implied_a,
-            "implied_prob_b": (1 - implied_a) if implied_a is not None else None,
-            "market_ticker": mkt.get("ticker"),
-            "series_ticker": mkt.get("_series_ticker"),
-            "last_price": yes_price,
-            "no_price": no_price,
+            "implied_prob_b": implied_b,
+            "event_ticker": event_ticker,
+            "ticker_a": side0["ticker"] if cm0["side"] == "a" else side1["ticker"],
+            "ticker_b": side1["ticker"] if cm0["side"] == "a" else side0["ticker"],
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "raw": {
-                "subtitle": subtitle,
-                "status": mkt.get("status"),
-                "yes_bid": mkt.get("yes_bid"),
-                "no_bid": mkt.get("no_bid"),
+                "a": {
+                    "yes_sub_title": name0 if cm0["side"] == "a" else name1,
+                    "yes_bid_dollars": side0.get("yes_bid_dollars") if cm0["side"] == "a" else side1.get("yes_bid_dollars"),
+                    "yes_ask_dollars": side0.get("yes_ask_dollars") if cm0["side"] == "a" else side1.get("yes_ask_dollars"),
+                },
+                "b": {
+                    "yes_sub_title": name1 if cm0["side"] == "a" else name0,
+                    "yes_bid_dollars": side1.get("yes_bid_dollars") if cm0["side"] == "a" else side0.get("yes_bid_dollars"),
+                    "yes_ask_dollars": side1.get("yes_ask_dollars") if cm0["side"] == "a" else side0.get("yes_ask_dollars"),
+                },
             },
         }
 
-        await _write_kalshi_odds(ca["match_id"], ca["slate_id"], odds_block)
+        await _write_kalshi_odds(cm0["match_id"], cm0["slate_id"], odds_block)
         matched += 1
 
     result = {
         "markets_found": len(markets),
+        "events_found": len(events),
         "matched": matched,
-        "skipped_no_parse": skipped_no_parse,
+        "skipped_bad_event": skipped_bad_event,
         "skipped_no_match": skipped_no_match,
     }
     if unmatched_samples and matched == 0:
         logger.info("Kalshi unmatched samples: %s", unmatched_samples)
     return result
+
+
+def _dollar_to_prob(bid: Optional[str], ask: Optional[str]) -> Optional[float]:
+    """Convert Kalshi's yes_bid_dollars + yes_ask_dollars to implied probability.
+
+    Kalshi dollar prices are strings like "0.5600" = $0.56 = 56% probability.
+    We use the midpoint of bid/ask when both are present, else whichever we have.
+    Returns None if neither is available or parseable.
+    """
+    def _parse(v):
+        if v is None:
+            return None
+        try:
+            n = float(v)
+            if 0.0 <= n <= 1.0:
+                return n
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    b = _parse(bid)
+    a = _parse(ask)
+    if b is not None and a is not None:
+        return (b + a) / 2.0
+    return b if b is not None else a
 
 
 async def _write_kalshi_odds(match_id: str, slate_id: str, odds_block: dict):
