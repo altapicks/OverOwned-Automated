@@ -4105,11 +4105,11 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
     return [...rows]
       .map((r) => ({ ...r, netOwn: r.actualOwn - (opponentOwn[r.opponent] || 0) }))
       .sort((a, b) => b.netOwn - a.netOwn)
-      .slice(0, 3);
+      .slice(0, 4);
   }, [rows, hasData, opponentOwn]);
   const biggestErrors = useMemo(() => {
     if (!hasData) return [];
-    return [...rows].sort((a, b) => Math.abs(b.deltaOwn) - Math.abs(a.deltaOwn)).slice(0, 3);
+    return [...rows].sort((a, b) => Math.abs(b.deltaOwn) - Math.abs(a.deltaOwn)).slice(0, 4);
   }, [rows, hasData]);
 
   // Human-readable relative time for "uploaded X ago"
@@ -4201,11 +4201,14 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
             {fieldNeeds.map((p, i) => (
               <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', padding: '3px 0', fontSize: 13, gap: 8 }}>
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><span style={{ color: 'var(--text-dim)', marginRight: 6 }}>{i + 1}.</span>{p.name}</span>
-                <span style={{ color: '#EF4444', fontWeight: 600, flexShrink: 0 }}>{p.actualOwn.toFixed(1)}%</span>
+                <span style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'baseline', gap: 6 }}>
+                  <span style={{ color: '#EF4444', fontWeight: 600 }}>{p.netOwn.toFixed(1)}</span>
+                  <span style={{ color: 'var(--text-dim)', fontSize: 11 }}>({p.actualOwn.toFixed(1)}%)</span>
+                </span>
               </div>
             ))}
           </div>
-          <div className="metric-sub" style={{ marginTop: 6 }}>Highest actual ownership</div>
+          <div className="metric-sub" style={{ marginTop: 6 }}>Net leverage (actual − opponent)</div>
         </div>
         <div className="metric" style={{ flex: 1 }}>
           <div className="metric-label"><Icon name="gem" size={13}/> Biggest Field Error</div>
