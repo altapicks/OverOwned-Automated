@@ -212,6 +212,26 @@ def test_frontend_match_odds_accepts_kalshi_fields():
     assert model.kalshi_prob_b == 0.135
 
 
+def test_frontend_match_odds_accepts_sharp_mode_fields():
+    """p3set and posted_lines pass through the serializer.
+    Regression guard — without p3set, engine.js hasRichOdds() fails and
+    every match falls back to baseline mode (the flat-numbers symptom)."""
+    from app.models import FrontendMatchOdds
+    db_odds = {
+        "p3set": 0.1328,
+        "gw_a_line": 12.5,
+        "ace_a_5plus": -239,
+        "posted_lines": {
+            "a": {"aces": 4.5, "games_won": 12.5, "dfs": 1.5},
+            "b": {"aces": 2.5, "games_won": 5.5, "dfs": 2.5},
+        },
+    }
+    model = FrontendMatchOdds(**db_odds)
+    assert model.p3set == 0.1328
+    assert model.posted_lines["a"]["aces"] == 4.5
+    assert model.posted_lines["b"]["games_won"] == 5.5
+
+
 def test_frontend_match_odds_empty_dict():
     """Empty dict → all-None model. Default path for matches without odds yet."""
     from app.models import FrontendMatchOdds
