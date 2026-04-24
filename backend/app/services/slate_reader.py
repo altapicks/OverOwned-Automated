@@ -97,6 +97,7 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     frontend_players = [FrontendPlayer(**e) for e in by_canonical.values()]
 
     meta = {
+        "id": slate["id"],
         "dk_draft_group_id": slate["dk_draft_group_id"],
         "first_seen_at": slate["first_seen_at"],
         "last_synced_at": slate["last_synced_at"],
