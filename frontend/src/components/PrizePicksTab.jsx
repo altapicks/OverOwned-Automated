@@ -298,7 +298,16 @@ export function PrizePicksTab({ slateId, players = [] }) {
           fontSize: 12,
           display: 'flex', alignItems: 'center', gap: 10,
         }}>
-          <span style={{ color: '#F5C518', fontSize: 14, lineHeight: 1 }}>⤵</span>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="#F5C518" strokeWidth="2"
+               strokeLinecap="round" strokeLinejoin="round"
+               style={{ flexShrink: 0 }}>
+            {/* Up-then-down line: rises from bottom-left, peaks, falls to
+                bottom-right. Conveys the "reversion after a spike" idea the
+                hint is warning about. */}
+            <polyline points="3 17 9 11 13 14 21 6"/>
+            <polyline points="15 6 21 6 21 12"/>
+          </svg>
           <span><strong style={{ color: '#F5C518', fontWeight: 600 }}>Hint:</strong> PrizePicks bad value will typically reverse</span>
         </div>
 
