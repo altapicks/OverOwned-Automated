@@ -99,6 +99,11 @@ class FrontendPlayer(BaseModel):
     acpt_salary: Optional[int] = None
     flex_id: Optional[int] = None
     flex_salary: Optional[int] = None
+    # Manually-provided pool ownership pct (0-100). When set, the frontend
+    # uses it directly and skips Monte Carlo for this player. Null for
+    # slates where Alta hasn't supplied values — those fall back to
+    # Monte Carlo. Populated from slate_players.ss_pool_own.
+    ss_pool_own: Optional[float] = None
 
 
 class FrontendPPLine(BaseModel):
