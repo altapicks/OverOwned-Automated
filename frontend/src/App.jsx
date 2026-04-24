@@ -2423,43 +2423,18 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
           </svg>
         </button>}
       </div>
-      {hasArchive && onSlateDateChange && (() => {
-        // UI shows most recent 6; backend (manifest.json) keeps the full list.
-        // Older slates are still accessible by direct URL or by extending the manifest
-        // if a "See all" option is added later.
-        const recentSlates = manifestSlates.slice(0, 6);
-        const isOlderSelected = slateDate !== 'live' && !recentSlates.some(s => s.date === slateDate);
-        return (
-          <select
-            value={slateDate}
-            onChange={e => onSlateDateChange(e.target.value)}
-            title="Select slate date"
-            className="slate-picker"
-            style={{
-              background: slateDate !== 'live' ? 'rgba(245,197,24,0.12)' : 'var(--bg)',
-              border: `1px solid ${slateDate !== 'live' ? 'rgba(245,197,24,0.4)' : 'var(--border-light)'}`,
-              borderRadius: 6,
-              color: slateDate !== 'live' ? 'var(--primary)' : 'var(--text-muted)',
-              padding: '5px 22px 5px 9px',
-              fontSize: 11,
-              fontWeight: 600,
-              cursor: 'pointer',
-              appearance: 'none',
-              height: 30,
-              lineHeight: '18px',
-              maxWidth: 140,
-              backgroundImage: `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%23F5C518' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>")`,
-              backgroundRepeat: 'no-repeat',
-              backgroundPosition: 'right 7px center',
-            }}>
-            <option value="live">Live slate</option>
-            {recentSlates.map(s => (
-              <option key={s.date} value={s.date}>{s.label || s.date}</option>
-            ))}
-            {isOlderSelected && <option value={slateDate}>{slateDate}</option>}
-          </select>
-        );
-      })()}
+      {/* Slate picker dropdown removed Apr 24, 2026. The dropdown was showing
+          stale manifest entries ("Featured", "TEN Short Slate") that pointed
+          to broken or non-existent slate payloads.
+          
+          State plumbing (slateDate, onSlateDateChange, manifestSlates) is
+          intentionally preserved so the future Research panel can reuse it
+          to browse historical slates. Deep-link access via URL param still
+          works — a direct link like /?date=2026-04-18 still loads that
+          archived slate even though no UI exposes the dropdown.
+          
+          When the Research panel ships, wire it to call onSlateDateChange()
+          and it'll inherit the existing fetch/route plumbing for free. */}
       {data && <div className="topbar-date">
         <span className="topbar-date-main">{data.date} · {
           sport === 'nba' ? `${data.game ? `${data.game.away}@${data.game.home}` : ''} · ${(data.dk_players || []).length} players`
