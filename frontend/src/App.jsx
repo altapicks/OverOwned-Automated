@@ -323,8 +323,9 @@ function OverOwnedHelpModal({ onClose }) {
           <RuleRow rule="9" target="Hidden Gem #2" cap="min = max(22%, simOwn × 1.8)" />
           <RuleRow rule="10" target="Hidden Gem #3 (16+ only)" cap="min = max(18%, simOwn × 1.5)" />
           <RuleRow rule="11" target="Hidden Gem #4 (16+ only)" cap="min = max(15%, simOwn × 1.3)" />
+          <RuleRow rule="12" target="Rest of field (non-signal players)" cap="max = simOwn × 1.6" />
           <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 10, lineHeight: 1.5 }}>
-            Hidden Gems surfaces the least-owned player in each value tier — true contrarian-value plays independent of any formula constant. Each gem gets a graduated leverage floor so the optimizer naturally leans into them.
+            Rule 12 is the baseline field cap. Every non-signal player gets a ceiling of simOwn × 1.6 at base strength (+60% leverage room). Keeps unflagged chalk from pushing past 60–70% exposure and eating slots reserved for Hidden Gems and Pivots. Scales tighter at higher strength, looser at lower.
           </div>
         </div>
 
@@ -348,7 +349,7 @@ function OverOwnedHelpModal({ onClose }) {
 // ═══════════════════════════════════════════════════════════════════════
 // SLATE DATA HOOK — sport-aware
 // ═══════════════════════════════════════════════════════════════════════
-function useSlateData(sport, slateDate) {
+function useSlateData(sport, slateDate, pollPaused = false) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const hasLoadedRef = useRef(false);
@@ -405,6 +406,7 @@ function useSlateData(sport, slateDate) {
   // successful poll will recover.
   useEffect(() => {
     if (slateDate && slateDate !== 'live') return; // archived = frozen
+    if (pollPaused) return;                        // user explicitly paused
     const POLL_INTERVAL_MS = 90_000;
     let cancelled = false;
     const tick = () => {
@@ -421,7 +423,7 @@ function useSlateData(sport, slateDate) {
     };
     const id = setInterval(tick, POLL_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(id); };
-  }, [sport, slateDate]);
+  }, [sport, slateDate, pollPaused]);
   return { data, error };
 }
 
@@ -1774,7 +1776,17 @@ export default function App() {
   useEffect(() => {
     if (!isSportEnabled(sport)) setSportRaw('tennis');
   }, [sport]);
-  const { data, error } = useSlateData(sport, slateDate);
+  // Freeze/Live toggle — pauses the 90s slate poll. When frozen, the DK
+  // tab and builder stop reshuffling mid-work. Persisted in localStorage
+  // so a hard refresh preserves the choice; defaults to live (unfrozen).
+  const [pollPaused, setPollPausedRaw] = useState(() => {
+    try { return localStorage.getItem('oo_poll_paused') === '1'; } catch { return false; }
+  });
+  const setPollPaused = (v) => {
+    setPollPausedRaw(v);
+    try { localStorage.setItem('oo_poll_paused', v ? '1' : '0'); } catch {}
+  };
+  const { data, error } = useSlateData(sport, slateDate, pollPaused);
   const manifestSlates = useSlateManifest(sport);
   const [tab, setTab] = useState('dk');
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
@@ -2330,7 +2342,7 @@ export default function App() {
       }
     `}</style>
     <div className="cursor-glow" aria-hidden="true" />
-    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} />
+    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} pollPaused={pollPaused} onTogglePollPaused={() => setPollPaused(!pollPaused)} />
     {missingPoolOwn.length > 0 && (
       <div style={{
         padding: '10px 24px', background: 'rgba(245, 158, 11, 0.09)',
@@ -2386,7 +2398,7 @@ export default function App() {
   </div>);
 }
 
-function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick }) {
+function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick, pollPaused = false, onTogglePollPaused }) {
   const hasArchive = manifestSlates && manifestSlates.length > 0;
   return (<div className="topbar">
     <div
@@ -2406,6 +2418,32 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
       <span>Over<span className="brand-o">O</span>wned</span>
     </div>
     <div className="topbar-right">
+      {onTogglePollPaused && slateDate === 'live' && (
+        <button
+          onClick={onTogglePollPaused}
+          title={pollPaused
+            ? 'Data is frozen — click to resume live updates (polls every 90s)'
+            : 'Data is live (polls every 90s) — click to freeze while building lineups'}
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            background: pollPaused ? 'rgba(125,211,252,0.1)' : 'rgba(74,222,128,0.08)',
+            border: `1px solid ${pollPaused ? 'rgba(125,211,252,0.4)' : 'rgba(74,222,128,0.3)'}`,
+            borderRadius: 6, padding: '7px 11px', cursor: 'pointer',
+            color: pollPaused ? 'var(--blue-text)' : 'var(--green-text)',
+            fontSize: 11, fontWeight: 600, letterSpacing: 0.4, textTransform: 'uppercase',
+            transition: 'all 0.15s',
+          }}
+        >
+          <span style={{
+            display: 'inline-block', width: 7, height: 7, borderRadius: '50%',
+            background: pollPaused ? 'var(--blue-text)' : 'var(--green-text)',
+            boxShadow: pollPaused ? 'none' : '0 0 6px rgba(74,222,128,0.7)',
+            animation: pollPaused ? 'none' : 'oo-live-pulse 1.5s ease-in-out infinite',
+          }}/>
+          {pollPaused ? 'Frozen' : 'Live'}
+        </button>
+      )}
+      <style>{`@keyframes oo-live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }`}</style>
       <div style={{ display: 'flex', background: 'var(--bg)', border: '1px solid var(--border-light)', borderRadius: 6, overflow: 'hidden' }}>
         <button onClick={() => onSportChange('tennis')} title="Tennis" aria-label="Tennis" style={{
           background: sport === 'tennis' ? 'var(--primary)' : 'transparent',
@@ -2783,6 +2821,9 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
 //   Hidden Gem #2          min = max(22%, simOwn × 1.8)
 //   Hidden Gem #3          min = max(18%, simOwn × 1.5)  (16+ only)
 //   Hidden Gem #4          min = max(15%, simOwn × 1.3)  (16+ only)
+//   (Field cap)            all non-signal players: max = simOwn × 1.6
+//                          Keeps baseline chalk from overleveraging
+//                          into lineups. At 25% own → 40% max cap.
 //
 // Strength scaling: factor = strength / 0.6.
 //   • Max caps divided by factor (higher strength = lower cap, more fade)
@@ -2810,14 +2851,33 @@ function computeOverOwnedCaps(rp, ownership, strength, matchCount) {
   const trapCount = is16Plus ? 4 : 2;
   const gemCount = is16Plus ? 4 : 2;
 
-  // Stack-safe setters
-  const setMin = (name, v) => {
+  // Stack-safe setters — order-independent stacking. Also tag the cap
+  // with which signal "won" (set the active bound) for the Top 5 Exposure
+  // Changes display panel. Tag updates when this rule's value equals or
+  // beats the current bound — so if two rules set the same floor (e.g.,
+  // Primary Pivot and Hidden Gem #1 both hit 31.8%), the later one wins
+  // the tag since gems are applied after pivots.
+  const setMin = (name, v, signal, rank) => {
     caps[name] = caps[name] || {};
-    caps[name].min = caps[name].min !== undefined ? Math.max(caps[name].min, v) : v;
+    if (caps[name].min === undefined || v >= caps[name].min) {
+      caps[name].min = caps[name].min !== undefined ? Math.max(caps[name].min, v) : v;
+      caps[name]._signal = signal;
+      if (rank !== undefined) caps[name]._rank = rank; else delete caps[name]._rank;
+    } else {
+      // keep existing higher floor, but still record it in case the caller
+      // is setting the first min on this player
+      caps[name].min = Math.max(caps[name].min, v);
+    }
   };
-  const setMax = (name, v) => {
+  const setMax = (name, v, signal, rank) => {
     caps[name] = caps[name] || {};
-    caps[name].max = caps[name].max !== undefined ? Math.min(caps[name].max, v) : v;
+    if (caps[name].max === undefined || v <= caps[name].max) {
+      caps[name].max = caps[name].max !== undefined ? Math.min(caps[name].max, v) : v;
+      caps[name]._signal = signal;
+      if (rank !== undefined) caps[name]._rank = rank; else delete caps[name]._rank;
+    } else {
+      caps[name].max = Math.min(caps[name].max, v);
+    }
   };
 
   // Scaling helpers
@@ -2910,30 +2970,50 @@ function computeOverOwnedCaps(rp, ownership, strength, matchCount) {
   }
 
   // ─── RULES ──────────────────────────────────────────────────────────
+  // Each rule tags its cap with a _signal string so the Top 5 Exposure
+  // Changes panel can label it. When rules overlap (e.g., Primary Pivot
+  // + Hidden Gem #1 both hitting the same floor), last-write-wins for
+  // the tag — rules run in the order below, so Hidden Gems win ties over
+  // Pivots, which wins over PP Fades.
 
   // (1-4) Biggest Traps — graduated max caps: 8, 10, 12, 14 at base
   const trapCaps = [8, 10, 12, 14];
   trapsListClean.forEach((p, i) => {
-    if (i < trapCount) setMax(p.name, scaledMax(trapCaps[i]));
+    if (i < trapCount) setMax(p.name, scaledMax(trapCaps[i]), 'trap', i + 1);
   });
 
   // (5) Primary Pivot — min = max(25%, simOwn × 2)
-  if (primaryPivot) setMin(primaryPivot.name, scaledMin(25, own(primaryPivot.name), 1.0));
+  if (primaryPivot) setMin(primaryPivot.name, scaledMin(25, own(primaryPivot.name), 1.0), 'primary-pivot');
 
   // (6) Or Pivot — min = max(20%, simOwn × 1.8) [16+ only]
-  if (is16Plus && orPivot) setMin(orPivot.name, scaledMin(20, own(orPivot.name), 0.8));
+  if (is16Plus && orPivot) setMin(orPivot.name, scaledMin(20, own(orPivot.name), 0.8), 'or-pivot');
 
   // (7) PP Fades — each min = simOwn × 1.5 (+50% leverage)
-  for (const pp of ppFades) {
-    setMin(pp.name, scaledMin(0, own(pp.name), 0.5));
-  }
+  ppFades.forEach((p, i) => {
+    setMin(p.name, scaledMin(0, own(p.name), 0.5), 'pp-fade', i + 1);
+  });
 
-  // (8-11) Hidden Gems — graduated min floors
+  // (8-11) Hidden Gems — graduated min floors (100/80/50/30% leverage)
   const gemAbsFloors  = [25, 22, 18, 15];
   const gemLevBoosts  = [1.0, 0.8, 0.5, 0.3];
   gemsList.forEach((p, i) => {
-    if (i < gemCount) setMin(p.name, scaledMin(gemAbsFloors[i], own(p.name), gemLevBoosts[i]));
+    if (i < gemCount) setMin(p.name, scaledMin(gemAbsFloors[i], own(p.name), gemLevBoosts[i]), 'gem', i + 1);
   });
+
+  // (12) Rest-of-field cap — every non-signal player gets max = simOwn × 1.6
+  // at base strength (+60% leverage ceiling). Stops unflagged chalk from
+  // eating lineup slots that should go to Hidden Gems. Scales with strength:
+  // tighter at higher strength, looser at lower. Skipped for players already
+  // flagged as a Trap, Gem, Pivot, or PP Fade. Tagged 'field-cap' but
+  // labelFor returns null for it so the Top 5 panel doesn't get flooded.
+  const signalPlayers = new Set(Object.keys(caps));
+  const fieldCapMult = 1 + 0.6 / factor; // 1.6× at base, tighter as factor grows
+  for (const p of withSal) {
+    if (signalPlayers.has(p.name)) continue;
+    const ownPct = own(p.name);
+    if (ownPct <= 0) continue;
+    setMax(p.name, roundInt(ownPct * fieldCapMult), 'field-cap');
+  }
 
   // Defensive clamp: ensure min ≤ max for any player with both
   for (const name in caps) {
@@ -3182,46 +3262,22 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
     )}
     <ContrarianPanel enabled={contrarianOn} onToggle={setContrarianOn} strength={contrarianStrength} onStrengthChange={setContrarianStrength} />
     {contrarianOn && Object.keys(contrarianCaps).length > 0 && (() => {
-      // OverOwned Mode display (v3.19/v3.24) — top 5 changes by |bound - fieldOwn|.
+      // OverOwned Mode display (v5.5) — top 5 changes by |bound - fieldOwn|.
+      // Reads _signal tag set by computeOverOwnedCaps on each cap.
       const labelFor = (c) => {
-        if (c._isTrap)   return { label: 'Trap',    icon: 'bomb',   color: 'var(--red)' };
-        if (c._isOrTrap) return { label: 'Or Trap', icon: 'bomb',   color: 'var(--red)' };
-        if (c._isGem && c._kind === 'primary') return { label: 'Gem',     icon: 'gem',    color: 'var(--green)' };
-        if (c._isGem && c._kind === 'or-pivot') return { label: 'Or Pivot', icon: 'gem',   color: 'var(--green)' };
-        if (c._isGem && c._kind === 'pivot')   return { label: `Pivot${c._ppPivotRank ? ' #' + c._ppPivotRank : ''}`, icon: 'gem', color: 'var(--green)' };
-        if (c._isPivotOpponent) return { label: 'Pivot Opp', icon: 'bomb', color: 'var(--amber)' };
-        if (c._isGemOpponent)   return { label: 'Gem Opp',   icon: 'bomb', color: 'var(--amber)' };
-        if (c._isHardFade)      return { label: 'Hard Fade',  icon: 'bomb', color: 'var(--red)' };
-        if (c._isHardFadeOpp)   return { label: 'Hard-Fade Opp Boost', icon: 'gem', color: 'var(--green)' };
-        if (c._isValOppBoost)   return { label: 'Val-Opp Boost', icon: 'gem', color: 'var(--green)' };
-        if (c._isValCap)        return { label: 'Val Cap', icon: 'bomb', color: 'var(--red)' };
-        if (c._isTop10Val)      return { label: `Top Val #${c._top10ValRank || ''} Cap`, icon: 'bomb', color: 'var(--red)' };
-        if (c._isTop10ValOppBoost) return { label: `Top Val #${c._top10ValOppRank || ''} Opp`, icon: 'gem', color: 'var(--green)' };
-        if (c._isCheapCap)      return { label: 'Cheap Cap', icon: 'bomb', color: 'var(--amber)' };
-        if (c._isStraightSetsCap) return { label: 'Straight-Sets Cap', icon: 'bomb', color: 'var(--amber)' };
-        if (c._isPpFadeOpponent)  return { label: 'PP Fade Opp', icon: 'bomb', color: 'var(--amber)' };
-        if (c._isMidTierFade)   return { label: 'Mid-Tier Fade', icon: 'bomb', color: 'var(--amber)' };
-        if (c._isMidTierPivot)  return { label: 'Mid-Tier Pivot', icon: 'gem', color: 'var(--green)' };
-        if (c._isPpBoost) return { label: 'PP Boost', icon: 'rocket', color: 'var(--primary)' };
-        return null;
+        switch (c._signal) {
+          case 'trap':          return { label: `Biggest Trap #${c._rank}`, icon: 'bomb',   color: 'var(--red-text)' };
+          case 'gem':           return { label: `Hidden Gem #${c._rank}`,   icon: 'gem',    color: 'var(--blue-text)' };
+          case 'primary-pivot': return { label: 'Primary Pivot',             icon: 'swords', color: 'var(--green-text)' };
+          case 'or-pivot':      return { label: 'Or Pivot',                  icon: 'swords', color: 'var(--green-text)' };
+          case 'pp-fade':       return { label: `PP Fade #${c._rank}`,       icon: 'swords', color: 'var(--green-text)' };
+          default: return null;
+        }
       };
       const describeChange = (c) => {
-        if (c._isTrap || c._isOrTrap)   return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isGem)    return { sym: `min ${c.min}%`, bound: c.min };
-        if (c._isPivotOpponent) return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isGemOpponent)   return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isHardFade)      return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isHardFadeOpp)   return { sym: `min ${c.min}% (+${c._hardFadeOppAddedMin || 0}pp)`, bound: c.min };
-        if (c._isValOppBoost)   return { sym: `min ${c.min}% (+${c._valOppBoostAddedMin || 0}pp)`, bound: c.min };
-        if (c._isValCap)        return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isTop10Val)      return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isTop10ValOppBoost) return { sym: `min ${c.min}%`, bound: c.min };
-        if (c._isCheapCap)      return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isStraightSetsCap) return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isPpFadeOpponent)  return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isMidTierFade)   return { sym: `max ${c.max}%`, bound: c.max };
-        if (c._isMidTierPivot)  return { sym: `min ${c.min}% (+${c._midTierPivotAddedMin}pp stacked)`, bound: c.min };
-        if (c._isPpBoost) return { sym: `+${c._ppBoostAddedMin}% min (stacked)`, bound: c.min };
+        if (c._signal === 'trap') return { sym: `max ${c.max}%`, bound: c.max };
+        // All other signals are min floors
+        if (c.min != null) return { sym: `min ${c.min}%`, bound: c.min };
         return { sym: '', bound: 0 };
       };
       const ranked = [];
