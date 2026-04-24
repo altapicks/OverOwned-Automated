@@ -1772,105 +1772,6 @@ export default function App() {
   const [lockedPlayers, setLockedPlayers] = useState([]);
   const [excludedPlayers, setExcludedPlayers] = useState([]);
 
-  // Manually-imported sim ownership, keyed per slate. When present, REPLACES
-  // the Monte Carlo sim for every player on the slate (via ss_pool_own
-  // injection into the player objects below). Persists in localStorage so
-  // reloading doesn't lose the import.
-  //
-  // Upload format: DFS CSV with a "My Own" column (column index 11, zero-
-  // based). We match by player Name (column 1). Surname fallback handles
-  // cases where DK has "Tomas Martin Etcheverry" but the import CSV has
-  // "Tomas Etcheverry" — same logic as the PP tab.
-  const [manualOwn, setManualOwn] = useState({});
-  const [manualOwnMeta, setManualOwnMeta] = useState(null);  // { filename, uploadedAt, rows }
-
-  // Load manual ownership for the active slate
-  useEffect(() => {
-    const sid = data?.meta?.id || data?.id || data?.meta?.slate_id;
-    if (!sid) return;
-    try {
-      const raw = localStorage.getItem(`manual_own_${sid}`);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        setManualOwn(parsed.ownership || {});
-        setManualOwnMeta(parsed.meta || null);
-      } else {
-        setManualOwn({});
-        setManualOwnMeta(null);
-      }
-    } catch (e) { console.warn('[manual-own] load failed:', e); }
-  }, [data]);
-
-  // CSV import handler — parses DFS-format CSV, extracts Name + "My Own",
-  // stores per-slate. Returns count of matched rows so the button can show
-  // feedback.
-  const handleImportSimOwn = useCallback((file) => {
-    if (!file) return;
-    const sid = data?.meta?.id || data?.id || data?.meta?.slate_id;
-    if (!sid) { alert('No active slate — cannot import sim own.'); return; }
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const raw = String(evt.target.result).replace(/^\uFEFF/, '');
-        const lines = raw.split(/\r?\n/).filter(Boolean);
-        if (lines.length < 2) throw new Error('CSV is empty or has no data rows.');
-        // RFC4180-ish parser
-        const parseRow = (line) => {
-          const cols = [];
-          let cur = '', inQuotes = false;
-          for (let i = 0; i < line.length; i++) {
-            const c = line[i];
-            if (c === '"') {
-              if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }
-              else inQuotes = !inQuotes;
-            } else if (c === ',' && !inQuotes) { cols.push(cur); cur = ''; }
-            else cur += c;
-          }
-          cols.push(cur);
-          return cols;
-        };
-        const header = parseRow(lines[0]).map(h => h.trim());
-        const nameIdx = header.findIndex(h => h.toLowerCase() === 'name');
-        const ownIdx = header.findIndex(h => h.toLowerCase() === 'my own');
-        if (nameIdx < 0 || ownIdx < 0) {
-          throw new Error('CSV missing required columns "Name" and "My Own".');
-        }
-        const ownership = {};
-        let matched = 0;
-        for (let i = 1; i < lines.length; i++) {
-          const cols = parseRow(lines[i]);
-          if (cols.length <= ownIdx) continue;
-          const name = (cols[nameIdx] || '').trim();
-          const own = parseFloat(cols[ownIdx]);
-          if (!name || isNaN(own)) continue;
-          ownership[name] = own;
-          matched++;
-        }
-        if (matched === 0) throw new Error('No valid rows found in CSV.');
-        const meta = {
-          filename: file.name,
-          uploadedAt: new Date().toISOString(),
-          rows: matched,
-        };
-        setManualOwn(ownership);
-        setManualOwnMeta(meta);
-        localStorage.setItem(`manual_own_${sid}`, JSON.stringify({ ownership, meta }));
-      } catch (err) {
-        alert('Import failed: ' + err.message);
-      }
-    };
-    reader.readAsText(file);
-  }, [data]);
-
-  const handleClearSimOwn = useCallback(() => {
-    const sid = data?.meta?.id || data?.id || data?.meta?.slate_id;
-    if (!sid) return;
-    if (!confirm('Clear imported sim own and return to Monte Carlo?')) return;
-    setManualOwn({});
-    setManualOwnMeta(null);
-    try { localStorage.removeItem(`manual_own_${sid}`); } catch {}
-  }, [data]);
-
   // NBA-only per-slot lock/exclude. Populated when the user clicks lock/exclude
   // while the NBA DK tab is in CPT or FLEX scope. Separate from the "any-slot"
   // sets above so users can e.g. lock SGA as FLEX-only (not CPT) without
@@ -1962,51 +1863,6 @@ export default function App() {
     sport === 'tennis' ? tennisProjections
     : sport === 'mma' ? mmaProjections
     : nbaProjections;
-
-  // Inject manual sim ownership (if imported for this slate) into each
-  // player's ss_pool_own field. The existing ownershipData memo already
-  // respects ss_pool_own as a Monte Carlo override — so simply setting
-  // this field flips every downstream consumer onto imported data without
-  // touching any ownership code path.
-  //
-  // Surname fallback matches the pattern from PrizePicksTab: if the
-  // import CSV has "Tomas Etcheverry" but the DK roster is "Tomas Martin
-  // Etcheverry", we still match via the last word.
-  const rawDkPlayersWithManualOwn = useMemo(() => {
-    if (!rawDkPlayers.length || Object.keys(manualOwn).length === 0) return rawDkPlayers;
-    // Normalize strips diacritics too — CSV may have "Joao Fonseca" while DK
-    // has "João Fonseca"; without NFD+accent-strip these fail to match.
-    const normalize = s => String(s || '')
-      .toLowerCase()
-      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-      .replace(/[.,'’`]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    const surname = s => {
-      const parts = normalize(s).split(' ').filter(Boolean);
-      return parts[parts.length - 1] || '';
-    };
-    // Build lookup maps from the import, keyed by normalized name
-    const exactNorm = {};
-    const bySurname = {};
-    Object.entries(manualOwn).forEach(([name, pct]) => {
-      exactNorm[normalize(name)] = pct;
-      const sn = surname(name);
-      if (sn) bySurname[sn] = bySurname[sn] === undefined ? pct : null;
-    });
-    const findPct = (playerName) => {
-      const n = normalize(playerName);
-      if (exactNorm[n] != null) return exactNorm[n];
-      const sn = surname(playerName);
-      if (sn && bySurname[sn] != null) return bySurname[sn];
-      return null;
-    };
-    return rawDkPlayers.map(p => {
-      const pct = findPct(p.name);
-      if (pct == null) return p;
-      return { ...p, ss_pool_own: pct };
-    });
-  }, [rawDkPlayers, manualOwn]);
   // Apply user projection overrides. For MMA, scale ceiling proportionally so proj:ceil ratio stays sane.
   // Value/cval are recomputed against salary so they reflect the new proj.
   const dkPlayers = useMemo(() => {
@@ -2036,35 +1892,38 @@ export default function App() {
   // projections, which doesn't change when the user privately edits their own
   // projections, so rawDkPlayers is also the semantically correct input.
   const ownershipData = useMemo(() => {
-    if (rawDkPlayersWithManualOwn.length === 0) return { overall: {}, cpt: {}, missingPoolOwn: [], manualMode: false };
-    // Manual mode is active whenever manualOwn state has entries — even if
-    // ZERO players matched. This makes matching failures LOUD (N/A for
-    // every player + visible banner) instead of silently falling back to
-    // Monte Carlo and hiding the problem.
-    const manualActive = Object.keys(manualOwn).length > 0;
-    if (manualActive) {
-      const missing = rawDkPlayersWithManualOwn
+    if (rawDkPlayers.length === 0) return { overall: {}, cpt: {}, missingPoolOwn: [] };
+    // When the backend has supplied ss_pool_own for ANY player on the slate,
+    // we're in MANUAL MODE:
+    //   - use ss_pool_own for players that have it
+    //   - leave missing players out of the ownership map (displays N/A)
+    //   - do NOT run Monte Carlo — partial sim-own data is better than
+    //     mixing imported and simulated numbers in the same column
+    //
+    // When NO player has ss_pool_own, fall back to Monte Carlo so the app
+    // still renders usable numbers on slates where Alta hasn't uploaded
+    // manual values yet.
+    const anyHasPoolOwn = rawDkPlayers.some(p => typeof p.ss_pool_own === 'number');
+    if (anyHasPoolOwn) {
+      const missing = rawDkPlayers
         .filter(p => typeof p.ss_pool_own !== 'number' && p.salary > 0)
         .map(p => p.name);
       const overall = {};
-      for (const p of rawDkPlayersWithManualOwn) {
+      for (const p of rawDkPlayers) {
         if (typeof p.ss_pool_own === 'number') overall[p.name] = p.ss_pool_own;
-        // Missing players are deliberately NOT added to the map. Consumers
-        // pass through `own[p.name] || 0` for math (so leverage calcs still
-        // work), and a separate missingPoolOwn set for rendering N/A.
+        // Missing players deliberately NOT added — DK tab renders N/A.
       }
-      return { overall, cpt: {}, missingPoolOwn: missing, manualMode: true };
+      return { overall, cpt: {}, missingPoolOwn: missing };
     }
-    // No manual import yet — classic Monte Carlo behavior
-    if (sport === 'tennis') return { ...simulateOwnership(rawDkPlayersWithManualOwn), missingPoolOwn: [], manualMode: false };
-    if (sport === 'mma')    return { ...simulateMMAOwnership(rawDkPlayersWithManualOwn), missingPoolOwn: [], manualMode: false };
-    if (sport === 'nba')    return { ...simulateNBAOwnership(rawDkPlayersWithManualOwn, data?.slate_type || 'showdown'), missingPoolOwn: [], manualMode: false };
-    return { overall: {}, cpt: {}, missingPoolOwn: [], manualMode: false };
-  }, [rawDkPlayersWithManualOwn, sport, data, manualOwn]);
+    // No manual values — classic Monte Carlo behavior
+    if (sport === 'tennis') return { ...simulateOwnership(rawDkPlayers), missingPoolOwn: [] };
+    if (sport === 'mma')    return { ...simulateMMAOwnership(rawDkPlayers), missingPoolOwn: [] };
+    if (sport === 'nba')    return { ...simulateNBAOwnership(rawDkPlayers, data?.slate_type || 'showdown'), missingPoolOwn: [] };
+    return { overall: {}, cpt: {}, missingPoolOwn: [] };
+  }, [rawDkPlayers, sport, data]);
   const ownership = ownershipData.overall;
   const cptOwnership = ownershipData.cpt;
   const missingPoolOwn = ownershipData.missingPoolOwn || [];
-  const manualMode = ownershipData.manualMode || false;
 
   if (error) {
     const expectedUrl = sport === 'mma' ? './slate-mma.json'
@@ -2441,7 +2300,7 @@ export default function App() {
       }
     `}</style>
     <div className="cursor-glow" aria-hidden="true" />
-    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} onImportSimOwn={handleImportSimOwn} onClearSimOwn={handleClearSimOwn} manualOwnMeta={manualOwnMeta} />
+    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} />
     {missingPoolOwn.length > 0 && (
       <div style={{
         padding: '10px 24px', background: 'rgba(245, 158, 11, 0.09)',
@@ -2497,22 +2356,8 @@ export default function App() {
   </div>);
 }
 
-function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick, onImportSimOwn, onClearSimOwn, manualOwnMeta }) {
+function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick }) {
   const hasArchive = manifestSlates && manifestSlates.length > 0;
-  const fileInputRef = useRef(null);
-  const hasImport = !!manualOwnMeta;
-  // Human-readable "12m ago" for the pill subtitle
-  const timeAgoLocal = (iso) => {
-    if (!iso) return '';
-    try {
-      const then = new Date(iso).getTime();
-      const diff = Math.round((Date.now() - then) / 1000);
-      if (diff < 60) return `${diff}s ago`;
-      if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
-      if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
-      return new Date(iso).toLocaleDateString();
-    } catch { return ''; }
-  };
   return (<div className="topbar">
     <div
       className="topbar-brand"
@@ -2531,61 +2376,6 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
       <span>Over<span className="brand-o">O</span>wned</span>
     </div>
     <div className="topbar-right">
-      {/* Sim Own source pill — click to import, click "×" to revert.
-          Tennis-only for now (MMA/NBA still use Monte Carlo). Shows at-a-
-          glance whether ownership is Monte Carlo or imported, and when. */}
-      {onImportSimOwn && sport === 'tennis' && (<>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".csv"
-          onChange={(e) => {
-            const f = e.target.files && e.target.files[0];
-            if (f) onImportSimOwn(f);
-            e.target.value = '';
-          }}
-          style={{ display: 'none' }}
-        />
-        <div style={{
-          display: 'flex', alignItems: 'stretch',
-          background: hasImport ? 'rgba(245,197,24,0.08)' : 'var(--bg)',
-          border: `1px solid ${hasImport ? 'rgba(245,197,24,0.35)' : 'var(--border-light)'}`,
-          borderRadius: 6, overflow: 'hidden',
-        }}>
-          <button
-            onClick={() => fileInputRef.current && fileInputRef.current.click()}
-            title={hasImport ? `Replace imported sim own (${manualOwnMeta.filename}, ${manualOwnMeta.rows} rows, ${timeAgoLocal(manualOwnMeta.uploadedAt)})` : 'Import sim ownership from CSV'}
-            style={{
-              background: 'transparent', border: 'none',
-              color: hasImport ? '#F5C518' : 'var(--text-muted)',
-              padding: '6px 10px', cursor: 'pointer',
-              display: 'inline-flex', alignItems: 'center', gap: 6,
-              fontSize: 11, fontWeight: 600, letterSpacing: '0.03em',
-              textTransform: 'uppercase',
-            }}
-          >
-            {/* Upload arrow icon */}
-            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 3v14"/><path d="M5 10l7-7 7 7"/><path d="M5 21h14"/>
-            </svg>
-            <span style={{ whiteSpace: 'nowrap' }}>
-              {hasImport ? `Sim own · ${timeAgoLocal(manualOwnMeta.uploadedAt)}` : 'Import sim own'}
-            </span>
-          </button>
-          {hasImport && (
-            <button
-              onClick={onClearSimOwn}
-              title="Clear imported sim own — revert to Monte Carlo"
-              style={{
-                background: 'transparent', border: 'none',
-                borderLeft: '1px solid rgba(245,197,24,0.25)',
-                color: 'var(--text-muted)', padding: '0 8px', cursor: 'pointer',
-                display: 'inline-flex', alignItems: 'center', fontSize: 14,
-              }}
-            >×</button>
-          )}
-        </div>
-      </>)}
       <div style={{ display: 'flex', background: 'var(--bg)', border: '1px solid var(--border-light)', borderRadius: 6, overflow: 'hidden' }}>
         <button onClick={() => onSportChange('tennis')} title="Tennis" aria-label="Tennis" style={{
           background: sport === 'tennis' ? 'var(--primary)' : 'transparent',
