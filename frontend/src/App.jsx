@@ -459,7 +459,33 @@ function oddsStyleForProb(p) {
   };
 }
 
-function OddsCell({ prob, source }) {
+// Track the first-seen wp for each (slate, player) pair in localStorage so
+// we can show "Δ since first load" on the DK tab. Call this at render time
+// — the setItem is idempotent (only writes when key is missing), so multiple
+// renders are safe. Returns null if no baseline yet (first render captures
+// it), or a decimal delta (current − baseline).
+//
+// Key format: owbase_{slateId}_{playerName}. Baselines persist across page
+// reloads, so "since I opened this slate" is the user-visible semantic.
+// Users can reset by clearing site data.
+function getWpBaseline(slateId, playerName, currentProb) {
+  if (!slateId || !playerName || currentProb == null) return null;
+  const key = `owbase_${slateId}_${playerName}`;
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored == null) {
+      localStorage.setItem(key, String(currentProb));
+      return null;  // first observation — no delta yet
+    }
+    const b = parseFloat(stored);
+    if (isNaN(b)) return null;
+    return currentProb - b;
+  } catch {
+    return null;  // localStorage blocked (private browsing, etc.)
+  }
+}
+
+function OddsCell({ prob, source, delta }) {
   if (source !== 'kalshi' || prob == null) {
     return (
       <span
@@ -481,6 +507,37 @@ function OddsCell({ prob, source }) {
   }
   const pct = Math.round(prob * 100);
   const style = oddsStyleForProb(prob);
+
+  // Delta rendering — only show when we have a baseline AND the change is
+  // meaningful (>= 1 percentage point either direction). Green up, red down.
+  // Kept visually subtle (smaller font, lower opacity) so it doesn't compete
+  // with the main percentage for attention.
+  let deltaEl = null;
+  if (delta != null) {
+    const deltaPct = delta * 100;
+    if (Math.abs(deltaPct) >= 1) {
+      const color = deltaPct > 0 ? '#4ADE80' : '#EF4444';
+      const arrow = deltaPct > 0 ? '▲' : '▼';
+      const sign = deltaPct > 0 ? '+' : '';
+      deltaEl = (
+        <span
+          style={{
+            display: 'block',
+            fontSize: 9,
+            fontWeight: 600,
+            color,
+            opacity: 0.85,
+            marginTop: 2,
+            letterSpacing: '0.02em',
+          }}
+          title={`Win% moved ${sign}${deltaPct.toFixed(1)}pp since first load`}
+        >
+          {arrow} {sign}{deltaPct.toFixed(1)}
+        </span>
+      );
+    }
+  }
+
   return (
     <span
       style={{
@@ -491,6 +548,7 @@ function OddsCell({ prob, source }) {
       }}
     >
       {pct}%
+      {deltaEl}
     </span>
   );
 }
@@ -2242,7 +2300,7 @@ export default function App() {
       </div>}
       {!buildError && <ErrorBoundary>
       {sport === 'tennis' && (<>
-        {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />}
+        {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
         {tab === 'pplines' && <PrizePicksTab slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} players={dkPlayers} />}
         {tab === 'build' && <BuilderTab players={dkPlayers} ownership={ownership} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} mc={data.matches?.length || 0} onGoToProjections={() => setTab('dk')} />}
         {tab === 'leverage' && <LeverageTab players={dkPlayers} />}
@@ -2413,7 +2471,7 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
 // ═══════════════════════════════════════════════════════════════════════
 // TENNIS COMPONENTS — UNCHANGED from v5 except BuilderTab gets contrarian
 // ═══════════════════════════════════════════════════════════════════════
-function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], excludedPlayers = [], onToggleLock, onToggleExclude, onClearLocks, onClearExcludes }) {
+function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], excludedPlayers = [], onToggleLock, onToggleExclude, onClearLocks, onClearExcludes, slateId }) {
   const [q, setQ] = useState('');
   const pw = useMemo(() => players.filter(p => p.salary > 0).map(p => ({ ...p, simOwn: own[p.name] || 0 })), [players, own]);
   const pwFiltered = useMemo(() => pw.filter(p => matchesSearch(p, q)), [pw, q]);
@@ -2738,7 +2796,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
         <td className="name">{p.name}</td><td className="muted">{p.opponent}</td>
         <td className="num">{fmtSal(p.salary)}</td>
         <td className="num" style={{ color: p.simOwn > 30 ? 'var(--amber)' : 'var(--text-muted)' }}>{fmt(p.simOwn, 1)}%</td>
-        <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} /></td>
+        <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} delta={getWpBaseline(slateId, p.name, p.oddsProb)} /></td>
         <td className="num">
           <span className={iv ? 'cell-top3' : 'cell-proj'}>
             <input type="number" step="0.01" className={`proj-edit ${isOver ? 'overridden' : ''}`}
