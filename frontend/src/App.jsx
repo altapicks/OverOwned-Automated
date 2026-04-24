@@ -1737,7 +1737,6 @@ export default function App() {
   // Label `l` becomes a hover tooltip via the title attribute; the tab bar shows icons only for a cleaner look.
   const buildTabs = () => [
     { id: 'dk', l: 'DraftKings Projections', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M3 17V9.5l4 3 2-6.5 3 6 3-6 2 6.5 4-3V17z"/><path d="M3 19h18"/></svg> },
-    { id: 'pp', l: 'PrizePicks Projections', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/></svg> },
     { id: 'pplines', l: 'PP Live Lines', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg> },
     { id: 'build', l: 'Lineup Builder', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L4 14h7l-1 8 10-12h-7l1-8z"/></svg> },
     { id: 'leverage', l: 'Live Leverage', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M7 3v18M4 7l3-4 3 4"/><path d="M17 21V3M14 17l3 4 3-4"/></svg> },
@@ -2111,7 +2110,6 @@ export default function App() {
       {!buildError && <ErrorBoundary>
       {sport === 'tennis' && (<>
         {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />}
-        {tab === 'pp' && <PPTab rows={ppRows} />}
         {tab === 'pplines' && <PrizePicksTab slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
         {tab === 'build' && <BuilderTab players={dkPlayers} ownership={ownership} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} mc={data.matches?.length || 0} onGoToProjections={() => setTab('dk')} />}
         {tab === 'leverage' && <LeverageTab players={dkPlayers} />}
@@ -2627,62 +2625,6 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
   </>);
 }
 
-function PPTab({ rows }) {
-  const [q, setQ] = useState('');
-  const rowsFiltered = useMemo(() => rows.filter(r => matchesSearch(r, q, ['player', 'stat', 'opponent'])), [rows, q]);
-  const { sorted, sortKey, sortDir, toggleSort } = useSort(rowsFiltered, 'ev', 'desc');
-  const S = p => <SH {...p} sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />;
-  const best = useMemo(() => [...rows].sort((a, b) => b.ev - a.ev).slice(0, 3), [rows]);
-  const worst = useMemo(() => [...rows].sort((a, b) => a.ev - b.ev).slice(0, 3), [rows]);
-  return (<>
-    <div className="section-hero">
-      <div className="section-hero-icon-wrap">
-        <svg className="section-hero-icon" viewBox="0 0 24 24" fill="none" stroke="#F5C518">
-          <circle cx="12" cy="12" r="9"/>
-          <circle cx="12" cy="12" r="5"/>
-          <circle cx="12" cy="12" r="1.5" fill="#F5C518" stroke="none"/>
-        </svg>
-      </div>
-      <div className="section-hero-text">
-        <h2 className="section-hero-title">PrizePicks Projections</h2>
-        <div className="section-hero-sub">All plays sorted by edge · Edge = Projected − PP Line</div>
-      </div>
-    </div>
-    <div style={{ background: 'rgba(245,197,24,0.06)', border: '1px solid rgba(245,197,24,0.25)', borderRadius: 8, padding: '10px 14px', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 10, fontSize: 13 }}>
-      <Icon name="trending-down" size={18} color="#F5C518"/>
-      <span style={{ color: 'var(--text-muted)' }}><strong style={{ color: 'var(--primary)', fontWeight: 700 }}>Hint:</strong> PrizePicks bad value will typically reverse</span>
-    </div>
-    <div className="metrics">
-      <div className="metric"><div className="metric-label"><Icon name="flame" size={13}/> Best Edge</div><div className="metric-value">{best.map((r, i) => <div key={i} style={{ fontSize: i === 0 ? '16px' : '13px', color: i === 0 ? 'var(--green-text)' : 'var(--text-muted)', fontWeight: i === 0 ? 700 : 500 }}>{r.player} · {r.stat} <span style={{fontSize:11, color: i === 0 ? undefined : 'var(--text-dim)'}}>{r.ev > 0 ? '+' : ''}{fmt(r.ev, 2)}</span>{r.mult && <span style={{fontSize:10,color: i === 0 ? 'var(--amber-text)' : 'var(--text-dim)',marginLeft:4}}>{r.mult}</span>}</div>)}</div></div>
-      <div className="metric"><div className="metric-label"><Icon name="trending-down" size={13}/> Biggest "Fades"</div><div className="metric-value">{worst.map((r, i) => <div key={i} style={{ fontSize: i === 0 ? '16px' : '13px', color: i === 0 ? 'var(--red-text)' : 'var(--text-muted)', fontWeight: i === 0 ? 700 : 500 }}>{r.player} · {r.stat} <span style={{fontSize:11, color: i === 0 ? undefined : 'var(--text-dim)'}}>{fmt(r.ev, 2)}</span></div>)}</div></div>
-    </div>
-    <SearchBar value={q} onChange={setQ} placeholder="Search plays, players, stats" total={rows.length} filtered={rowsFiltered.length} />
-    <div className="table-wrap"><table><thead><tr>
-      <th>#</th><th></th><S label="Player" colKey="player" /><S label="Stat" colKey="stat" />
-      <S label="PP Line" colKey="line" num /><S label="Projected" colKey="projected" num />
-      <S label="Edge" colKey="ev" num /><S label="Play" colKey="direction" />
-      <th>Mult</th><S label="Win%" colKey="wp" num /><S label="Opp" colKey="opponent" />
-    </tr></thead>
-    <tbody>{sorted.map((r, i) => {
-      const isBest = best.some(t => t.player === r.player && t.stat === r.stat);
-      const isWorst = worst.some(t => t.player === r.player && t.stat === r.stat);
-      const playDir = r.direction;
-      return <tr key={r.player + r.stat} className={isBest ? 'row-hl-green' : isWorst ? 'row-hl-red' : ''}>
-        <td className="muted">{i+1}</td>
-        <td>{isBest ? <Tip icon="flame" label="Best edge" /> : isWorst ? <Tip icon="trending-down" label="Fade" /> : ''}</td>
-        <td className="name">{r.player}</td>
-        <td style={{fontSize:11,color:'var(--text-muted)'}}>{r.stat}</td>
-        <td className="num">{fmt(r.line, 1)}</td>
-        <td className="num"><span className="cell-proj">{fmt(r.projected, 2)}</span></td>
-        <td className="num"><span className={isBest ? 'cell-ev-top' : isWorst ? 'cell-ev-worst' : r.ev > 0 ? 'cell-ev-pos' : 'cell-ev-neg'}>{r.ev > 0 ? '+' : ''}{fmt(r.ev, 2)}</span></td>
-        <td><span style={{color: playDir === 'MORE' ? 'var(--green-text)' : playDir === 'LESS' ? 'var(--red-text)' : 'var(--text-dim)', fontWeight:600}}>{playDir}</span></td>
-        <td style={{color:'var(--amber-text)',fontSize:11}}>{r.mult || ''}</td>
-        <td className="num muted">{fmtPct(r.wp)}</td>
-        <td className="muted">{r.opponent}</td>
-      </tr>;
-    })}</tbody></table></div>
-  </>);
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // TENNIS OVEROWNED MODE — 16+ MATCH SLATE RULESET (v3.24.12)
