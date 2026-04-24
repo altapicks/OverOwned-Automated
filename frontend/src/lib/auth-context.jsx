@@ -25,66 +25,91 @@ export function AuthProvider({ children }) {
   const [status, setStatus] = useState('loading');
 
   // Fetch subscription row for a given user. Called whenever the user changes.
+  // v5.13: hardened with a 4s timeout — a slow/stuck query must not block
+  // the UI. If it times out, we just leave subscription null; user can refresh.
   const loadSubscription = useCallback(async (userId) => {
     if (!userId) { setSubscription(null); return; }
-    const { data, error } = await supabase
-      .from('subscriptions')
-      .select('*')
-      .eq('user_id', userId)
-      .order('current_period_end', { ascending: false })  // latest/active one first
-      .limit(1)
-      .maybeSingle();
-    if (error) {
-      // Not a fatal error — user may simply have no subscription row yet.
-      // Log for debugging but don't block the app.
-      console.warn('[auth] subscription fetch error:', error.message);
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 4000);
+    try {
+      const { data, error } = await supabase
+        .from('subscriptions')
+        .select('*')
+        .eq('user_id', userId)
+        .order('current_period_end', { ascending: false })
+        .limit(1)
+        .abortSignal(abort.signal)
+        .maybeSingle();
+      clearTimeout(timer);
+      if (error) {
+        console.warn('[auth] subscription fetch error:', error.message);
+        setSubscription(null);
+        return;
+      }
+      setSubscription(data || null);
+    } catch (e) {
+      clearTimeout(timer);
+      console.warn('[auth] subscription fetch aborted/failed:', e?.message || e);
       setSubscription(null);
-      return;
     }
-    setSubscription(data || null);
   }, []);
 
-  // Check admin status against admin_users. RLS policy on that table uses
-  // is_admin() which means non-admins see 0 rows, admins see their own row.
-  // Either way the query succeeds — we just count rows.
+  // Check admin status against admin_users. RLS policy uses is_admin() which
+  // is security-definer, so this is a fast indexed PK lookup.
+  // v5.13: 4s timeout — must not block authentication status.
   const loadAdminStatus = useCallback(async (userId) => {
     if (!userId) { setIsAdmin(false); return; }
-    const { data, error } = await supabase
-      .from('admin_users')
-      .select('user_id')
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (error) {
-      console.warn('[auth] admin status check failed:', error.message);
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 4000);
+    try {
+      const { data, error } = await supabase
+        .from('admin_users')
+        .select('user_id')
+        .eq('user_id', userId)
+        .abortSignal(abort.signal)
+        .maybeSingle();
+      clearTimeout(timer);
+      if (error) {
+        console.warn('[auth] admin status check failed:', error.message);
+        setIsAdmin(false);
+        return;
+      }
+      setIsAdmin(!!data);
+    } catch (e) {
+      clearTimeout(timer);
+      console.warn('[auth] admin status aborted/failed:', e?.message || e);
       setIsAdmin(false);
-      return;
     }
-    setIsAdmin(!!data);
   }, []);
 
   // On mount: check existing session + listen for auth state changes.
+  // v5.13: status is set based purely on whether a session exists.
+  // Subscription + admin status load asynchronously in the background —
+  // they must NEVER block the authentication state transition. Otherwise
+  // a slow or hung aux query leaves the UI stuck on "Loading…" forever.
   useEffect(() => {
     let mounted = true;
 
-    // Initial session check (reads from localStorage via Supabase SDK).
-    supabase.auth.getSession().then(async ({ data: { session } }) => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
       if (!mounted) return;
       const u = session?.user ?? null;
       setUser(u);
-      if (u) {
-        await Promise.all([loadSubscription(u.id), loadAdminStatus(u.id)]);
-      }
       setStatus(u ? 'authenticated' : 'unauthenticated');
+      if (u) {
+        // Fire-and-forget — errors handled inside each load function
+        loadSubscription(u.id);
+        loadAdminStatus(u.id);
+      }
     });
 
-    // Subscribe to future auth changes (sign-in, sign-out, token refresh).
-    const { data: { subscription: authSub } } = supabase.auth.onAuthStateChange(async (event, session) => {
+    const { data: { subscription: authSub } } = supabase.auth.onAuthStateChange((event, session) => {
       if (!mounted) return;
       const u = session?.user ?? null;
       setUser(u);
       if (u) {
-        await Promise.all([loadSubscription(u.id), loadAdminStatus(u.id)]);
         setStatus('authenticated');
+        loadSubscription(u.id);
+        loadAdminStatus(u.id);
       } else {
         setSubscription(null);
         setIsAdmin(false);
@@ -119,15 +144,17 @@ export function AuthProvider({ children }) {
 
   // v5.11: update display_name in auth.users.user_metadata.
   // Returns { ok, error? } — the component handles UI feedback.
+  // v5.13: 6s timeout so the Save button never gets stuck indefinitely.
   const updateDisplayName = useCallback(async (name) => {
     const trimmed = (name || '').trim();
     if (!trimmed) return { ok: false, error: 'Display name cannot be empty.' };
     if (trimmed.length > 40) return { ok: false, error: 'Maximum 40 characters.' };
-    const { data, error } = await supabase.auth.updateUser({
-      data: { display_name: trimmed },
-    });
+    const timeoutPromise = new Promise((resolve) =>
+      setTimeout(() => resolve({ data: null, error: { message: 'Request timed out. Please try again.' } }), 6000)
+    );
+    const updatePromise = supabase.auth.updateUser({ data: { display_name: trimmed } });
+    const { data, error } = await Promise.race([updatePromise, timeoutPromise]);
     if (error) return { ok: false, error: error.message };
-    // Refresh local user object so UI picks up the change immediately.
     if (data?.user) setUser(data.user);
     return { ok: true };
   }, []);
