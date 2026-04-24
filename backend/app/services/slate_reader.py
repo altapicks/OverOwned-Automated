@@ -60,7 +60,7 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
                 start_time=m.get("start_time"),
                 tournament=m.get("tournament") or "",
                 surface=m.get("surface"),
-                odds=FrontendMatchOdds(),  # populated by odds service later
+                odds=FrontendMatchOdds(**(m.get("odds") or {})),
                 adj_a=0,
                 adj_b=0,
             )
