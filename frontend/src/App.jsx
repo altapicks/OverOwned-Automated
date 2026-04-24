@@ -2407,6 +2407,54 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
       <span>Over<span className="brand-o">O</span>wned</span>
     </div>
     <div className="topbar-right">
+      {/* v5.9: Window-gated Live indicator — positioned LEFT of the sport
+          picker. Appears only from first match start through 3 hours after
+          the last match. Outside that window there's nothing to track and
+          the indicator is just noise. Hidden on archived slates entirely.
+          Mobile: label collapses, only pulsing dot shows (see styles.css). */}
+      {data && (() => {
+        if (slateDate !== 'live') return null;
+        // Parse match/game start times. Shape varies by sport:
+        //   tennis: data.matches[].start_time   e.g. "04/24/2026 10:00AM ET"
+        //   mma:    data.fights[].start_time
+        //   nba:    data.game.tip
+        const items = data.matches || data.fights || (data.game ? [data.game] : []);
+        if (!items.length) return null;
+        const timeField = data.game ? 'tip' : 'start_time';
+        const parseStart = (s) => {
+          if (!s) return NaN;
+          // Try ISO first (2026-04-24T10:00:00Z etc.)
+          let t = new Date(s).getTime();
+          if (!isNaN(t)) return t;
+          // DK-style "MM/DD/YYYY HH:MM AM/PM ET" — approximate as local time.
+          // DST/timezone drift is ≤ 1hr which is fine for window gating.
+          const m = String(s).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(AM|PM)/i);
+          if (m) {
+            let h = parseInt(m[4], 10);
+            const ap = m[6].toUpperCase();
+            if (ap === 'PM' && h !== 12) h += 12;
+            if (ap === 'AM' && h === 12) h = 0;
+            return new Date(+m[3], +m[1] - 1, +m[2], h, +m[5]).getTime();
+          }
+          return NaN;
+        };
+        const starts = items.map(x => parseStart(x[timeField])).filter(t => !isNaN(t));
+        if (!starts.length) return null;
+        const firstStart = Math.min(...starts);
+        const lastStart  = Math.max(...starts);
+        const windowEnd = lastStart + 3 * 3600 * 1000;  // 3hr past last match start
+        const now = Date.now();
+        if (now < firstStart || now > windowEnd) return null;
+        return (
+          <span
+            className="oo-live-pill"
+            title="Data refreshes every 90 seconds. Expect Kalshi odds, sim own, and PP lines to shift as matches progress."
+          >
+            <span className="oo-live-pill-dot" />
+            <span className="oo-live-pill-label">Live</span>
+          </span>
+        );
+      })()}
       <div style={{ display: 'flex', background: 'var(--bg)', border: '1px solid var(--border-light)', borderRadius: 6, overflow: 'hidden' }}>
         <button onClick={() => onSportChange('tennis')} title="Tennis" aria-label="Tennis" style={{
           background: sport === 'tennis' ? 'var(--primary)' : 'transparent',
@@ -2489,46 +2537,9 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
             No live slate · showing most recent
           </span>;
         })()}
-        {/* v5.8: Passive Live indicator. Purely informative — tells the user
-            their data is auto-refreshing every 90s so they understand why
-            Kalshi odds, sim own, and PP lines shift during a build session.
-            Not a toggle; no click behavior. Shows "Archived" on historical
-            slates. */}
-        {(() => {
-          const isLive = slateDate === 'live';
-          return (
-            <span
-              className="oo-live-pill"
-              title={isLive
-                ? 'Data refreshes every 90 seconds. Expect Kalshi odds, sim own, and PP lines to shift as the market moves and closer to match time.'
-                : 'Historical slate — no live updates.'}
-              style={{
-                marginLeft: 8, padding: '2px 10px', borderRadius: 999,
-                background: isLive ? 'rgba(74, 222, 128, 0.10)' : 'rgba(139, 154, 186, 0.08)',
-                border: isLive ? '1px solid rgba(74, 222, 128, 0.35)' : '1px solid rgba(139, 154, 186, 0.25)',
-                color: isLive ? '#4ADE80' : 'var(--text-dim)',
-                fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5,
-                textTransform: 'uppercase', whiteSpace: 'nowrap',
-                display: 'inline-flex', alignItems: 'center', gap: 6,
-                cursor: 'help',
-              }}
-            >
-              <span style={{
-                width: 7, height: 7, borderRadius: '50%',
-                background: isLive ? '#4ADE80' : '#8B9ABA',
-                animation: isLive ? 'oo-live-pulse 2s ease-in-out infinite' : 'none',
-                boxShadow: isLive ? '0 0 6px rgba(74, 222, 128, 0.6)' : 'none',
-              }} />
-              {isLive ? 'Live' : 'Archived'}
-            </span>
-          );
-        })()}
-        <style>{`
-          @keyframes oo-live-pulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50%      { opacity: 0.55; transform: scale(0.85); }
-          }
-        `}</style>
+        {/* v5.8: Passive Live indicator relocated to topbar-right (sibling of
+            sport picker) so it sits to the left of the tennis ball. See
+            rendering logic just above `.topbar-right > .sport-picker`. */}
         {data.last_updated && <span className="topbar-date-updated"> · <span style={{color:'var(--green)',fontSize:12}}>Updated {data.last_updated}</span></span>}
       </div>}
       <a href="https://x.com/OverOwnedDFS" target="_blank" rel="noopener noreferrer" className="twitter-btn" title="@OverOwnedDFS">
@@ -3039,6 +3050,14 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
   const [variance, setVariance] = useState(2);                // ±% jitter on projections per build — differentiates outputs between users
   const [globalMax, setGlobalMax] = useState(100); const [globalMin, setGlobalMin] = useState(0);
   const [poolQ, setPoolQ] = useState('');
+  // v5.9: DK player ID override. User uploads the official DKSalaries.csv;
+  // we parse it for name→id and override at export time. Sidesteps any
+  // stale/mismapped IDs in the backend pipeline. Cleared on slate change.
+  const [dkIdOverrides, setDkIdOverrides] = useState(null);
+  // Reset overrides when the slate's player roster changes (new day's slate).
+  // Keyed on roster signature so stable re-renders don't churn it.
+  const rosterSig = useMemo(() => rp.map(p => p.name).sort().join('|'), [rp]);
+  useEffect(() => { setDkIdOverrides(null); }, [rosterSig]);
   // Favorites — classic-only (tennis showdown intentionally skipped).
   // Stored as name-based tuples so they survive rebuilds.
   const [favoriteLineups, setFavoriteLineups] = useState([]);
@@ -3166,18 +3185,68 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
   const dl = (c, f) => { const b = new Blob([c], { type: 'text/csv' }); const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = f; a.click(); URL.revokeObjectURL(a.href); };
   const exportDK = () => {
     if (!res) return;
+    // v5.9: if user uploaded DKSalaries.csv, use those IDs instead of
+    // whatever came through the backend pipeline. Falls back to p.id
+    // when there's no override or no match for a player's name.
+    const idFor = (p, fallback) => (dkIdOverrides && dkIdOverrides[p.name]) || fallback;
     if (res.isShowdown) {
       let c = 'CPT,A-CPT,P\n';
       res.lineups.forEach(lu => {
         const cptP = res.pData[lu.cpt], acptP = res.pData[lu.acpt], flexP = res.pData[lu.flex];
-        c += `${cptP.cpt_id},${acptP.acpt_id},${flexP.flex_id}\n`;
+        c += `${idFor(cptP, cptP.cpt_id)},${idFor(acptP, acptP.acpt_id)},${idFor(flexP, flexP.flex_id)}\n`;
       });
       dl(c, 'dk_upload_showdown.csv');
       return;
     }
     let c = 'P,P,P,P,P,P\n';
-    res.lineups.forEach(lu => { const ps = lu.players.map(i => res.pData[i]).sort((a, b) => b.salary - a.salary); c += ps.map(p => p.id).join(',') + '\n'; });
+    res.lineups.forEach(lu => {
+      const ps = lu.players.map(i => res.pData[i]).sort((a, b) => b.salary - a.salary);
+      c += ps.map(p => idFor(p, p.id)).join(',') + '\n';
+    });
     dl(c, 'dk_upload.csv');
+  };
+  // v5.9: parse uploaded DKSalaries.csv. Skips DK's leading 7 empty cols,
+  // finds header row by column[7]==='Position', maps Name → ID.
+  const onDkCsvUpload = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const raw = evt.target.result.replace(/^\uFEFF/, '');
+        const lines = raw.split(/\r?\n/);
+        const parseCsvLine = (line) => {
+          const cols = []; let cur = '', inQuotes = false;
+          for (let i = 0; i < line.length; i++) {
+            const c = line[i];
+            if (c === '"') { if (inQuotes && line[i+1] === '"') { cur += '"'; i++; } else inQuotes = !inQuotes; }
+            else if (c === ',' && !inQuotes) { cols.push(cur); cur = ''; }
+            else cur += c;
+          }
+          cols.push(cur); return cols;
+        };
+        // Find header row: ,,,,,,,Position,Name + ID,Name,ID,...
+        let headerIdx = -1;
+        for (let i = 0; i < lines.length; i++) {
+          const cols = parseCsvLine(lines[i]);
+          if (cols.length > 10 && cols[7] === 'Position' && cols[9] === 'Name') { headerIdx = i; break; }
+        }
+        if (headerIdx < 0) { alert('Could not find DK salaries header row. Expected "Position,Name + ID,Name,ID,…"'); return; }
+        const map = {};
+        for (let i = headerIdx + 1; i < lines.length; i++) {
+          const cols = parseCsvLine(lines[i]);
+          if (cols.length < 11) continue;
+          const name = (cols[9] || '').trim();
+          const id   = (cols[10] || '').trim();
+          if (name && id) map[name] = id;
+        }
+        const count = Object.keys(map).length;
+        if (count === 0) { alert('No player IDs found in the CSV.'); return; }
+        setDkIdOverrides(map);
+      } catch (e) {
+        alert('Failed to parse DK salaries CSV: ' + e.message);
+      }
+    };
+    reader.readAsText(file);
   };
   const exportReadable = () => {
     if (!res) return;
@@ -3310,11 +3379,11 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
       <Icon name="bolt" size={14}/> Build {nL} {isShowdown ? 'Showdown' : ''} Lineups{contrarianOn ? ' (Contrarian)' : ''}
     </button>
     {isBuilding && <BuildAnimation count={nL} />}
-    {!isBuilding && res && <ExposureResults res={res} ownership={ownership} onRebuild={run} onExportDK={exportDK} onExportReadable={exportReadable} nL={nL} canBuild={canBuild} overrideCount={overrideCount} favoriteLineups={favoriteLineups} onToggleFavorite={toggleFavoriteLineup} prevRes={prevRes} onRestorePrev={() => { setRes(prevRes); setPrevRes(null); }} />}
+    {!isBuilding && res && <ExposureResults res={res} ownership={ownership} onRebuild={run} onExportDK={exportDK} onExportReadable={exportReadable} nL={nL} canBuild={canBuild} overrideCount={overrideCount} favoriteLineups={favoriteLineups} onToggleFavorite={toggleFavoriteLineup} prevRes={prevRes} onRestorePrev={() => { setRes(prevRes); setPrevRes(null); }} onDkCsvUpload={onDkCsvUpload} dkIdOverrides={dkIdOverrides} onClearDkOverrides={() => setDkIdOverrides(null)} />}
   </>);
 }
 
-function ExposureResults({ res, ownership, onRebuild, onExportDK, onExportReadable, nL, canBuild = true, overrideCount = 2, favoriteLineups = [], onToggleFavorite, prevRes, onRestorePrev }) {
+function ExposureResults({ res, ownership, onRebuild, onExportDK, onExportReadable, nL, canBuild = true, overrideCount = 2, favoriteLineups = [], onToggleFavorite, prevRes, onRestorePrev, onDkCsvUpload, dkIdOverrides, onClearDkOverrides }) {
   const [q, setQ] = useState('');
   // v3.24.14: MME-style metrics — lineup-set health stats that beginners
   // miss but power players optimize for. Median/stdev of cumulative
@@ -3400,6 +3469,14 @@ function ExposureResults({ res, ownership, onRebuild, onExportDK, onExportReadab
       {onExportDK && <button className="btn btn-primary" onClick={onExportDK} style={{ flex: '1 1 auto', width: 'auto', background: 'linear-gradient(135deg, #15803D, #22C55E)' }}><Icon name="download" size={14}/> Download DK Upload CSV</button>}
       {onExportReadable && <button className="btn btn-outline" onClick={onExportReadable} style={{ flex: '1 1 auto', width: 'auto', marginTop: 0 }}><Icon name="download" size={14}/> Readable CSV</button>}
     </div>
+    {/* v5.9: DK ID override uploader. */}
+    {onDkCsvUpload && (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', marginTop: 10, background: 'rgba(30, 41, 59, 0.4)', border: '1px solid var(--border)', borderRadius: 8, flexWrap: 'wrap' }}>
+        <label htmlFor="dk-csv-upload-tennis" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', cursor: 'pointer' }} title="Upload today's official DKSalaries.csv to override player IDs at export."><Icon name="upload" size={12}/> Upload DKSalaries.csv</label>
+        <input id="dk-csv-upload-tennis" type="file" accept=".csv" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; onDkCsvUpload(f); e.target.value = ''; }} />
+        {dkIdOverrides ? (<><span style={{ fontSize: 12, color: '#4ADE80', fontWeight: 600 }}>✓ {Object.keys(dkIdOverrides).length} player IDs loaded — exports will use these</span>{onClearDkOverrides && (<button onClick={onClearDkOverrides} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', fontSize: 11, cursor: 'pointer', textDecoration: 'underline' }} title="Clear the uploaded IDs">clear</button>)}</>) : (<span style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.4 }}>If your DK upload gets rejected for bad IDs, drop today's DKSalaries.csv here to override.</span>)}
+      </div>
+    )}
     <div className="section-head" style={{ marginTop: 20 }}><Icon name="chart" size={16} color="#F5C518"/> Exposure</div>
     <SearchBar value={q} onChange={setQ} placeholder="Search exposure" total={expData.length} filtered={expFiltered.length} />
     <div className="table-wrap" style={{ marginBottom: 20 }}><table><thead><tr>
