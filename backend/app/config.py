@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     dk_poll_interval_minutes: int = 15
     dk_sports: str = "TEN"
 
+    # In-process worker (default ON — single-service Railway deployments)
+    # Set to false if running a separate Railway worker service.
+    enable_in_process_worker: bool = True
+
     # Slate filtering
     dk_slate_types: str = "classic"  # comma list: classic,showdown,other
     dk_fallback_to_showdown: bool = True  # when no Classic found, ingest Showdown instead
