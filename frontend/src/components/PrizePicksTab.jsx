@@ -96,13 +96,15 @@ export function PrizePicksTab({ slateId, players = [] }) {
     } catch (e) { setError(e.message); }
   }, [slateId]);
 
-  if (!slateId) return <div className="empty"><p>No active slate.</p></div>;
-  if (loading) return <div className="empty"><p>Loading PrizePicks lines…</p></div>;
-
   // Build a lookup of projected values per (player, stat) for edge computation.
   // Lines are compared against our model's projection to produce edge signals.
   // Color coding: green = MORE (project over line), red = LESS (project under).
   // Edge drives Hidden Gem + PP Fade signals in the DK tab.
+  //
+  // RULES-OF-HOOKS: all useMemo/useCallback MUST be above the early-return
+  // guards below. React tracks hooks by call order — returning early before
+  // calling these hooks on the first render and then calling them on the
+  // second render produces error #310.
   const playersByName = useMemo(() => {
     const m = {};
     (players || []).forEach(p => { m[p.name] = p; });
@@ -174,6 +176,10 @@ export function PrizePicksTab({ slateId, players = [] }) {
       </th>
     );
   };
+
+  // Early returns must come AFTER all hooks — see rules-of-hooks note above.
+  if (!slateId) return <div className="empty"><p>No active slate.</p></div>;
+  if (loading) return <div className="empty"><p>Loading PrizePicks lines…</p></div>;
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '1fr 320px', gap: 16 }}>
