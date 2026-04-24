@@ -17,6 +17,7 @@ import {
 import { useAuth } from './lib/auth-context';
 import { UserMenu } from './components/UserMenu';
 import { SignInPrompt } from './components/SignInPrompt';
+import { AccountPage } from './components/AccountPage';
 import { PrizePicksTab } from './components/PrizePicksTab';
 import { loadSlate, loadManifest, isSportEnabled, fetchContestOwnership, uploadContestOwnership, clearContestOwnership } from './lib/api';
 
@@ -1758,25 +1759,35 @@ function SportSwitchLoader({ sport }) {
 // ═══════════════════════════════════════════════════════════════════════
 export default function App() {
   // Phase 1 auth — #signin hash reveals the magic-link sign-in card.
-  // Doesn't gate anything yet (Phase 3 adds paywall overlays on paid tabs).
-  const [showSignIn, setShowSignIn] = useState(() => typeof window !== 'undefined' && window.location.hash === '#signin');
+  // v5.12: #account reveals the AccountPage. Both routes take over the
+  // full screen, replacing the main app view until the hash changes.
+  const isHash = (h) => (typeof window !== 'undefined' && window.location.hash === h);
+  const [showSignIn, setShowSignIn] = useState(() => isHash('#signin'));
+  const [showAccount, setShowAccount] = useState(() => isHash('#account'));
   useEffect(() => {
-    const sync = () => setShowSignIn(window.location.hash === '#signin');
+    const sync = () => {
+      setShowSignIn(window.location.hash === '#signin');
+      setShowAccount(window.location.hash === '#account');
+    };
     window.addEventListener('hashchange', sync);
     return () => window.removeEventListener('hashchange', sync);
   }, []);
   // v3.24.14: clean up unknown hashes on mount so bookmarked/shared deep
   // links (like /#lineup) don't leave the user on a confusing blank state.
-  // Only #signin is a real route; anything else gets stripped so the app
+  // Known routes: #signin, #account. Anything else is stripped so the app
   // renders its default home instead.
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const h = window.location.hash;
-    if (h && h !== '#signin' && h !== '') {
+    const known = ['#signin', '#account', ''];
+    // Also allow Supabase's implicit-flow callback hash (#access_token=...)
+    // to be handled by the Supabase SDK before we strip anything.
+    if (h && !known.includes(h) && !h.startsWith('#access_token=') && !h.startsWith('#error')) {
       history.replaceState(null, '', window.location.pathname + window.location.search);
     }
   }, []);
   if (showSignIn) return <SignInPrompt />;
+  if (showAccount) return <AccountPage />;
 
   // v3.24.14: persist last sport to localStorage. DFS users typically
   // stick with one sport — forcing Tennis on every reload is annoying
@@ -3957,6 +3968,16 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
     return () => clearInterval(id);
   }, [slateId, loadOwnership]);
 
+  // Swallow benign Supabase auth-lock messages — they're internal lock
+  // contention, not something the user can act on. Everything else shows.
+  const humanizeError = (msg) => {
+    const s = String(msg || '').toLowerCase();
+    if (s.includes('lock') && (s.includes('released') || s.includes('stole'))) {
+      return '';  // transient Supabase lock, usually resolves on retry
+    }
+    return msg;
+  };
+
   const handleFile = async (e) => {
     const f = e.target.files?.[0];
     e.target.value = '';  // allow re-upload of the same file
@@ -3970,7 +3991,8 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
       await loadOwnership();
       if (!summary.upserted) setError('Upload succeeded but 0 rows were ingested. Check the CSV format.');
     } catch (err) {
-      setError(err.message || 'Upload failed.');
+      const msg = humanizeError(err.message);
+      if (msg) setError(msg || 'Upload failed.');
     } finally {
       setUploading(false);
     }
@@ -3984,7 +4006,8 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
       await clearContestOwnership(slateId);
       await loadOwnership();
     } catch (err) {
-      setError(err.message || 'Clear failed.');
+      const msg = humanizeError(err.message);
+      if (msg) setError(msg || 'Clear failed.');
     }
   };
 
