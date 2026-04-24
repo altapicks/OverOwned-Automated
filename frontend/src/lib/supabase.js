@@ -26,7 +26,14 @@ export const supabase = createClient(url, anonKey, {
     autoRefreshToken: true,
     // Detect session in URL after magic-link callback.
     detectSessionInUrl: true,
-    // Use PKCE flow (more secure, standard for SPAs).
-    flowType: 'pkce',
+    // Implicit flow — carries the session directly in the URL hash after
+    // the magic link redirects. Unlike PKCE, it does NOT require a code
+    // verifier to be present in the clicking browser's localStorage, so
+    // cross-device sign-in works (request link on desktop, click on phone
+    // or vice versa). Slightly less secure than PKCE in theory because
+    // hashes are visible in server logs, but for email magic-links this
+    // is the industry-standard trade-off (auth proof is already the fact
+    // that the user accessed their own inbox).
+    flowType: 'implicit',
   },
 });
