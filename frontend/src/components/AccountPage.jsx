@@ -309,11 +309,38 @@ export function AccountPage() {
     signOut, updateDisplayName, status,
   } = useAuth();
   const [busy, setBusy] = useState(false);
+  // v5.16: surface "still loading" if auth-context never transitions out of
+  // 'loading'. With v5.13 timeouts this should never happen — but if it does,
+  // give the user actionable info instead of an infinite spinner.
+  const [showSlowHint, setShowSlowHint] = useState(false);
+  useEffect(() => {
+    if (status !== 'loading') return;
+    const t = setTimeout(() => setShowSlowHint(true), 3000);
+    return () => clearTimeout(t);
+  }, [status]);
 
   if (status === 'loading') {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ color: '#8B9ABA', fontSize: 13 }}>Loading…</div>
+      <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+        <div style={{ color: '#8B9ABA', fontSize: 13, marginBottom: 16 }}>Loading…</div>
+        {showSlowHint && (
+          <>
+            <div style={{ color: '#F59E0B', fontSize: 12, textAlign: 'center', maxWidth: 360, lineHeight: 1.5 }}>
+              Taking longer than expected. Your session may need to refresh.
+            </div>
+            <button
+              onClick={() => window.location.reload()}
+              style={{
+                marginTop: 14, padding: '8px 18px', fontSize: 12, fontWeight: 600,
+                background: 'transparent', color: '#F5C518',
+                border: '1px solid rgba(245,197,24,0.4)', borderRadius: 6, cursor: 'pointer',
+                fontFamily: 'inherit',
+              }}
+            >
+              Refresh
+            </button>
+          </>
+        )}
       </div>
     );
   }
