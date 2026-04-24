@@ -21,6 +21,34 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 
+def _build_opening_odds_model(raw: Optional[dict]) -> FrontendMatchOdds:
+    """Flatten stored opening_odds (source-keyed) into FrontendMatchOdds.
+
+    Stored shape:
+      {"kalshi": {"implied_prob_a": 0.62, "implied_prob_b": 0.38, ...},
+       "the_odds_api": {"ml_a": -175, "ml_b": 137, ...}}
+
+    Flat keys used by engine.js/frontend:
+      - kalshi_prob_a / kalshi_prob_b   from kalshi.implied_prob_*
+      - ml_a / ml_b                     from the_odds_api.ml_*
+    """
+    if not raw or not isinstance(raw, dict):
+        return FrontendMatchOdds()
+    flat: dict = {}
+    kalshi = raw.get("kalshi") or {}
+    if isinstance(kalshi, dict):
+        if kalshi.get("implied_prob_a") is not None:
+            flat["kalshi_prob_a"] = kalshi["implied_prob_a"]
+        if kalshi.get("implied_prob_b") is not None:
+            flat["kalshi_prob_b"] = kalshi["implied_prob_b"]
+    odds_api = raw.get("the_odds_api") or {}
+    if isinstance(odds_api, dict):
+        for k in ("ml_a", "ml_b", "gw_a_line", "gw_a_over", "gw_b_line", "gw_b_over"):
+            if odds_api.get(k) is not None:
+                flat[k] = odds_api[k]
+    return FrontendMatchOdds(**flat)
+
+
 def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     """Hydrate a complete slate into the shape the frontend expects."""
     db = get_client()
@@ -61,6 +89,11 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
                 tournament=m.get("tournament") or "",
                 surface=m.get("surface"),
                 odds=FrontendMatchOdds(**(m.get("odds") or {})),
+                # opening_odds may include kalshi_prob_a/kalshi_prob_b sub-keys
+                # nested under 'kalshi'. Flatten the flat keys to the top level
+                # so the frontend reads match.opening_odds.kalshi_prob_a without
+                # drilling. Mirrors how live odds are laid out.
+                opening_odds=_build_opening_odds_model(m.get("opening_odds")),
                 adj_a=0,
                 adj_b=0,
             )
@@ -80,18 +113,23 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
             {"name": display, "id": 0, "salary": 0, "avg_ppg": 0},
         )
         rp = sp.get("roster_position") or "P"
+        # v5.10: prefer dk_player_id_override when set. The slate_watcher
+        # worker overwrites dk_player_id on every 15-min poll, so any manual
+        # SQL correction to dk_player_id gets clobbered. Override column is
+        # never touched by the worker — operators set it and it persists.
+        effective_dk_id = sp.get("dk_player_id_override") or sp["dk_player_id"]
         if rp in ("P", "FLEX"):
             # Classic: P. Showdown flex: FLEX.
-            entry["id"] = sp["dk_player_id"]
+            entry["id"] = effective_dk_id
             entry["salary"] = sp["salary"]
             entry["avg_ppg"] = float(sp["avg_ppg"] or 0)
-            entry["flex_id"] = sp["dk_player_id"]
+            entry["flex_id"] = effective_dk_id
             entry["flex_salary"] = sp["salary"]
         elif rp == "CPT":
-            entry["cpt_id"] = sp["dk_player_id"]
+            entry["cpt_id"] = effective_dk_id
             entry["cpt_salary"] = sp["salary"]
         elif rp == "ACPT":
-            entry["acpt_id"] = sp["dk_player_id"]
+            entry["acpt_id"] = effective_dk_id
             entry["acpt_salary"] = sp["salary"]
         # ss_pool_own — set on any row for this player (usually the P/FLEX
         # row). None-safe: float(None) would throw, so only cast if present.
