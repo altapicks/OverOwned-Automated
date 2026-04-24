@@ -18,7 +18,7 @@ import { useAuth } from './lib/auth-context';
 import { UserMenu } from './components/UserMenu';
 import { SignInPrompt } from './components/SignInPrompt';
 import { PrizePicksTab } from './components/PrizePicksTab';
-import { loadSlate, loadManifest, isSportEnabled } from './lib/api';
+import { loadSlate, loadManifest, isSportEnabled, fetchContestOwnership, uploadContestOwnership, clearContestOwnership } from './lib/api';
 
 // ═══════════════════════════════════════════════════════════════════════
 // ERROR BOUNDARY — catches any runtime crash and shows it on screen
@@ -532,8 +532,29 @@ function oddsStyleForProb(p) {
 // Key format: owbase_{slateId}_{playerName}. Baselines persist across page
 // reloads, so "since I opened this slate" is the user-visible semantic.
 // Users can reset by clearing site data.
-function getWpBaseline(slateId, playerName, currentProb) {
-  if (!slateId || !playerName || currentProb == null) return null;
+// Returns the delta (current_prob − baseline_prob) in *probability* terms,
+// or null when we don't have a baseline yet.
+//
+// Two baseline sources, in priority order:
+//   1. Backend canonical — match.opening_odds.kalshi_prob_{a|b}. Frozen on
+//      first ingest, never updated. Populated for newer slates; empty on
+//      legacy slates. Used when present because it's the same value for
+//      every user (canonical closing-line movement on archived slates).
+//   2. Per-user localStorage baseline — owbase_{slateId}_{playerName}. What
+//      the current session first observed. Used as fallback when there's no
+//      canonical baseline. Keeps behavior intact on old slates.
+//
+// Key format: owbase_{slateId}_{playerName}. Baselines persist across page
+// reloads, so "since I opened this slate" is the user-visible semantic.
+// Users can reset by clearing site data.
+function getWpBaseline(slateId, playerName, currentProb, canonicalOpeningProb = null) {
+  if (currentProb == null) return null;
+  // Prefer canonical (backend) baseline when present — value is canonical
+  // across users and survives archive snapshots.
+  if (canonicalOpeningProb != null && !isNaN(canonicalOpeningProb)) {
+    return currentProb - canonicalOpeningProb;
+  }
+  if (!slateId || !playerName) return null;
   const key = `owbase_${slateId}_${playerName}`;
   try {
     const stored = localStorage.getItem(key);
@@ -630,6 +651,12 @@ function buildProjections(data) {
     // wp so the UI can show source attribution without re-doing the math.
     const o = match.odds || {};
     const oddsForPlayer = computeOddsDisplay(o);
+    // Canonical opening-odds baseline — backend-frozen on first ingest, so
+    // every user sees the same "moved from X" delta regardless of when
+    // they first loaded the slate. Shape matches match.odds (flat keys).
+    // Empty object on legacy slates where opening_odds was never captured;
+    // frontend falls back to per-user localStorage baseline in that case.
+    const openingForPlayer = computeOddsDisplay(match.opening_odds || {});
     [['player_a', stats.player_a, 'a'], ['player_b', stats.player_b, 'b']].forEach(([side, s, abKey]) => {
       const name = match[side]; const dk = dkMap[name]; if (!dk) return;
       const proj = dkProjection(s);
@@ -638,6 +665,9 @@ function buildProjections(data) {
         // Odds display: probability + source (kalshi | market | null)
         oddsProb: oddsForPlayer[abKey].prob,
         oddsSource: oddsForPlayer[abKey].source,
+        // Canonical opening prob — used by OddsCell to show archived-slate
+        // deltas that are consistent across users. Null on legacy data.
+        openingProb: openingForPlayer[abKey].prob,
         // Showdown tiers — undefined for classic slates (harmless)
         cpt_id: dk.cpt_id, cpt_salary: dk.cpt_salary,
         acpt_id: dk.acpt_id, acpt_salary: dk.acpt_salary,
@@ -1990,7 +2020,7 @@ export default function App() {
     { id: 'dk', l: 'DraftKings Projections', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M3 17V9.5l4 3 2-6.5 3 6 3-6 2 6.5 4-3V17z"/><path d="M3 19h18"/></svg> },
     { id: 'pplines', l: 'PrizePicks Projections', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/></svg> },
     { id: 'build', l: 'Lineup Builder', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L4 14h7l-1 8 10-12h-7l1-8z"/></svg> },
-    { id: 'tracker', l: 'Tracker', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> },
+    { id: 'tracker', l: 'Leverage', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> },
     { id: 'record', l: 'Track Record', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M7 15l4-5 4 3 6-8"/></svg> }
   ];
   const tabs = buildTabs();
@@ -2447,11 +2477,42 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
         if (now < firstStart || now > windowEnd) return null;
         return (
           <span
-            className="oo-live-pill"
+            style={{
+              marginLeft: 8,
+              padding: '3px 10px',
+              borderRadius: 999,
+              background: 'rgba(74, 222, 128, 0.10)',
+              border: '1px solid rgba(74, 222, 128, 0.35)',
+              color: '#4ADE80',
+              fontSize: 10.5,
+              fontWeight: 700,
+              letterSpacing: 0.5,
+              textTransform: 'uppercase',
+              whiteSpace: 'nowrap',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              cursor: 'help',
+              flexShrink: 0,
+            }}
             title="Data refreshes every 90 seconds. Expect Kalshi odds, sim own, and PP lines to shift as matches progress."
           >
-            <span className="oo-live-pill-dot" />
-            <span className="oo-live-pill-label">Live</span>
+            <span style={{
+              width: 7,
+              height: 7,
+              borderRadius: '50%',
+              background: '#4ADE80',
+              boxShadow: '0 0 6px rgba(74, 222, 128, 0.6)',
+              animation: 'oo-live-pulse 2s ease-in-out infinite',
+              flexShrink: 0,
+            }} />
+            Live
+            <style>{`
+              @keyframes oo-live-pulse {
+                0%, 100% { opacity: 1; transform: scale(1); }
+                50%      { opacity: 0.55; transform: scale(0.85); }
+              }
+            `}</style>
           </span>
         );
       })()}
@@ -2783,7 +2844,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
         <td className="name">{p.name}</td><td className="muted">{p.opponent}</td>
         <td className="num">{fmtSal(p.salary)}</td>
         <td className="num" style={{ color: p.simOwn > 30 ? 'var(--amber)' : 'var(--text-muted)' }}>{missingSet.has(p.name) ? <span style={{ fontStyle: 'italic', color: 'var(--text-dim)' }}>N/A</span> : fmt(p.simOwn, 1) + '%'}</td>
-        <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} delta={getWpBaseline(slateId, p.name, p.oddsProb)} /></td>
+        <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} delta={getWpBaseline(slateId, p.name, p.oddsProb, p.openingProb)} /></td>
         <td className="num">
           <span className={iv ? 'cell-top3' : 'cell-proj'}>
             <input type="number" step="0.01" className={`proj-edit ${isOver ? 'overridden' : ''}`}
@@ -3050,14 +3111,6 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
   const [variance, setVariance] = useState(2);                // ±% jitter on projections per build — differentiates outputs between users
   const [globalMax, setGlobalMax] = useState(100); const [globalMin, setGlobalMin] = useState(0);
   const [poolQ, setPoolQ] = useState('');
-  // v5.9: DK player ID override. User uploads the official DKSalaries.csv;
-  // we parse it for name→id and override at export time. Sidesteps any
-  // stale/mismapped IDs in the backend pipeline. Cleared on slate change.
-  const [dkIdOverrides, setDkIdOverrides] = useState(null);
-  // Reset overrides when the slate's player roster changes (new day's slate).
-  // Keyed on roster signature so stable re-renders don't churn it.
-  const rosterSig = useMemo(() => rp.map(p => p.name).sort().join('|'), [rp]);
-  useEffect(() => { setDkIdOverrides(null); }, [rosterSig]);
   // Favorites — classic-only (tennis showdown intentionally skipped).
   // Stored as name-based tuples so they survive rebuilds.
   const [favoriteLineups, setFavoriteLineups] = useState([]);
@@ -3185,68 +3238,18 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
   const dl = (c, f) => { const b = new Blob([c], { type: 'text/csv' }); const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = f; a.click(); URL.revokeObjectURL(a.href); };
   const exportDK = () => {
     if (!res) return;
-    // v5.9: if user uploaded DKSalaries.csv, use those IDs instead of
-    // whatever came through the backend pipeline. Falls back to p.id
-    // when there's no override or no match for a player's name.
-    const idFor = (p, fallback) => (dkIdOverrides && dkIdOverrides[p.name]) || fallback;
     if (res.isShowdown) {
       let c = 'CPT,A-CPT,P\n';
       res.lineups.forEach(lu => {
         const cptP = res.pData[lu.cpt], acptP = res.pData[lu.acpt], flexP = res.pData[lu.flex];
-        c += `${idFor(cptP, cptP.cpt_id)},${idFor(acptP, acptP.acpt_id)},${idFor(flexP, flexP.flex_id)}\n`;
+        c += `${cptP.cpt_id},${acptP.acpt_id},${flexP.flex_id}\n`;
       });
       dl(c, 'dk_upload_showdown.csv');
       return;
     }
     let c = 'P,P,P,P,P,P\n';
-    res.lineups.forEach(lu => {
-      const ps = lu.players.map(i => res.pData[i]).sort((a, b) => b.salary - a.salary);
-      c += ps.map(p => idFor(p, p.id)).join(',') + '\n';
-    });
+    res.lineups.forEach(lu => { const ps = lu.players.map(i => res.pData[i]).sort((a, b) => b.salary - a.salary); c += ps.map(p => p.id).join(',') + '\n'; });
     dl(c, 'dk_upload.csv');
-  };
-  // v5.9: parse uploaded DKSalaries.csv. Skips DK's leading 7 empty cols,
-  // finds header row by column[7]==='Position', maps Name → ID.
-  const onDkCsvUpload = (file) => {
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const raw = evt.target.result.replace(/^\uFEFF/, '');
-        const lines = raw.split(/\r?\n/);
-        const parseCsvLine = (line) => {
-          const cols = []; let cur = '', inQuotes = false;
-          for (let i = 0; i < line.length; i++) {
-            const c = line[i];
-            if (c === '"') { if (inQuotes && line[i+1] === '"') { cur += '"'; i++; } else inQuotes = !inQuotes; }
-            else if (c === ',' && !inQuotes) { cols.push(cur); cur = ''; }
-            else cur += c;
-          }
-          cols.push(cur); return cols;
-        };
-        // Find header row: ,,,,,,,Position,Name + ID,Name,ID,...
-        let headerIdx = -1;
-        for (let i = 0; i < lines.length; i++) {
-          const cols = parseCsvLine(lines[i]);
-          if (cols.length > 10 && cols[7] === 'Position' && cols[9] === 'Name') { headerIdx = i; break; }
-        }
-        if (headerIdx < 0) { alert('Could not find DK salaries header row. Expected "Position,Name + ID,Name,ID,…"'); return; }
-        const map = {};
-        for (let i = headerIdx + 1; i < lines.length; i++) {
-          const cols = parseCsvLine(lines[i]);
-          if (cols.length < 11) continue;
-          const name = (cols[9] || '').trim();
-          const id   = (cols[10] || '').trim();
-          if (name && id) map[name] = id;
-        }
-        const count = Object.keys(map).length;
-        if (count === 0) { alert('No player IDs found in the CSV.'); return; }
-        setDkIdOverrides(map);
-      } catch (e) {
-        alert('Failed to parse DK salaries CSV: ' + e.message);
-      }
-    };
-    reader.readAsText(file);
   };
   const exportReadable = () => {
     if (!res) return;
@@ -3379,11 +3382,11 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
       <Icon name="bolt" size={14}/> Build {nL} {isShowdown ? 'Showdown' : ''} Lineups{contrarianOn ? ' (Contrarian)' : ''}
     </button>
     {isBuilding && <BuildAnimation count={nL} />}
-    {!isBuilding && res && <ExposureResults res={res} ownership={ownership} onRebuild={run} onExportDK={exportDK} onExportReadable={exportReadable} nL={nL} canBuild={canBuild} overrideCount={overrideCount} favoriteLineups={favoriteLineups} onToggleFavorite={toggleFavoriteLineup} prevRes={prevRes} onRestorePrev={() => { setRes(prevRes); setPrevRes(null); }} onDkCsvUpload={onDkCsvUpload} dkIdOverrides={dkIdOverrides} onClearDkOverrides={() => setDkIdOverrides(null)} />}
+    {!isBuilding && res && <ExposureResults res={res} ownership={ownership} onRebuild={run} onExportDK={exportDK} onExportReadable={exportReadable} nL={nL} canBuild={canBuild} overrideCount={overrideCount} favoriteLineups={favoriteLineups} onToggleFavorite={toggleFavoriteLineup} prevRes={prevRes} onRestorePrev={() => { setRes(prevRes); setPrevRes(null); }} />}
   </>);
 }
 
-function ExposureResults({ res, ownership, onRebuild, onExportDK, onExportReadable, nL, canBuild = true, overrideCount = 2, favoriteLineups = [], onToggleFavorite, prevRes, onRestorePrev, onDkCsvUpload, dkIdOverrides, onClearDkOverrides }) {
+function ExposureResults({ res, ownership, onRebuild, onExportDK, onExportReadable, nL, canBuild = true, overrideCount = 2, favoriteLineups = [], onToggleFavorite, prevRes, onRestorePrev }) {
   const [q, setQ] = useState('');
   // v3.24.14: MME-style metrics — lineup-set health stats that beginners
   // miss but power players optimize for. Median/stdev of cumulative
@@ -3469,14 +3472,6 @@ function ExposureResults({ res, ownership, onRebuild, onExportDK, onExportReadab
       {onExportDK && <button className="btn btn-primary" onClick={onExportDK} style={{ flex: '1 1 auto', width: 'auto', background: 'linear-gradient(135deg, #15803D, #22C55E)' }}><Icon name="download" size={14}/> Download DK Upload CSV</button>}
       {onExportReadable && <button className="btn btn-outline" onClick={onExportReadable} style={{ flex: '1 1 auto', width: 'auto', marginTop: 0 }}><Icon name="download" size={14}/> Readable CSV</button>}
     </div>
-    {/* v5.9: DK ID override uploader. */}
-    {onDkCsvUpload && (
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', marginTop: 10, background: 'rgba(30, 41, 59, 0.4)', border: '1px solid var(--border)', borderRadius: 8, flexWrap: 'wrap' }}>
-        <label htmlFor="dk-csv-upload-tennis" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', cursor: 'pointer' }} title="Upload today's official DKSalaries.csv to override player IDs at export."><Icon name="upload" size={12}/> Upload DKSalaries.csv</label>
-        <input id="dk-csv-upload-tennis" type="file" accept=".csv" style={{ display: 'none' }} onChange={(e) => { const f = e.target.files?.[0]; onDkCsvUpload(f); e.target.value = ''; }} />
-        {dkIdOverrides ? (<><span style={{ fontSize: 12, color: '#4ADE80', fontWeight: 600 }}>✓ {Object.keys(dkIdOverrides).length} player IDs loaded — exports will use these</span>{onClearDkOverrides && (<button onClick={onClearDkOverrides} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', fontSize: 11, cursor: 'pointer', textDecoration: 'underline' }} title="Clear the uploaded IDs">clear</button>)}</>) : (<span style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.4 }}>If your DK upload gets rejected for bad IDs, drop today's DKSalaries.csv here to override.</span>)}
-      </div>
-    )}
     <div className="section-head" style={{ marginTop: 20 }}><Icon name="chart" size={16} color="#F5C518"/> Exposure</div>
     <SearchBar value={q} onChange={setQ} placeholder="Search exposure" total={expData.length} filtered={expFiltered.length} />
     <div className="table-wrap" style={{ marginBottom: 20 }}><table><thead><tr>
@@ -3905,117 +3900,91 @@ function SlateWaiting({ message, sub }) {
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// TRACKER TAB — post-lock field ownership vs sim + live Kalshi
+// LIVE LEVERAGE TRACKER — post-lock field ownership vs sim + live Kalshi
 // ═══════════════════════════════════════════════════════════════════════
-// After contest lock, user uploads a DK contest export CSV (same format
-// the legacy LeverageTab parsed). We extract %Drafted per player and
-// compare against our sim_ownership to surface leverage opportunities:
+// After contest lock, an admin uploads the DK contest export CSV to the
+// backend. The parsed ownership is stored in contest_ownership (shared
+// across all users) + snapshotted in contest_ownership_history.
 //
-//   • Δ Own = actual − sim. Positive = field over-concentrated (red);
-//     negative = field under-rostered (green). Threshold ±10pp.
-//   • "Field Needs Most" = top 3 by actual ownership (who breaks the
-//     field if they miss).
-//   • "Biggest Field Error" = top 3 by |Δ| (where field diverged from
-//     our model most — your leverage if you called it correctly).
+//   • Reads are public: any signed-in user sees the same ownership data.
+//   • Uploads are admin-only: backend verifies via admin_users table.
+//   • Clear button is admin-only: deletes current state, history preserved.
 //
-// Kalshi prob column updates live via the existing 90s slate polling —
-// no extra fetch path needed. Kalshi delta (▲/▼ since first load) is
-// preserved via the OddsCell + getWpBaseline localStorage mechanism
-// already wired for the DK tab.
+// Δ Own = actual − sim. Positive = field over-concentrated (red);
+// negative = field under-rostered (green). Threshold ±10pp.
 //
-// Persistence: parsed ownership map saved to localStorage keyed by
-// slateId so it survives refreshes. Cross-device + historical browsing
-// would require a Supabase table (contest_ownership_archives) — queued
-// as a follow-up, not in tonight's scope.
+//   "Field Needs Most"    = top 3 by actual ownership
+//   "Biggest Field Error" = top 3 by |Δ| (your realized leverage)
+//
+// Kalshi prob column updates live via the 90s slate poll. Per-match lock
+// snapshotting (so odds freeze at first-pitch) is a separate snapshot
+// job; this tab just renders whatever the slate payload provides.
 function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
   const [actualOwn, setActualOwn] = useState({});
   const [uploadedAt, setUploadedAt] = useState(null);
+  const [contestName, setContestName] = useState(null);
+  const [totalEntries, setTotalEntries] = useState(null);
+  const [uploading, setUploading] = useState(false);
   const [error, setError] = useState('');
   const [sortKey, setSortKey] = useState('deltaOwn');
   const [sortDir, setSortDir] = useState('desc');
   const missingSet = useMemo(() => new Set(missingPoolOwn), [missingPoolOwn]);
 
-  // Load persisted data for this slate on mount / slate change
-  useEffect(() => {
+  // Load contest ownership from backend. Shared data — every user of the
+  // app sees the same numbers once an admin uploads the CSV. Falls back
+  // to an empty state if backend is unreachable or nothing's uploaded.
+  const loadOwnership = useCallback(async () => {
     if (!slateId) return;
+    setError('');
     try {
-      const raw = localStorage.getItem(`tracker_${slateId}`);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        setActualOwn(parsed.ownership || {});
-        setUploadedAt(parsed.uploadedAt || null);
-      } else {
-        setActualOwn({});
-        setUploadedAt(null);
-      }
+      const r = await fetchContestOwnership(slateId);
+      setActualOwn(r.ownership || {});
+      setUploadedAt(r.uploaded_at || null);
+      setContestName(r.contest_name || null);
+      setTotalEntries(r.total_entries || null);
     } catch (e) {
-      console.warn('[tracker] localStorage load failed:', e);
+      console.warn('[tracker] fetch failed', e);
+      // leave prior state in place; UI stays functional
     }
   }, [slateId]);
 
-  const handleFile = (e) => {
-    const f = e.target.files[0];
-    if (!f) return;
-    const r = new FileReader();
-    r.onload = evt => {
-      try {
-        const raw = evt.target.result.replace(/^\uFEFF/, '');
-        const lines = raw.split(/\r?\n/);
-        // Minimal RFC4180-ish CSV line parser — handles quoted fields
-        const parseCsvLine = (line) => {
-          const cols = [];
-          let cur = '', inQuotes = false;
-          for (let i = 0; i < line.length; i++) {
-            const c = line[i];
-            if (c === '"') {
-              if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }
-              else inQuotes = !inQuotes;
-            } else if (c === ',' && !inQuotes) { cols.push(cur); cur = ''; }
-            else cur += c;
-          }
-          cols.push(cur);
-          return cols;
-        };
-        // DK standard contest export: columns 8-10 = Player / Roster Position / %Drafted
-        // Showdown players appear twice (CPT + UTIL); sum their ownership.
-        const own = {};
-        for (const line of lines) {
-          if (!line || line.startsWith('Rank,')) continue;
-          const cols = parseCsvLine(line);
-          if (cols.length < 11) continue;
-          const playerName = (cols[8] || '').trim();
-          const drafted = parseFloat((cols[10] || '').replace('%', ''));
-          if (!playerName || isNaN(drafted)) continue;
-          own[playerName] = (own[playerName] || 0) + drafted;
-        }
-        if (Object.keys(own).length === 0) {
-          setError('No ownership data found in CSV. Expected DK contest export with Player / %Drafted columns.');
-          return;
-        }
-        setActualOwn(own);
-        const now = new Date().toISOString();
-        setUploadedAt(now);
-        if (slateId) {
-          try {
-            localStorage.setItem(`tracker_${slateId}`, JSON.stringify({ ownership: own, uploadedAt: now }));
-          } catch (e) { console.warn('[tracker] localStorage save failed:', e); }
-        }
-        setError('');
-      } catch (err) {
-        setError('Failed to parse CSV: ' + err.message);
-      }
-      // Reset input value so re-uploading the same file triggers onChange
-      e.target.value = '';
-    };
-    r.readAsText(f);
+  useEffect(() => { loadOwnership(); }, [loadOwnership]);
+
+  // Poll every 60s so non-admin users see new uploads without refreshing
+  useEffect(() => {
+    if (!slateId) return;
+    const id = setInterval(loadOwnership, 60_000);
+    return () => clearInterval(id);
+  }, [slateId, loadOwnership]);
+
+  const handleFile = async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';  // allow re-upload of the same file
+    if (!f || !slateId) return;
+    setUploading(true);
+    setError('');
+    try {
+      const r = await uploadContestOwnership(slateId, f);
+      const summary = r?.summary || {};
+      // Optimistic: reload from backend to pick up canonical state
+      await loadOwnership();
+      if (!summary.upserted) setError('Upload succeeded but 0 rows were ingested. Check the CSV format.');
+    } catch (err) {
+      setError(err.message || 'Upload failed.');
+    } finally {
+      setUploading(false);
+    }
   };
 
-  const handleClear = () => {
-    if (!confirm('Clear uploaded ownership data for this slate?')) return;
-    setActualOwn({});
-    setUploadedAt(null);
-    if (slateId) {
-      try { localStorage.removeItem(`tracker_${slateId}`); } catch {}
+  const handleClear = async () => {
+    if (!slateId) return;
+    if (!confirm('Clear uploaded ownership for this slate? (History log is preserved.)')) return;
+    setError('');
+    try {
+      await clearContestOwnership(slateId);
+      await loadOwnership();
+    } catch (err) {
+      setError(err.message || 'Clear failed.');
     }
   };
 
@@ -4028,7 +3997,7 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
       return {
         name: p.name, opponent: p.opponent, salary: p.salary,
         simOwn: sim, actualOwn: actual, deltaOwn: delta,
-        oddsProb: p.oddsProb, oddsSource: p.oddsSource,
+        oddsProb: p.oddsProb, oddsSource: p.oddsSource, openingProb: p.openingProb,
       };
     });
   }, [rp, ownership, actualOwn]);
@@ -4127,17 +4096,24 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
         </svg>
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <h2 className="section-head" style={{ margin: 0, lineHeight: 1.1 }}>Tracker</h2>
+        <h2 className="section-head" style={{ margin: 0, lineHeight: 1.1 }}>Live Leverage Tracker</h2>
         <p className="section-sub" style={{ margin: '4px 0 0' }}>
-          {hasData ? `Ownership uploaded ${timeAgoLocal(uploadedAt)} · actual vs sim · live Kalshi` : 'Upload the DK contest export to see field ownership vs our sim'}
+          {hasData
+            ? <>
+                {contestName ? <strong style={{ color: 'var(--text)' }}>{contestName}</strong> : 'Contest ownership'}
+                {totalEntries ? <> · {totalEntries.toLocaleString()} entries</> : null}
+                {uploadedAt ? <> · uploaded {timeAgoLocal(uploadedAt)}</> : null}
+                <> · actual vs sim · live Kalshi</>
+              </>
+            : 'Admin uploads the DK contest export once the slate locks. Shared view — every signed-in user sees the same data.'}
         </p>
       </div>
       <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-        <label className="btn btn-primary" style={{ width: 'auto', cursor: 'pointer' }}>
-          {hasData ? 'Replace CSV' : 'Upload CSV'}
-          <input type="file" accept=".csv" onChange={handleFile} style={{ display: 'none' }} />
+        <label className="btn btn-primary" style={{ width: 'auto', cursor: uploading ? 'wait' : 'pointer', opacity: uploading ? 0.6 : 1 }}>
+          {uploading ? 'Uploading…' : (hasData ? 'Replace CSV' : 'Upload CSV')}
+          <input type="file" accept=".csv" onChange={handleFile} disabled={uploading} style={{ display: 'none' }} />
         </label>
-        {hasData && (
+        {hasData && !uploading && (
           <button className="btn btn-outline" style={{ width: 'auto' }} onClick={handleClear}>Clear</button>
         )}
       </div>
@@ -4195,7 +4171,7 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
                 <td className="num muted">{missingSet.has(p.name) ? <span style={{ fontStyle: 'italic' }}>N/A</span> : p.simOwn.toFixed(1) + '%'}</td>
                 <td className="num" style={{ fontWeight: 600 }}>{p.actualOwn.toFixed(1)}%</td>
                 <td className="num"><DeltaCell delta={p.deltaOwn} /></td>
-                <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} delta={getWpBaseline(slateId, p.name, p.oddsProb)} /></td>
+                <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} delta={getWpBaseline(slateId, p.name, p.oddsProb, p.openingProb)} /></td>
               </tr>
             ))}
           </tbody>
