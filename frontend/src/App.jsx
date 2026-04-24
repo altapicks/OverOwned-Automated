@@ -375,6 +375,91 @@ function useSlateManifest(sport) {
 // ═══════════════════════════════════════════════════════════════════════
 // TENNIS PROJECTION BUILDER — UNCHANGED from v5
 // ═══════════════════════════════════════════════════════════════════════
+
+// Build the "Odds" column display value per match.
+// Priority: Kalshi implied prob (market, no vig) → Odds API vig-removed prob
+// Returns { a: {prob, source}, b: {prob, source} } where source is:
+//   'kalshi'  → market-sourced probability from Kalshi
+//   'market'  → vig-removed probability from Odds API consensus
+//   null      → no odds data for this match
+function computeOddsDisplay(odds) {
+  const empty = { a: { prob: null, source: null }, b: { prob: null, source: null } };
+  if (!odds || typeof odds !== 'object') return empty;
+
+  // Kalshi first — most trustworthy (no vig, market-resolved)
+  const kA = odds.kalshi_prob_a;
+  const kB = odds.kalshi_prob_b;
+  if (kA != null && kB != null && kA >= 0 && kA <= 1) {
+    return {
+      a: { prob: kA, source: 'kalshi' },
+      b: { prob: kB, source: 'kalshi' },
+    };
+  }
+
+  // Fallback: Odds API moneyline, vig-removed
+  const mlA = odds.ml_a;
+  const mlB = odds.ml_b;
+  if (mlA != null && mlB != null) {
+    const pA = americanToImpliedProb(mlA);
+    const pB = americanToImpliedProb(mlB);
+    if (pA > 0 && pB > 0) {
+      const total = pA + pB;  // total > 1 due to vig; normalize
+      return {
+        a: { prob: pA / total, source: 'market' },
+        b: { prob: pB / total, source: 'market' },
+      };
+    }
+  }
+
+  return empty;
+}
+
+function americanToImpliedProb(ml) {
+  if (ml == null) return 0;
+  const n = Number(ml);
+  if (!isFinite(n) || n === 0) return 0;
+  if (n > 0) return 100 / (n + 100);
+  return (-n) / ((-n) + 100);
+}
+
+// Render the Odds column cell. When Kalshi data is present, shows the
+// probability in gold with a small "K" badge. When falling back to market
+// consensus, shows it in the normal text color with no badge. When neither
+// source has data, shows a dash.
+function OddsCell({ prob, source, fallbackWp }) {
+  // If we have a real source, use it. Otherwise fall back to the engine's
+  // wp (which is itself computed from whatever odds fields are available —
+  // may be 0.5 if no odds landed).
+  const displayProb = prob != null ? prob : fallbackWp;
+  const displaySource = source || (fallbackWp > 0 && fallbackWp !== 0.5 ? 'market' : null);
+  if (displayProb == null || displayProb === 0.5 && !displaySource) {
+    return <span style={{ color: 'var(--text-dim)' }}>—</span>;
+  }
+  const pct = Math.round(displayProb * 100);
+  if (displaySource === 'kalshi') {
+    return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, justifyContent: 'flex-end' }}>
+        <span style={{ color: 'var(--primary, #F5C518)', fontWeight: 600 }}>{pct}%</span>
+        <span
+          title="Sourced from Kalshi prediction market"
+          style={{
+            fontSize: 9,
+            fontWeight: 700,
+            padding: '1px 4px',
+            borderRadius: 3,
+            background: 'rgba(245, 197, 24, 0.15)',
+            color: 'var(--primary, #F5C518)',
+            letterSpacing: '0.05em',
+          }}
+        >
+          K
+        </span>
+      </span>
+    );
+  }
+  return <span>{pct}%</span>;
+}
+
 function buildProjections(data) {
   if (!data || !data.matches || !data.dk_players) return { dkPlayers: [], ppRows: [] };
   const dkMap = {}; data.dk_players.forEach(p => { dkMap[p.name] = p; });
@@ -383,11 +468,19 @@ function buildProjections(data) {
   const dkPlayers = [];
   data.matches.forEach(match => {
     const stats = processMatch(match);
-    [['player_a', stats.player_a], ['player_b', stats.player_b]].forEach(([side, s]) => {
+    // Odds-for-display: prefer Kalshi implied prob (market-sourced, no vig),
+    // fall back to vig-removed Odds API implied prob. Stored alongside engine
+    // wp so the UI can show source attribution without re-doing the math.
+    const o = match.odds || {};
+    const oddsForPlayer = computeOddsDisplay(o);
+    [['player_a', stats.player_a, 'a'], ['player_b', stats.player_b, 'b']].forEach(([side, s, abKey]) => {
       const name = match[side]; const dk = dkMap[name]; if (!dk) return;
       const proj = dkProjection(s);
       const val = dk.salary > 0 ? Math.round(proj / (dk.salary / 1000) * 100) / 100 : 0;
       dkPlayers.push({ name, salary: dk.salary, id: dk.id, avgPPG: dk.avg_ppg, opponent: oppMap[name] || '', tournament: mtMap[name]?.t || '', startTime: mtMap[name]?.time || '', wp: s.wp, proj, val, pStraight: s.pStraightWin, p3set: s.p3set, gw: s.gw, gl: s.gl, sw: s.setsWon, sl: s.setsLost, aces: s.aces, dfs: s.dfs, breaks: s.breaks, p10ace: s.p10ace, pNoDF: s.pNoDF, ppProj: ppProjection(s), stats: s,
+        // Odds display: probability + source (kalshi | market | null)
+        oddsProb: oddsForPlayer[abKey].prob,
+        oddsSource: oddsForPlayer[abKey].source,
         // Showdown tiers — undefined for classic slates (harmless)
         cpt_id: dk.cpt_id, cpt_salary: dk.cpt_salary,
         acpt_id: dk.acpt_id, acpt_salary: dk.acpt_salary,
@@ -2433,7 +2526,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
     <SearchBar value={q} onChange={setQ} placeholder="Search players, opponents" total={pw.length} filtered={pwFiltered.length} />
     <LockBar lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />
     <div className="table-wrap"><table><thead><tr>
-      <th>#</th><th></th><S label="Player" colKey="name" /><th>Opp</th><S label="Sal" colKey="salary" num /><S label="Sim Own" colKey="simOwn" num tip="Projected field ownership (imported from Pool Own, or simulated if unavailable)" /><S label="Win%" colKey="wp" num /><S label="Proj" colKey="proj" num /><S label="Val" colKey="val" num /><S label="P(2-0)" colKey="pStraight" num /><S label="GW" colKey="gw" num /><S label="GL" colKey="gl" num /><S label="SW" colKey="sw" num /><S label="Aces" colKey="aces" num /><S label="DFs" colKey="dfs" num /><S label="Breaks" colKey="breaks" num /><th>Time</th><th></th>
+      <th>#</th><th></th><S label="Player" colKey="name" /><th>Opp</th><S label="Sal" colKey="salary" num /><S label="Sim Own" colKey="simOwn" num tip="Projected field ownership (imported from Pool Own, or simulated if unavailable)" /><S label={<span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-end', lineHeight: 1.1 }}><span>Odds</span><span style={{ fontSize: 9, fontWeight: 500, opacity: 0.55, letterSpacing: '0.04em' }}>Kalshi · Market</span></span>} colKey="oddsProb" num tip="Match-winner implied probability. Primary source: Kalshi prediction market (no vig). Fallback: consensus sportsbook odds with vig removed." /><S label="Proj" colKey="proj" num /><S label="Val" colKey="val" num /><S label="P(2-0)" colKey="pStraight" num /><S label="GW" colKey="gw" num /><S label="GL" colKey="gl" num /><S label="SW" colKey="sw" num /><S label="Aces" colKey="aces" num /><S label="DFs" colKey="dfs" num /><S label="Breaks" colKey="breaks" num /><th>Time</th><th></th>
     </tr></thead>
     <tbody>{sorted.map((p, i) => {
       const iv = t3v.includes(p.name), is = t3s.includes(p.name);
@@ -2478,7 +2571,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
         <td className="name">{p.name}</td><td className="muted">{p.opponent}</td>
         <td className="num">{fmtSal(p.salary)}</td>
         <td className="num" style={{ color: p.simOwn > 30 ? 'var(--amber)' : 'var(--text-muted)' }}>{fmt(p.simOwn, 1)}%</td>
-        <td className="num">{fmtPct(p.wp)}</td>
+        <td className="num"><OddsCell prob={p.oddsProb} source={p.oddsSource} fallbackWp={p.wp} /></td>
         <td className="num">
           <span className={iv ? 'cell-top3' : 'cell-proj'}>
             <input type="number" step="0.01" className={`proj-edit ${isOver ? 'overridden' : ''}`}
