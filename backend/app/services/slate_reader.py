@@ -236,48 +236,80 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
 def get_today_slate(sport: str) -> Optional[FrontendSlate]:
     """Return the most relevant active slate for a sport.
 
-    Preference order:
-      1. Classic slate for today (if any)
-      2. Classic slate for any date (most recent)
-      3. Showdown fallback for today (if is_fallback=true or no Classic at all)
+    v5.15 selection logic — fixes the bug where an empty freshly-ingested
+    slate for tomorrow (UTC rollover) would win over today's populated
+    slate that users are actively working with.
 
-    This mirrors the watcher's classify/fallback logic — if a Classic got
-    ingested today, users see it; if only a Showdown fallback exists, they
-    see that instead. Used by /api/slates/today.
+    Preference order:
+      1. Classic slate with dk_players populated AND lock_time in the future
+         (the upcoming slate users are building lineups for). Prefers the
+         SOONEST lock among those.
+      2. Classic slate with dk_players populated (any lock_time, most recent).
+         Covers the post-lock / in-progress / archived browsing case.
+      3. Any Classic slate (even empty) — last-resort fallback so the UI
+         doesn't 404; might render empty but at least the shell loads.
+      4. Showdown fallback with same 3-tier preference.
+
+    "Populated" = has at least one slate_players row. Slates that were
+    created by the watcher but not yet hydrated by the DK draftables fetch
+    are intentionally deprioritized — showing an empty shell when a full
+    slate exists is a bug.
     """
     db = get_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Most recent Classic, active status
-    classic = (
-        db.table("slates")
-        .select("id")
-        .eq("sport", sport)
-        .eq("status", "active")
-        .eq("contest_type", "classic")
-        .order("slate_date", desc=True)
-        .order("first_seen_at", desc=True)
-        .limit(1)
-        .execute()
-        .data
-    )
-    if classic:
-        return get_frontend_slate(classic[0]["id"])
+    def _has_players(slate_id: str) -> bool:
+        result = (
+            db.table("slate_players")
+            .select("slate_id", count="exact")
+            .eq("slate_id", slate_id)
+            .limit(1)
+            .execute()
+        )
+        return (result.count or 0) > 0
 
-    # Fall through to Showdown (fallback or otherwise)
-    showdown = (
-        db.table("slates")
-        .select("id")
-        .eq("sport", sport)
-        .eq("status", "active")
-        .eq("contest_type", "showdown")
-        .order("slate_date", desc=True)
-        .order("first_seen_at", desc=True)
-        .limit(1)
-        .execute()
-        .data
-    )
-    if showdown:
-        return get_frontend_slate(showdown[0]["id"])
+    def _pick(contest_type: str) -> Optional[str]:
+        candidates = (
+            db.table("slates")
+            .select("id, lock_time, slate_date, first_seen_at")
+            .eq("sport", sport)
+            .eq("status", "active")
+            .eq("contest_type", contest_type)
+            .order("slate_date", desc=True)
+            .order("first_seen_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+        if not candidates:
+            return None
+
+        # Tier 1: populated + upcoming (lock_time > now), soonest lock first
+        upcoming = [
+            c for c in candidates
+            if c.get("lock_time") and c["lock_time"] > now_iso
+        ]
+        # Sort ascending by lock_time — want the NEXT lock, not the latest
+        upcoming.sort(key=lambda c: c["lock_time"])
+        for c in upcoming:
+            if _has_players(c["id"]):
+                return c["id"]
+
+        # Tier 2: populated (any lock_time), most recent first
+        for c in candidates:
+            if _has_players(c["id"]):
+                return c["id"]
+
+        # Tier 3: fallback to the most recent candidate, even if empty
+        return candidates[0]["id"]
+
+    classic_id = _pick("classic")
+    if classic_id:
+        return get_frontend_slate(classic_id)
+
+    showdown_id = _pick("showdown")
+    if showdown_id:
+        return get_frontend_slate(showdown_id)
 
     return None
 
