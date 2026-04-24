@@ -24,7 +24,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import get_settings
 from app.db import get_client
-from app.services import notifier
+from app.services import kalshi, notifier, odds_api
 from app.services.dk_client import DraftKingsClient, SPORT_CODE_MAP
 from app.services.slate_builder import ingest_draft_group
 from app.services.slate_classifier import (
@@ -144,6 +144,28 @@ async def run_slate_watcher_once() -> dict:
                     )
 
             results["sports"][sport_name] = sport_summary
+
+        # ── Odds ingestion (post-DK) ──────────────────────────────
+        # Runs once per polling cycle per sport. Internally gated to tennis-with-upcoming-matches.
+        for sport_code in s.sports_list:
+            sport_name = SPORT_CODE_MAP.get(sport_code, sport_code.lower())
+            if sport_name != "tennis":
+                continue
+            try:
+                odds_summary = await odds_api.fetch_tick(sport_code)
+                logger.info("The Odds API tick: %s", odds_summary)
+                results["sports"].setdefault(sport_name, {})["odds_api"] = odds_summary
+            except Exception as e:
+                logger.exception("Odds API tick failed: %s", e)
+                results["sports"].setdefault(sport_name, {})["odds_api_error"] = str(e)
+
+            try:
+                kalshi_summary = await kalshi.fetch_tick()
+                logger.info("Kalshi tick: %s", kalshi_summary)
+                results["sports"].setdefault(sport_name, {})["kalshi"] = kalshi_summary
+            except Exception as e:
+                logger.exception("Kalshi tick failed: %s", e)
+                results["sports"].setdefault(sport_name, {})["kalshi_error"] = str(e)
 
     return results
 
