@@ -64,6 +64,15 @@ class FrontendMatchOdds(BaseModel):
     # by the ingestion layer. Frontend reads these to render the gold [K] Odds badge.
     kalshi_prob_a: Optional[float] = None
     kalshi_prob_b: Optional[float] = None
+    # P(match goes 3 sets). Used by engine.js sharp mode to derive 4-way set
+    # betting probabilities when only Sets Played odds are available (typical
+    # of Underdog-style prop feeds that don't post a full 4-way set market).
+    # Populated by the Underdog transformer.
+    p3set: Optional[float] = None
+    # Raw posted lines from PrizePicks/Underdog — used for fade signal comparison
+    # (projection vs posted line) and Track Record grading. NOT projection inputs.
+    # Schema: {"a": {"aces": 4.5, "games_won": 12.5, ...}, "b": {...}}
+    posted_lines: Optional[dict] = None
 
 
 class FrontendMatch(BaseModel):
