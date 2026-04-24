@@ -16,7 +16,7 @@ import {
   checkIsAdmin, subscribeToLines, subscribeToMovements, parseCsvLines,
 } from '../lib/prizepicks-api';
 
-export function PrizePicksTab({ slateId }) {
+export function PrizePicksTab({ slateId, players = [] }) {
   const [lines, setLines] = useState([]);
   const [movements, setMovements] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -25,6 +25,8 @@ export function PrizePicksTab({ slateId }) {
   const [showAdd, setShowAdd] = useState(false);
   const [showBulk, setShowBulk] = useState(false);
   const [error, setError] = useState(null);
+  const [sortKey, setSortKey] = useState('edge');
+  const [sortDir, setSortDir] = useState('desc');
 
   // Initial load + admin check
   useEffect(() => {
@@ -97,13 +99,89 @@ export function PrizePicksTab({ slateId }) {
   if (!slateId) return <div className="empty"><p>No active slate.</p></div>;
   if (loading) return <div className="empty"><p>Loading PrizePicks lines…</p></div>;
 
+  // Build a lookup of projected values per (player, stat) for edge computation.
+  // Lines are compared against our model's projection to produce edge signals.
+  // Color coding: green = MORE (project over line), red = LESS (project under).
+  // Edge drives Hidden Gem + PP Fade signals in the DK tab.
+  const playersByName = useMemo(() => {
+    const m = {};
+    (players || []).forEach(p => { m[p.name] = p; });
+    return m;
+  }, [players]);
+
+  const getProjectedForStat = useCallback((playerName, stat) => {
+    const p = playersByName[playerName];
+    if (!p) return null;
+    // Stat label → projected field on player object
+    switch (stat) {
+      case 'Fantasy Score': return p.ppProj;
+      case 'Games Won': return p.gw;
+      case 'Games Played': return (p.gw || 0) + (p.gl || 0);
+      case 'Aces': return p.aces;
+      case 'Double Faults': return p.dfs;
+      case 'Breakpoints Won': return p.breaks;
+      case 'Sets Won': return p.sw;
+      case 'Sets Played': return (p.sw || 0) + (p.sl || 0);
+      case '1st Set Games Won': return p.stats?.firstSetGamesWon;  // may be undefined
+      case '1st Set Games Played': return p.stats?.firstSetGamesPlayed;
+      case 'Tiebreakers Played': return p.stats?.tiebreakersPlayed;
+      default: return null;
+    }
+  }, [playersByName]);
+
+  // Enrich each line with projected + edge + direction, ready for display/sort.
+  const enrichedLines = useMemo(() => {
+    return (lines || []).map(line => {
+      const projected = getProjectedForStat(line.raw_player_name, line.stat_type);
+      const edge = (projected != null) ? Math.round((projected - line.current_line) * 100) / 100 : null;
+      const direction = edge == null ? '-' : (edge > 0.2 ? 'MORE' : edge < -0.2 ? 'LESS' : '-');
+      return { ...line, projected, edge, direction };
+    });
+  }, [lines, getProjectedForStat]);
+
+  // Sort — edge desc by default, but clicking a header cycles the sort.
+  const sortedLines = useMemo(() => {
+    const arr = [...enrichedLines];
+    arr.sort((a, b) => {
+      let va, vb;
+      switch (sortKey) {
+        case 'player': va = a.raw_player_name; vb = b.raw_player_name; break;
+        case 'stat': va = a.stat_type; vb = b.stat_type; break;
+        case 'line': va = a.current_line; vb = b.current_line; break;
+        case 'projected': va = a.projected ?? -Infinity; vb = b.projected ?? -Infinity; break;
+        case 'edge':
+        default:
+          va = a.edge ?? -Infinity; vb = b.edge ?? -Infinity;
+      }
+      if (va === vb) return 0;
+      const cmp = va > vb ? 1 : -1;
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+    return arr;
+  }, [enrichedLines, sortKey, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(key); setSortDir(key === 'player' || key === 'stat' ? 'asc' : 'desc'); }
+  };
+
+  const SortHeader = ({ label, col, num }) => {
+    const active = sortKey === col;
+    return (
+      <th className={num ? 'num' : ''} style={{ cursor: 'pointer' }} onClick={() => toggleSort(col)}>
+        {label}
+        {active && <span className="sort-arrow" style={{ marginLeft: 4 }}>{sortDir === 'asc' ? '▲' : '▼'}</span>}
+      </th>
+    );
+  };
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '1fr 320px', gap: 16 }}>
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
           <div>
-            <h2 className="section-head">PrizePicks Lines</h2>
-            <p className="section-sub">{lines.length} active line{lines.length === 1 ? '' : 's'}</p>
+            <h2 className="section-head">PrizePicks Projections</h2>
+            <p className="section-sub">{lines.length} active line{lines.length === 1 ? '' : 's'} · sorted by edge</p>
           </div>
           {isAdmin && (
             <div style={{ display: 'flex', gap: 8 }}>
@@ -119,18 +197,20 @@ export function PrizePicksTab({ slateId }) {
           <table>
             <thead>
               <tr>
-                <th>Player</th>
-                <th>Stat</th>
-                <th className="num">Line</th>
+                <SortHeader label="Player" col="player" />
+                <SortHeader label="Stat" col="stat" />
+                <SortHeader label="Line" col="line" num />
+                <SortHeader label="Proj" col="projected" num />
+                <SortHeader label="Edge" col="edge" num />
                 <th className="muted">Updated</th>
                 {isAdmin && <th></th>}
               </tr>
             </thead>
             <tbody>
-              {lines.length === 0 && (
-                <tr><td colSpan={isAdmin ? 5 : 4} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>No lines yet{isAdmin ? '. Click "Add Line" or "Paste CSV" to get started.' : '.'}</td></tr>
+              {sortedLines.length === 0 && (
+                <tr><td colSpan={isAdmin ? 7 : 6} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>No lines yet{isAdmin ? '. Click "Add Line" or "Paste CSV" to get started.' : '.'}</td></tr>
               )}
-              {lines.map(line => (
+              {sortedLines.map(line => (
                 <tr key={line.id} style={flashId === line.id ? { background: 'rgba(245,197,24,0.15)', transition: 'background 0.3s' } : {}}>
                   <td className="name">{line.raw_player_name}</td>
                   <td className="muted">{line.stat_type}</td>
@@ -141,6 +221,8 @@ export function PrizePicksTab({ slateId }) {
                       <span className="cell-proj">{line.current_line}</span>
                     )}
                   </td>
+                  <td className="num muted">{line.projected != null ? (Math.round(line.projected * 100) / 100).toFixed(2) : '—'}</td>
+                  <td className="num"><EdgeCell edge={line.edge} direction={line.direction} /></td>
                   <td className="muted" style={{ fontSize: 11 }}>{timeAgo(line.last_updated_at)}</td>
                   {isAdmin && (
                     <td><button onClick={() => onDelete(line.id)} style={{ background: 'none', border: 'none', color: 'var(--text-dim)', cursor: 'pointer', fontSize: 18 }}>×</button></td>
@@ -165,6 +247,19 @@ export function PrizePicksTab({ slateId }) {
       {showBulk && <BulkModal onSave={onBulk} onClose={() => setShowBulk(false)} />}
     </div>
   );
+}
+
+// Edge cell: projected − line. Green = MORE (we project over), red = LESS
+// (we project under), muted em-dash when we don't have a projection for
+// that stat (e.g., engine doesn't model 1st-set breakdowns yet). Magnitude
+// threshold of ±0.2 avoids flagging noise as directional signal.
+function EdgeCell({ edge, direction }) {
+  if (edge == null) return <span style={{ color: 'var(--text-dim)' }}>—</span>;
+  const color = direction === 'MORE' ? '#4ADE80'
+              : direction === 'LESS' ? '#EF4444'
+              : 'var(--text-muted)';
+  const sign = edge > 0 ? '+' : '';
+  return <span style={{ color, fontWeight: 600 }}>{sign}{edge.toFixed(2)}</span>;
 }
 
 function InlineLineEdit({ value, onSave }) {
