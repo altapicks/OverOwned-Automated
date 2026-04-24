@@ -423,22 +423,42 @@ function americanToImpliedProb(ml) {
 }
 
 // Render the Kalshi column cell.
-//   Kalshi has a market  → show the implied probability as NN%
-//   Kalshi has no market → show "Not Live" in muted styling (honest signal
-//                          that this match isn't currently on Kalshi)
+//   Kalshi has a market  → show NN% centered, colored by implied probability:
+//                          gold for heavy favorites, amber for clear favorites,
+//                          neutral near 50/50, cool blue tones for underdogs.
+//                          The color gradient lets users scan favorites at a glance.
+//   Kalshi has no market → show "Not Live" in muted styling
 // Column header carries the Kalshi brand attribution, so individual cells
 // don't need per-row badges.
+function oddsColorForProb(p) {
+  // Tiered color gradient tuned for OverOwned's gold-and-navy palette.
+  //   ≥85%  → bright gold (heavy favorite, strong signal)
+  //   ≥65%  → warm amber (clear favorite)
+  //   ≥50%  → neutral text (slight favorite)
+  //   ≥35%  → cool steel blue (slight dog)
+  //   ≥15%  → muted blue-gray (clear dog)
+  //   <15%  → very muted (heavy dog)
+  if (p >= 0.85) return { color: '#F5C518', weight: 700 };          // OO gold
+  if (p >= 0.65) return { color: '#F5A623', weight: 650 };          // amber
+  if (p >= 0.50) return { color: 'var(--text, #E5E7EB)', weight: 600 };
+  if (p >= 0.35) return { color: '#7B9ECC', weight: 550 };          // steel blue
+  if (p >= 0.15) return { color: '#566B88', weight: 500 };          // muted blue
+  return { color: 'var(--text-dim, #6B7280)', weight: 500 };
+}
+
 function OddsCell({ prob, source }) {
   if (source !== 'kalshi' || prob == null) {
     return (
       <span
         style={{
+          display: 'block',
+          textAlign: 'center',
           color: 'var(--text-dim)',
           fontSize: 11,
           fontWeight: 500,
-          letterSpacing: '0.02em',
           fontStyle: 'italic',
-          opacity: 0.65,
+          opacity: 0.6,
+          letterSpacing: '0.02em',
         }}
         title="No active Kalshi market for this match"
       >
@@ -447,7 +467,20 @@ function OddsCell({ prob, source }) {
     );
   }
   const pct = Math.round(prob * 100);
-  return <span style={{ fontWeight: 600 }}>{pct}%</span>;
+  const { color, weight } = oddsColorForProb(prob);
+  return (
+    <span
+      style={{
+        display: 'block',
+        textAlign: 'center',
+        color,
+        fontWeight: weight,
+        fontVariantNumeric: 'tabular-nums',
+      }}
+    >
+      {pct}%
+    </span>
+  );
 }
 
 function buildProjections(data) {
@@ -2516,7 +2549,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
     <SearchBar value={q} onChange={setQ} placeholder="Search players, opponents" total={pw.length} filtered={pwFiltered.length} />
     <LockBar lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />
     <div className="table-wrap"><table><thead><tr>
-      <th>#</th><th></th><S label="Player" colKey="name" /><th>Opp</th><S label="Sal" colKey="salary" num /><S label="Sim Own" colKey="simOwn" num tip="Projected field ownership (imported from Pool Own, or simulated if unavailable)" /><S label={<span style={{ fontWeight: 600, letterSpacing: '0.01em' }}>Kalshi</span>} colKey="oddsProb" num tip="Kalshi prediction market implied probability. Matches without an active Kalshi market show 'Not Live'." /><S label="Proj" colKey="proj" num /><S label="Val" colKey="val" num /><S label="P(2-0)" colKey="pStraight" num /><S label="GW" colKey="gw" num /><S label="GL" colKey="gl" num /><S label="SW" colKey="sw" num /><S label="Aces" colKey="aces" num /><S label="DFs" colKey="dfs" num /><S label="Breaks" colKey="breaks" num /><th>Time</th><th></th>
+      <th>#</th><th></th><S label="Player" colKey="name" /><th>Opp</th><S label="Sal" colKey="salary" num /><S label="Sim Own" colKey="simOwn" num tip="Projected field ownership (imported from Pool Own, or simulated if unavailable)" /><S label={<span style={{ display: 'block', textAlign: 'center', fontWeight: 600, letterSpacing: '0.02em' }}>Kalshi</span>} colKey="oddsProb" num tip="Kalshi prediction market implied probability. Color-coded by win probability. Matches without an active Kalshi market show 'Not Live'." /><S label="Proj" colKey="proj" num /><S label="Val" colKey="val" num /><S label="P(2-0)" colKey="pStraight" num /><S label="GW" colKey="gw" num /><S label="GL" colKey="gl" num /><S label="SW" colKey="sw" num /><S label="Aces" colKey="aces" num /><S label="DFs" colKey="dfs" num /><S label="Breaks" colKey="breaks" num /><th>Time</th><th></th>
     </tr></thead>
     <tbody>{sorted.map((p, i) => {
       const iv = t3v.includes(p.name), is = t3s.includes(p.name);
@@ -2561,7 +2594,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
         <td className="name">{p.name}</td><td className="muted">{p.opponent}</td>
         <td className="num">{fmtSal(p.salary)}</td>
         <td className="num" style={{ color: p.simOwn > 30 ? 'var(--amber)' : 'var(--text-muted)' }}>{fmt(p.simOwn, 1)}%</td>
-        <td className="num"><OddsCell prob={p.oddsProb} source={p.oddsSource} /></td>
+        <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} /></td>
         <td className="num">
           <span className={iv ? 'cell-top3' : 'cell-proj'}>
             <input type="number" step="0.01" className={`proj-edit ${isOver ? 'overridden' : ''}`}
