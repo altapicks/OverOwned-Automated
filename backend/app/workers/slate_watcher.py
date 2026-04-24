@@ -167,7 +167,68 @@ async def run_slate_watcher_once() -> dict:
                 logger.exception("Kalshi tick failed: %s", e)
                 results["sports"].setdefault(sport_name, {})["kalshi_error"] = str(e)
 
+    # v5.14: snapshot closing_odds for any slate that has passed its lock_time.
+    # Idempotent — only writes when closing_odds is still empty. Runs after
+    # odds fetches so the snapshot captures the freshest possible values.
+    try:
+        snap_summary = await _snapshot_closing_odds()
+        logger.info("closing_odds snapshot: %s", snap_summary)
+        results["closing_odds_snapshot"] = snap_summary
+    except Exception as e:
+        logger.exception("closing_odds snapshot failed: %s", e)
+        results["closing_odds_snapshot_error"] = str(e)
+
     return results
+
+
+async def _snapshot_closing_odds() -> dict:
+    """Snapshot matches.odds into matches.closing_odds for every match whose
+    slate has passed lock_time and whose closing_odds is still empty.
+
+    Idempotent: after the first successful run for a slate, closing_odds is
+    non-empty so this is a no-op for those rows on subsequent cycles.
+    """
+    db = get_client()
+    # Find slates that have locked but whose matches may not yet have snapshots
+    now_iso = _utc_now_iso()
+    slates = (
+        db.table("slates")
+        .select("id, lock_time")
+        .not_.is_("lock_time", "null")
+        .lte("lock_time", now_iso)
+        .execute()
+        .data
+        or []
+    )
+    if not slates:
+        return {"snapshotted": 0, "slates_checked": 0}
+
+    total_snapped = 0
+    for slate in slates:
+        # Pull matches for this slate with empty closing_odds
+        matches = (
+            db.table("matches")
+            .select("id, odds, closing_odds")
+            .eq("slate_id", slate["id"])
+            .execute()
+            .data
+            or []
+        )
+        for m in matches:
+            closing = m.get("closing_odds") or {}
+            if closing and isinstance(closing, dict) and len(closing) > 0:
+                continue  # already snapshotted
+            odds = m.get("odds") or {}
+            if not isinstance(odds, dict) or len(odds) == 0:
+                continue  # nothing to snapshot
+            db.table("matches").update({"closing_odds": odds}).eq("id", m["id"]).execute()
+            total_snapped += 1
+    return {"snapshotted": total_snapped, "slates_checked": len(slates)}
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _log_error(source: str, sport: str, msg: str, context: dict) -> None:
