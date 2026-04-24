@@ -1,14 +1,20 @@
 """FastAPI application entrypoint.
 
-In production on Railway, two services share this codebase:
-  - `api`    → runs uvicorn on this app (this module)
-  - `worker` → runs app.workers.slate_watcher
+Runs as a single Railway service that does BOTH:
+  1. Serves HTTP (uvicorn running this app)
+  2. Runs the scheduled slate + odds watcher in-process via FastAPI lifespan
 
-Both read Supabase credentials from the same env vars.
+The watcher uses APScheduler's AsyncIOScheduler, which shares the event loop
+with FastAPI. max_instances=1 + coalesce=True on each job prevents overlap.
+
+If you ever split into separate services, set ENABLE_IN_PROCESS_WORKER=false
+on the api service and run `python -m app.workers.slate_watcher` as its own
+process.
 """
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 import sentry_sdk
 from fastapi import FastAPI
@@ -24,6 +30,35 @@ def _configure_logging(level: str):
         level=level,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the scheduled watcher alongside the HTTP server."""
+    settings = get_settings()
+
+    if settings.enable_in_process_worker:
+        try:
+            from app.workers.slate_watcher import scheduled_watcher
+            logger.info(
+                "Starting in-process slate watcher (sports=%s, types=%s, fallback=%s)",
+                settings.sports_list,
+                settings.slate_types_list,
+                settings.dk_fallback_to_showdown,
+            )
+            async with scheduled_watcher():
+                yield
+        except Exception as e:
+            logger.exception("In-process watcher failed to start: %s", e)
+            yield
+    else:
+        logger.info("In-process watcher disabled (ENABLE_IN_PROCESS_WORKER=false)")
+        yield
+
+    logger.info("Application shutdown complete")
 
 
 def create_app() -> FastAPI:
@@ -42,6 +77,7 @@ def create_app() -> FastAPI:
         title="OverOwned API",
         version=__version__,
         description="Ingestion and slate API for OverOwned DFS.",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
