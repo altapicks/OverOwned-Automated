@@ -191,3 +191,30 @@ def test_event_grouping_structure():
         assert len(event_markets) == 2
         names = [m["yes_sub_title"] for m in event_markets]
         assert all(names)  # both named
+
+
+def test_frontend_match_odds_accepts_kalshi_fields():
+    """Pydantic model accepts kalshi_prob_a/b when hydrating from matches.odds.
+    Regression guard for hotfix #3 — prior model silently dropped these fields."""
+    from app.models import FrontendMatchOdds
+    db_odds = {
+        "ml_a": -300,
+        "ml_b": 245,
+        "kalshi_prob_a": 0.865,
+        "kalshi_prob_b": 0.135,
+        # Extra keys from other sources should be silently ignored, not raise
+        "kalshi": {"raw": {"a": {}, "b": {}}},
+        "the_odds_api": {"raw": {}, "fetched_at": "..."},
+    }
+    model = FrontendMatchOdds(**db_odds)
+    assert model.ml_a == -300
+    assert model.kalshi_prob_a == 0.865
+    assert model.kalshi_prob_b == 0.135
+
+
+def test_frontend_match_odds_empty_dict():
+    """Empty dict → all-None model. Default path for matches without odds yet."""
+    from app.models import FrontendMatchOdds
+    model = FrontendMatchOdds(**{})
+    assert model.ml_a is None
+    assert model.kalshi_prob_a is None
