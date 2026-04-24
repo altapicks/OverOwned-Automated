@@ -698,80 +698,121 @@ function buildMMAProjections(data) {
 // mix of optimizer users, recreational players, chalk-averse contrarians,
 // and narrative-chasers.
 //
-// Four calibrated adjustments, all zero-sum so total ownership still sums
-// to n_roster × 100 (preserving the pigeonhole property):
+// v2 model — salary-tiered caps + wp-gated floor (replacing v1's flat
+// thresholds which let $6K optimizer-value plays jam into 48% while
+// recognizable $11K favorites stayed at 18%):
 //
-//   CHALK_CAP (48%)  — realistic field ceiling. Above 50% = "obvious play"
-//                       that many contrarians deliberately fade.
-//   DOG_CAP (22%)    — recreational aversion to cheap-dog punts. Optimizer
-//                       finds them value, casual users find them "gross."
-//   MID_FLOOR (12%)  — default safe-pick behavior for priced-up mid-tier
-//                       with genuine projection.
-//   Redistribution   — excess from chalk/dog caps → mid-tier value plays
-//                       (the spot where "I'm not playing chalk" drifts).
+//   Salary-tiered caps (the cheaper the player, the harder they're
+//   capped — recreational field won't roster unknowns regardless of
+//   what the optimizer thinks about value):
+//     $10,500+        → 42%  (elite favorite ceiling)
+//     $9,000-$10,499  → 38%
+//     $8,000-$8,999   → 32%
+//     $7,000-$7,999   → 26%
+//     $6,000-$6,999   → 20%
+//     under $6,000    → 16%
 //
-// These values were chosen to match observed tennis DK classic contest
-// ownership distributions. Conservative enough to not over-correct.
+//   WP-gated floor: wp > 75% → min 25% ownership. Real field recognizes
+//   the name and pays up for chalk regardless of where the optimizer
+//   thinks the edge is. Fixes "Gauff at 18%" when Gauff is a consensus
+//   favorite at top salary.
+//
+//   Redistribution: excess from tier caps flows to mid-tier value plays
+//   ($7K-$8.2K range) weighted by value ratio — models the "I'm not
+//   playing chalk" drift pattern.
+//
+// All zero-sum: total ownership still sums to n_roster × 100 (600% for
+// tennis classic 6-roster), preserving the pigeonhole invariant.
 function humanizeOwnership(rawOwnership, pData) {
-  const CHALK_CAP = 48;
-  const DOG_CAP = 22;
-  const MID_FLOOR = 12;
+  // Tier cap lookup
+  const tierCap = (salary) => {
+    if (salary >= 10500) return 42;
+    if (salary >=  9000) return 38;
+    if (salary >=  8000) return 32;
+    if (salary >=  7000) return 26;
+    if (salary >=  6000) return 20;
+    return 16;
+  };
+  const WP_FLOOR = 25;
+  const WP_GATE = 0.75;
 
   const result = { ...rawOwnership };
-  const salaries = pData.map(p => p.salary).sort((a, b) => a - b);
-  const projections = pData.map(p => p.projection).sort((a, b) => a - b);
-  const medianProj = projections[Math.floor(projections.length / 2)] || 0;
 
-  // Pass 1: apply chalk cap + dog cap, accumulate redistributable excess
+  // Pass 1: salary-tiered cap. Excess accumulates for redistribution.
   let excess = 0;
   pData.forEach(p => {
+    const cap = tierCap(p.salary);
     const cur = result[p.name] || 0;
-    if (cur > CHALK_CAP) {
-      excess += cur - CHALK_CAP;
-      result[p.name] = CHALK_CAP;
-    }
-    if (p.salary < 6000 && result[p.name] > DOG_CAP) {
-      excess += result[p.name] - DOG_CAP;
-      result[p.name] = DOG_CAP;
+    if (cur > cap) {
+      excess += cur - cap;
+      result[p.name] = cap;
     }
   });
 
-  // Pass 2: redistribute excess to mid-tier value plays ($7000-$8200).
-  // Weight by value (proj/salary) so the best-value mid-tier gets more.
-  // Falls back to uniform across mid-tier if no value signal available.
-  const midTier = pData.filter(p => p.salary >= 7000 && p.salary <= 8200);
-  if (midTier.length > 0 && excess > 0) {
-    const valueSum = midTier.reduce((s, p) =>
-      s + Math.max(0, p.projection / (p.salary / 1000)), 0);
-    if (valueSum > 0) {
-      midTier.forEach(p => {
-        const val = Math.max(0, p.projection / (p.salary / 1000));
-        result[p.name] += excess * (val / valueSum);
-      });
-    } else {
-      midTier.forEach(p => { result[p.name] += excess / midTier.length; });
-    }
-  }
-
-  // Pass 3: mid-tier floor. Players in the mid-salary band with
-  // above-median projection must hit 12% minimum — models the "default
-  // safe pick" behavior where recreational users gravitate to priced-up
-  // mid-tier plays over chalk or deep dogs. Shortfall comes proportionally
-  // from top-owned players (the ones real field fades most).
-  midTier.forEach(p => {
-    if ((p.projection || 0) > medianProj && (result[p.name] || 0) < MID_FLOOR) {
-      const shortfall = MID_FLOOR - result[p.name];
-      const donors = pData.filter(x => (result[x.name] || 0) > 20)
-                          .sort((a, b) => result[b.name] - result[a.name]);
+  // Pass 2: wp-gated favorite floor. When a recognizable chalk favorite
+  // comes in below 25% ownership, pull them up to 25% (shortfall taken
+  // from non-favorites proportional to their current ownership).
+  //
+  // This runs BEFORE redistribution because the floor anchors the top
+  // of the curve; redistribution then fills mid-tier from whatever's
+  // left over.
+  pData.forEach(p => {
+    const wp = p.wp || 0;
+    if (wp >= WP_GATE && (result[p.name] || 0) < WP_FLOOR) {
+      const shortfall = WP_FLOOR - result[p.name];
+      // Donors: all non-chalk-favorites (wp < WP_GATE) with >5% ownership.
+      // Take proportional to current ownership so high-owned donors give
+      // more than low-owned ones.
+      const donors = pData.filter(x =>
+        (x.wp || 0) < WP_GATE && (result[x.name] || 0) > 5);
       const donorSum = donors.reduce((s, d) => s + result[d.name], 0);
       if (donorSum > 0) {
         donors.forEach(d => {
           result[d.name] -= shortfall * (result[d.name] / donorSum);
         });
+        result[p.name] = WP_FLOOR;
       }
-      result[p.name] = MID_FLOOR;
     }
   });
+
+  // Pass 3: redistribute excess to players with tier-cap headroom,
+  // weighted by value. Prefers mid-tier ($7K-$8.2K) but falls back to
+  // any player with headroom if mid-tier can't absorb all excess.
+  // Multi-pass: keep redistributing until excess < 0.5% or no headroom remains.
+  if (excess > 0) {
+    const priorityTiers = [
+      p => p.salary >= 7000 && p.salary <= 8200,   // mid-tier first
+      p => p.salary >= 8200 && p.salary <= 9000,   // next priority
+      p => p.salary >= 6000 && p.salary <= 7000,   // then low-mid
+      p => true,                                    // anyone with headroom
+    ];
+
+    for (const filter of priorityTiers) {
+      if (excess < 0.5) break;
+      const eligible = pData.filter(p => {
+        if (!filter(p)) return false;
+        const cap = tierCap(p.salary);
+        return (result[p.name] || 0) < cap;
+      });
+      if (eligible.length === 0) continue;
+
+      // Value-weight within this tier
+      const valueSum = eligible.reduce((s, p) =>
+        s + Math.max(0.1, (p.projection || 0) / (p.salary / 1000)), 0);
+
+      let absorbed = 0;
+      eligible.forEach(p => {
+        const val = Math.max(0.1, (p.projection || 0) / (p.salary / 1000));
+        const cap = tierCap(p.salary);
+        const headroom = Math.max(0, cap - (result[p.name] || 0));
+        const targetShare = excess * (val / valueSum);
+        const add = Math.min(headroom, targetShare);
+        result[p.name] += add;
+        absorbed += add;
+      });
+      excess -= absorbed;
+    }
+  }
 
   // Round to 1 decimal for display stability
   Object.keys(result).forEach(k => {
@@ -806,7 +847,7 @@ function simulateOwnership(players, n = 1500) {
   }
   const pData = players.filter(p => p.salary > 0).map(p => ({
     name: p.name, salary: p.salary, id: p.id, projection: p.proj,
-    opponent: p.opponent, maxExp: 100, minExp: 0,
+    opponent: p.opponent, wp: p.wp || 0, maxExp: 100, minExp: 0,
   }));
   try {
     // v3.23: 18+ match tennis slates use a $49,200 minSalary floor (up from
@@ -2202,7 +2243,7 @@ export default function App() {
       {!buildError && <ErrorBoundary>
       {sport === 'tennis' && (<>
         {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />}
-        {tab === 'pplines' && <PrizePicksTab slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
+        {tab === 'pplines' && <PrizePicksTab slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} players={dkPlayers} />}
         {tab === 'build' && <BuilderTab players={dkPlayers} ownership={ownership} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} mc={data.matches?.length || 0} onGoToProjections={() => setTab('dk')} />}
         {tab === 'leverage' && <LeverageTab players={dkPlayers} />}
         {tab === 'record' && <TrackRecordTab sport={sport} />}
