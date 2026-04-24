@@ -9,6 +9,8 @@
 // slate.json schema exactly — so no UI changes are required.
 // ═══════════════════════════════════════════════════════════════════════
 
+import { supabase } from './supabase';
+
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
 // Toggle to force static-only mode (useful for debugging). Set
@@ -104,8 +106,6 @@ export function isSportEnabled(sport) {
 // Read is public (no auth). Write is admin-only; uses supabase.auth.getSession()
 // to obtain the access token so the backend can verify admin_users membership.
 
-import { supabase } from './supabase';
-
 export async function fetchContestOwnership(slateId) {
   if (!slateId) return { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null };
   if (!API_BASE) return { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null };
@@ -118,8 +118,28 @@ export async function fetchContestOwnership(slateId) {
 }
 
 async function getAccessToken() {
-  const { data: { session } } = await supabase.auth.getSession();
-  const token = session?.access_token;
+  // Supabase-JS uses navigator.locks internally for session reads. When
+  // multiple tabs/components hit auth simultaneously, the later call "steals"
+  // the lock and the earlier one throws a NavigatorLockAcquireTimeoutError /
+  // "lock was released because another request stole it". Harmless, but
+  // transient — on retry the stealing call has completed and we succeed.
+  const tryOnce = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    return session?.access_token;
+  };
+  let token;
+  try {
+    token = await tryOnce();
+  } catch (err) {
+    const msg = String(err?.message || err || '');
+    if (msg.toLowerCase().includes('lock') && msg.toLowerCase().includes('released')) {
+      // One retry after a brief yield
+      await new Promise((r) => setTimeout(r, 120));
+      token = await tryOnce();
+    } else {
+      throw err;
+    }
+  }
   if (!token) throw new Error('Not signed in — sign in as an admin to upload contest CSVs.');
   return token;
 }
