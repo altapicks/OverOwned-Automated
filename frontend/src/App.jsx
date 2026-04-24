@@ -349,7 +349,7 @@ function OverOwnedHelpModal({ onClose }) {
 // ═══════════════════════════════════════════════════════════════════════
 // SLATE DATA HOOK — sport-aware
 // ═══════════════════════════════════════════════════════════════════════
-function useSlateData(sport, slateDate, pollPaused = false) {
+function useSlateData(sport, slateDate) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const hasLoadedRef = useRef(false);
@@ -405,8 +405,7 @@ function useSlateData(sport, slateDate, pollPaused = false) {
   // user — a transient network blip shouldn't clear their view. The next
   // successful poll will recover.
   useEffect(() => {
-    if (slateDate && slateDate !== 'live') return; // archived = frozen
-    if (pollPaused) return;                        // user explicitly paused
+    if (slateDate && slateDate !== 'live') return; // archived = no polling
     const POLL_INTERVAL_MS = 90_000;
     let cancelled = false;
     const tick = () => {
@@ -423,7 +422,7 @@ function useSlateData(sport, slateDate, pollPaused = false) {
     };
     const id = setInterval(tick, POLL_INTERVAL_MS);
     return () => { cancelled = true; clearInterval(id); };
-  }, [sport, slateDate, pollPaused]);
+  }, [sport, slateDate]);
   return { data, error };
 }
 
@@ -1776,17 +1775,7 @@ export default function App() {
   useEffect(() => {
     if (!isSportEnabled(sport)) setSportRaw('tennis');
   }, [sport]);
-  // Freeze/Live toggle — pauses the 90s slate poll. When frozen, the DK
-  // tab and builder stop reshuffling mid-work. Persisted in localStorage
-  // so a hard refresh preserves the choice; defaults to live (unfrozen).
-  const [pollPaused, setPollPausedRaw] = useState(() => {
-    try { return localStorage.getItem('oo_poll_paused') === '1'; } catch { return false; }
-  });
-  const setPollPaused = (v) => {
-    setPollPausedRaw(v);
-    try { localStorage.setItem('oo_poll_paused', v ? '1' : '0'); } catch {}
-  };
-  const { data, error } = useSlateData(sport, slateDate, pollPaused);
+  const { data, error } = useSlateData(sport, slateDate);
   const manifestSlates = useSlateManifest(sport);
   const [tab, setTab] = useState('dk');
   const [hasLoadedOnce, setHasLoadedOnce] = useState(false);
@@ -2342,7 +2331,7 @@ export default function App() {
       }
     `}</style>
     <div className="cursor-glow" aria-hidden="true" />
-    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} pollPaused={pollPaused} onTogglePollPaused={() => setPollPaused(!pollPaused)} />
+    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} />
     {missingPoolOwn.length > 0 && (
       <div style={{
         padding: '10px 24px', background: 'rgba(245, 158, 11, 0.09)',
@@ -2398,7 +2387,7 @@ export default function App() {
   </div>);
 }
 
-function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick, pollPaused = false, onTogglePollPaused }) {
+function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick }) {
   const hasArchive = manifestSlates && manifestSlates.length > 0;
   return (<div className="topbar">
     <div
@@ -2418,32 +2407,6 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
       <span>Over<span className="brand-o">O</span>wned</span>
     </div>
     <div className="topbar-right">
-      {onTogglePollPaused && slateDate === 'live' && (
-        <button
-          onClick={onTogglePollPaused}
-          title={pollPaused
-            ? 'Data is frozen — click to resume live updates (polls every 90s)'
-            : 'Data is live (polls every 90s) — click to freeze while building lineups'}
-          style={{
-            display: 'inline-flex', alignItems: 'center', gap: 6,
-            background: pollPaused ? 'rgba(125,211,252,0.1)' : 'rgba(74,222,128,0.08)',
-            border: `1px solid ${pollPaused ? 'rgba(125,211,252,0.4)' : 'rgba(74,222,128,0.3)'}`,
-            borderRadius: 6, padding: '7px 11px', cursor: 'pointer',
-            color: pollPaused ? 'var(--blue-text)' : 'var(--green-text)',
-            fontSize: 11, fontWeight: 600, letterSpacing: 0.4, textTransform: 'uppercase',
-            transition: 'all 0.15s',
-          }}
-        >
-          <span style={{
-            display: 'inline-block', width: 7, height: 7, borderRadius: '50%',
-            background: pollPaused ? 'var(--blue-text)' : 'var(--green-text)',
-            boxShadow: pollPaused ? 'none' : '0 0 6px rgba(74,222,128,0.7)',
-            animation: pollPaused ? 'none' : 'oo-live-pulse 1.5s ease-in-out infinite',
-          }}/>
-          {pollPaused ? 'Frozen' : 'Live'}
-        </button>
-      )}
-      <style>{`@keyframes oo-live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }`}</style>
       <div style={{ display: 'flex', background: 'var(--bg)', border: '1px solid var(--border-light)', borderRadius: 6, overflow: 'hidden' }}>
         <button onClick={() => onSportChange('tennis')} title="Tennis" aria-label="Tennis" style={{
           background: sport === 'tennis' ? 'var(--primary)' : 'transparent',
@@ -3090,20 +3053,10 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
     // Yield two frames so the animation paints before we block on optimize.
     setTimeout(() => { try {
     // Variance jitter: each build applies a fresh ±variance% random multiplier to every player's projection.
-    // Math.random() is unseeded, so two users clicking Build on the same slate get different rankings → different CSVs.
+    // Math.random() is unseeded, so two users clicking Build on the same slate get different rankings.
+    // Minimum variance is 1% (enforced by slider), which combined with 90s live odds polling keeps every
+    // submitted CSV structurally distinct without needing a forced nudge step.
     const jitter = () => 1 + (Math.random() * 2 - 1) * variance / 100;
-    // DK anti-abuse rule: submitted lineup CSVs can't be identical across entries. Even at variance=0
-    // (deterministic builds), guarantee at least 2 players' projections differ from baseline by ≥0.01 —
-    // enough to break ties in the optimizer without meaningfully altering rankings.
-    const enforceMinNudge = (pd, basePd) => {
-      const changed = pd.filter((p, i) => Math.abs(p.projection - basePd[i].proj) >= 0.01).length;
-      if (changed >= 2) return;
-      const idxs = [...Array(pd.length).keys()].sort(() => Math.random() - 0.5).slice(0, 2);
-      idxs.forEach(i => {
-        const sign = Math.random() < 0.5 ? -1 : 1;
-        pd[i].projection = Math.round((pd[i].projection + sign * 0.01) * 1000) / 1000;
-      });
-    };
     if (isShowdown) {
       const pd = sp.map(p => {
         const cap = contrarianCaps[p.name] || {};
@@ -3124,7 +3077,6 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
           maxExp: effMax, minExp: effMin,
         };
       });
-      enforceMinNudge(pd, sp);
       const r = optimizeShowdown(pd, nL, 50000, 48000, { locked: new Set(lockedPlayers), excluded: new Set(excludedPlayers) });
       setRes({ ...r, pData: pd, isShowdown: true });
       return;
@@ -3146,7 +3098,6 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
       const gemBoost = (cap._signal === 'gem' && cap._rank && GEM_BOOST[cap._rank]) || 1;
       return { name: p.name, salary: p.salary, id: p.id, projection: p.proj * jitter() * gemBoost, opponent: p.opponent, maxExp: effMax, minExp: effMin };
     });
-    enforceMinNudge(pd, sp);
     // v3.23: 18+ match tennis slates use a $49,200 minSalary floor (up from
     // $48,000). Forces meaningful cap utilization on deep slates where
     // cheap-filler lineups become structurally similar, improving lineup
@@ -3325,10 +3276,10 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
       <label style={{ fontSize: 13, color: 'var(--text-muted)' }}>Lineups: <input style={{ width: 60, background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 8px', marginLeft: 4 }} type="number" min="1" step="1" value={nL} onChange={e => { const v = e.target.value; if (v === "") setNL(""); else setNL(Math.max(1, parseInt(v, 10) || 1)); }} onBlur={e => { if (e.target.value === "" || +e.target.value < 1) setNL(20); }} /></label>
       <label style={{ fontSize: 13, color: 'var(--text-muted)' }}>Global Min %: <input style={{ width: 50, background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 8px', marginLeft: 4 }} type="number" min="0" max="100" step="1" value={globalMin} onChange={e => { const v = e.target.value; if (v === "") setGlobalMin(""); else setGlobalMin(Math.max(0, Math.min(100, parseInt(v, 10) || 0))); }} onBlur={e => { if (e.target.value === "") setGlobalMin(0); }} /></label>
       <label style={{ fontSize: 13, color: 'var(--text-muted)' }}>Global Max %: <input style={{ width: 50, background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', padding: '4px 8px', marginLeft: 4 }} type="number" min="0" max="100" step="1" value={globalMax} onChange={e => { const v = e.target.value; if (v === "") setGlobalMax(""); else setGlobalMax(Math.max(0, Math.min(100, parseInt(v, 10) || 0))); }} onBlur={e => { if (e.target.value === "") setGlobalMax(100); }} /></label>
-      <label style={{ fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 }} title="Random ± shift applied to each player's projection per build. Ensures you and other users don't submit identical lineups on the same slate.">
+      <label style={{ fontSize: 13, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 }} title="Random ± shift applied to each player's projection per build. Minimum 1% required so every CSV is structurally distinct (DK anti-duplicate rule). Higher = more lineup diversity per build.">
         Variance
-        <input type="range" min="0" max="25" step="1" value={variance} onChange={e => setVariance(+e.target.value)} style={{ width: 80, accentColor: 'var(--primary)' }} />
-        <span style={{ fontWeight: 700, color: variance > 0 ? 'var(--primary)' : 'var(--text-dim)', minWidth: 28, textAlign: 'right' }}>{variance}%</span>
+        <input type="range" min="1" max="25" step="1" value={variance} onChange={e => setVariance(+e.target.value)} style={{ width: 80, accentColor: 'var(--primary)' }} />
+        <span style={{ fontWeight: 700, color: 'var(--primary)', minWidth: 28, textAlign: 'right' }}>{variance}%</span>
       </label>
       <button onClick={applyGlobal} style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text-muted)', padding: '4px 12px', fontSize: 12, cursor: 'pointer' }}>Apply Global</button>
       <button onClick={exportProjections} style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text-muted)', padding: '4px 12px', fontSize: 12, cursor: 'pointer', marginLeft: 'auto' }}><Icon name="download" size={12}/> Projections CSV</button>
