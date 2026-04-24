@@ -105,43 +105,76 @@ export function PrizePicksTab({ slateId, players = [] }) {
   // guards below. React tracks hooks by call order — returning early before
   // calling these hooks on the first render and then calling them on the
   // second render produces error #310.
-  // Build two lookups:
-  //   exact:   full-name → player
-  //   surname: last-word → player  (used as fallback)
-  // PP lines often drop middle particles ("Tomas Etcheverry" vs DK roster's
-  // "Tomas Martin Etcheverry"; "Alex Minaur" vs "Alex de Minaur"). Surname
-  // match catches these — tennis slates are typically unique by surname so
-  // false-positive risk is low. If ambiguity ever becomes a real problem,
-  // we can add a first-initial tiebreaker.
+  // Player lookup with multiple fallback strategies. PP/UD feeds often drop
+  // middle particles ("Alex Minaur" vs DK's "Alex de Minaur") or use
+  // different case/punctuation. We try strategies in descending specificity:
+  //   1. Exact case-sensitive match
+  //   2. Normalized exact (case/punct insensitive)
+  //   3. First+last words (drops middle particles, unique-enough for tennis)
+  //   4. Surname only (last-ditch for single-name rows)
+  //
+  // If lookup fails, we console.warn once per unique name so failures are
+  // visible in DevTools but don't spam the log.
   const playersByName = useMemo(() => {
-    const exact = {};
-    const bySurname = {};
-    const norm = s => String(s || '').trim();
-    const surnameOf = s => {
-      const parts = norm(s).split(/\s+/);
-      return parts[parts.length - 1]?.toLowerCase() || '';
+    const normalize = s => String(s || '')
+      .toLowerCase()
+      .replace(/[.,'’`]/g, '')   // drop common punctuation
+      .replace(/\s+/g, ' ')
+      .trim();
+    const firstLast = s => {
+      const parts = normalize(s).split(' ').filter(Boolean);
+      if (parts.length === 0) return '';
+      if (parts.length === 1) return parts[0];
+      return parts[0] + ' ' + parts[parts.length - 1];
     };
+    const surname = s => {
+      const parts = normalize(s).split(' ').filter(Boolean);
+      return parts[parts.length - 1] || '';
+    };
+
+    const exact = {};           // raw name → player
+    const normExact = {};       // normalized full → player
+    const byFirstLast = {};     // "first last" → player (or null if collision)
+    const bySurname = {};       // "last" → player (or null if collision)
+
     (players || []).forEach(p => {
-      exact[norm(p.name)] = p;
-      const sn = surnameOf(p.name);
-      if (sn) {
-        // If two DK players share a surname, the second one overwrites the
-        // first — which means we won't surface a match for the shadowed
-        // player via fallback. That's the conservative choice: silent miss
-        // beats incorrect attribution.
-        bySurname[sn] = bySurname[sn] === undefined ? p : null;
-      }
+      exact[String(p.name || '').trim()] = p;
+      const ne = normalize(p.name);
+      if (ne) normExact[ne] = p;
+      const fl = firstLast(p.name);
+      if (fl) byFirstLast[fl] = (byFirstLast[fl] === undefined) ? p : null;
+      const sn = surname(p.name);
+      if (sn) bySurname[sn] = (bySurname[sn] === undefined) ? p : null;
     });
-    return { exact, bySurname, surnameOf };
+    return { exact, normExact, byFirstLast, bySurname, normalize, firstLast, surname };
   }, [players]);
 
+  // Diagnostic: remember which raw names we've already warned about so the
+  // console doesn't get spammed. Cleared when `players` changes (new slate).
+  const warnedMissingRef = React.useRef(new Set());
+  React.useEffect(() => { warnedMissingRef.current = new Set(); }, [players]);
+
   const lookupPlayer = useCallback((rawName) => {
-    const { exact, bySurname, surnameOf } = playersByName;
-    const trimmed = String(rawName || '').trim();
-    const hit = exact[trimmed];
-    if (hit) return hit;
-    const sn = surnameOf(trimmed);
+    if (!rawName) return null;
+    const { exact, normExact, byFirstLast, bySurname, normalize, firstLast, surname } = playersByName;
+    const trimmed = String(rawName).trim();
+    // 1. Exact
+    if (exact[trimmed]) return exact[trimmed];
+    // 2. Normalized exact
+    const ne = normalize(trimmed);
+    if (normExact[ne]) return normExact[ne];
+    // 3. First+last (handles "Alex Minaur" → "Alex de Minaur")
+    const fl = firstLast(trimmed);
+    if (fl && byFirstLast[fl]) return byFirstLast[fl];
+    // 4. Surname only (handles single-name rows, last-ditch)
+    const sn = surname(trimmed);
     if (sn && bySurname[sn]) return bySurname[sn];
+    // Nothing matched — log diagnostic once per unique name
+    if (!warnedMissingRef.current.has(trimmed)) {
+      warnedMissingRef.current.add(trimmed);
+      const availableNames = Object.keys(exact).slice(0, 5).join(', ');
+      console.warn(`[PrizePicksTab] No player match for "${trimmed}" (normalized: "${ne}"). First 5 DK names: ${availableNames}`);
+    }
     return null;
   }, [playersByName]);
 
@@ -218,17 +251,55 @@ export function PrizePicksTab({ slateId, players = [] }) {
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '1fr 320px', gap: 16 }}>
       <div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-          <div>
-            <h2 className="section-head">PrizePicks Projections</h2>
-            <p className="section-sub">{lines.length} active line{lines.length === 1 ? '' : 's'} · sorted by edge</p>
+        {/* Header: icon card on the left, title + subtitle in the middle,
+            admin buttons on the right. Matches the mockup — larger card-style
+            bullseye treatment, subtitle explains what "edge" means so the
+            hint strip below can focus on actionable guidance. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 14 }}>
+          <div style={{
+            width: 56, height: 56, borderRadius: 10,
+            background: 'rgba(245,197,24,0.08)',
+            border: '1px solid rgba(245,197,24,0.25)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            flexShrink: 0,
+          }}>
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none"
+                 stroke="#F5C518" strokeWidth="1.75"
+                 strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="9"/>
+              <circle cx="12" cy="12" r="5"/>
+              <circle cx="12" cy="12" r="1.5" fill="#F5C518" stroke="none"/>
+            </svg>
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <h2 className="section-head" style={{ margin: 0, lineHeight: 1.1 }}>PrizePicks Projections</h2>
+            <p className="section-sub" style={{ margin: '4px 0 0 0' }}>
+              All plays sorted by edge · Edge = Projected − PP Line
+            </p>
           </div>
           {isAdmin && (
-            <div style={{ display: 'flex', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
               <button className="btn btn-outline" style={{ width: 'auto' }} onClick={() => setShowAdd(true)}>Add Line</button>
               <button className="btn btn-primary" style={{ width: 'auto' }} onClick={() => setShowBulk(true)}>Paste CSV</button>
             </div>
           )}
+        </div>
+
+        {/* Hint strip: amber-accented contextual guidance. Style matches the
+            error banner below (same padding/radius/font) but uses amber
+            instead of red so users distinguish "tip" from "problem". */}
+        <div style={{
+          background: 'rgba(245,197,24,0.08)',
+          border: '1px solid rgba(245,197,24,0.25)',
+          color: 'var(--text-muted)',
+          padding: '10px 14px',
+          borderRadius: 6,
+          marginBottom: 12,
+          fontSize: 12,
+          display: 'flex', alignItems: 'center', gap: 10,
+        }}>
+          <span style={{ color: '#F5C518', fontSize: 14, lineHeight: 1 }}>⤵</span>
+          <span><strong style={{ color: '#F5C518', fontWeight: 600 }}>Hint:</strong> PrizePicks bad value will typically reverse</span>
         </div>
 
         {error && <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#EF4444', padding: 10, borderRadius: 6, marginBottom: 12, fontSize: 12 }}>{error} <span style={{ cursor: 'pointer', marginLeft: 10 }} onClick={() => setError(null)}>✕</span></div>}
