@@ -647,28 +647,43 @@ function buildProjections(data) {
   const dkPlayers = [];
   data.matches.forEach(match => {
     const stats = processMatch(match);
-    // Odds-for-display: prefer Kalshi implied prob (market-sourced, no vig),
-    // fall back to vig-removed Odds API implied prob. Stored alongside engine
-    // wp so the UI can show source attribution without re-doing the math.
-    const o = match.odds || {};
+    // v5.14: once the slate locks, closing_odds is populated by the backend
+    // (frozen snapshot at lock_time). Prefer it everywhere except the Live
+    // Leverage Tracker, which explicitly uses match.odds directly — that's
+    // the whole point of that tab.
+    // Empty object → slate hasn't locked yet → fall back to live odds.
+    const closing = match.closing_odds && Object.keys(match.closing_odds).length > 0
+      ? match.closing_odds
+      : null;
+    const o = closing || match.odds || {};
     const oddsForPlayer = computeOddsDisplay(o);
+    // Also expose live (non-locked) odds alongside, so the Tracker tab can
+    // read them without duplicating the computation.
+    const liveOddsForPlayer = computeOddsDisplay(match.odds || {});
     // Canonical opening-odds baseline — backend-frozen on first ingest, so
     // every user sees the same "moved from X" delta regardless of when
     // they first loaded the slate. Shape matches match.odds (flat keys).
     // Empty object on legacy slates where opening_odds was never captured;
     // frontend falls back to per-user localStorage baseline in that case.
     const openingForPlayer = computeOddsDisplay(match.opening_odds || {});
+    // Track whether this match is locked (for the "frozen" badge on OddsCell).
+    const isLocked = closing !== null;
     [['player_a', stats.player_a, 'a'], ['player_b', stats.player_b, 'b']].forEach(([side, s, abKey]) => {
       const name = match[side]; const dk = dkMap[name]; if (!dk) return;
       const proj = dkProjection(s);
       const val = dk.salary > 0 ? Math.round(proj / (dk.salary / 1000) * 100) / 100 : 0;
       dkPlayers.push({ name, salary: dk.salary, id: dk.id, avgPPG: dk.avg_ppg, opponent: oppMap[name] || '', tournament: mtMap[name]?.t || '', startTime: mtMap[name]?.time || '', wp: s.wp, proj, val, pStraight: s.pStraightWin, p3set: s.p3set, gw: s.gw, gl: s.gl, sw: s.setsWon, sl: s.setsLost, aces: s.aces, dfs: s.dfs, breaks: s.breaks, p10ace: s.p10ace, pNoDF: s.pNoDF, ppProj: ppProjection(s), stats: s,
         // Odds display: probability + source (kalshi | market | null)
+        // These are the LOCKED values once the slate has locked.
         oddsProb: oddsForPlayer[abKey].prob,
         oddsSource: oddsForPlayer[abKey].source,
+        // Live odds — always the freshest value, used only by the Tracker tab.
+        liveOddsProb: liveOddsForPlayer[abKey].prob,
+        liveOddsSource: liveOddsForPlayer[abKey].source,
         // Canonical opening prob — used by OddsCell to show archived-slate
         // deltas that are consistent across users. Null on legacy data.
         openingProb: openingForPlayer[abKey].prob,
+        isLocked,
         // Showdown tiers — undefined for classic slates (harmless)
         cpt_id: dk.cpt_id, cpt_salary: dk.cpt_salary,
         acpt_id: dk.acpt_id, acpt_salary: dk.acpt_salary,
@@ -3953,9 +3968,13 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
       setUploadedAt(r.uploaded_at || null);
       setContestName(r.contest_name || null);
       setTotalEntries(r.total_entries || null);
+      // Surface backend connection errors so the user knows why no data is showing
+      if (r._error) {
+        setError(`Could not load contest data: ${r._error}`);
+      }
     } catch (e) {
       console.warn('[tracker] fetch failed', e);
-      // leave prior state in place; UI stays functional
+      setError(`Failed to load contest data: ${e.message}`);
     }
   }, [slateId]);
 
@@ -3987,9 +4006,23 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
     try {
       const r = await uploadContestOwnership(slateId, f);
       const summary = r?.summary || {};
-      // Optimistic: reload from backend to pick up canonical state
+      // Reload from backend to pick up canonical state
       await loadOwnership();
-      if (!summary.upserted) setError('Upload succeeded but 0 rows were ingested. Check the CSV format.');
+      // Diagnostic: if upload said N rows upserted but reload shows nothing,
+      // something is wrong on the read path (RLS, cache, wrong slate_id).
+      if (summary.upserted > 0 && Object.keys(actualOwn).length === 0) {
+        // Note: actualOwn here is the PREVIOUS state because setState is async.
+        // Give React a tick to settle, then re-check by refetching raw.
+        setTimeout(async () => {
+          const r2 = await fetchContestOwnership(slateId);
+          if (Object.keys(r2.ownership || {}).length === 0) {
+            setError(`Upload succeeded (${summary.upserted} rows written) but GET returned 0 rows. Slate ID mismatch or RLS issue. slate_id=${slateId}`);
+          }
+        }, 500);
+      }
+      if (!summary.upserted) {
+        setError('Upload succeeded but 0 rows were ingested. Check the CSV format.');
+      }
     } catch (err) {
       const msg = humanizeError(err.message);
       if (msg) setError(msg || 'Upload failed.');
@@ -4020,7 +4053,11 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
       return {
         name: p.name, opponent: p.opponent, salary: p.salary,
         simOwn: sim, actualOwn: actual, deltaOwn: delta,
-        oddsProb: p.oddsProb, oddsSource: p.oddsSource, openingProb: p.openingProb,
+        // Live odds — Tracker always shows the freshest value, regardless
+        // of whether the slate has locked. That's the point of this tab.
+        oddsProb: p.liveOddsProb ?? p.oddsProb,
+        oddsSource: p.liveOddsSource ?? p.oddsSource,
+        openingProb: p.openingProb,
       };
     });
   }, [rp, ownership, actualOwn]);
