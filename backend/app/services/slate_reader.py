@@ -93,6 +93,16 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         elif rp == "ACPT":
             entry["acpt_id"] = sp["dk_player_id"]
             entry["acpt_salary"] = sp["salary"]
+        # ss_pool_own — set on any row for this player (usually the P/FLEX
+        # row). None-safe: float(None) would throw, so only cast if present.
+        # Overrides subsequent overwrites only if currently unset, so a CPT
+        # row with NULL doesn't wipe a P row's value.
+        val = sp.get("ss_pool_own")
+        if val is not None and entry.get("ss_pool_own") is None:
+            try:
+                entry["ss_pool_own"] = float(val)
+            except (TypeError, ValueError):
+                pass
 
     frontend_players = [FrontendPlayer(**e) for e in by_canonical.values()]
 
