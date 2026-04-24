@@ -144,16 +144,30 @@ export function AuthProvider({ children }) {
 
   // v5.11: update display_name in auth.users.user_metadata.
   // Returns { ok, error? } — the component handles UI feedback.
-  // v5.13: 6s timeout so the Save button never gets stuck indefinitely.
+  // v5.16: catch any thrown error (network, JWT, etc.) so the UI gets a
+  // real message instead of a silent hang. Wrap supabase call in try/catch
+  // because auth.updateUser can throw on transport errors, not just return them.
   const updateDisplayName = useCallback(async (name) => {
     const trimmed = (name || '').trim();
     if (!trimmed) return { ok: false, error: 'Display name cannot be empty.' };
     if (trimmed.length > 40) return { ok: false, error: 'Maximum 40 characters.' };
     const timeoutPromise = new Promise((resolve) =>
-      setTimeout(() => resolve({ data: null, error: { message: 'Request timed out. Please try again.' } }), 6000)
+      setTimeout(() => resolve({ __timedOut: true }), 6000)
     );
-    const updatePromise = supabase.auth.updateUser({ data: { display_name: trimmed } });
-    const { data, error } = await Promise.race([updatePromise, timeoutPromise]);
+    const updatePromise = (async () => {
+      try {
+        return await supabase.auth.updateUser({ data: { display_name: trimmed } });
+      } catch (e) {
+        console.error('[auth] updateUser threw:', e);
+        return { data: null, error: { message: e?.message || 'Update failed (network error)' } };
+      }
+    })();
+    const result = await Promise.race([updatePromise, timeoutPromise]);
+    if (result?.__timedOut) {
+      console.warn('[auth] updateUser timed out after 6s');
+      return { ok: false, error: 'Request timed out. Try again.' };
+    }
+    const { data, error } = result;
     if (error) return { ok: false, error: error.message };
     if (data?.user) setUser(data.user);
     return { ok: true };
