@@ -359,6 +359,41 @@ function useSlateData(sport, slateDate) {
       .catch(e => finalize(() => { if (!cancelled) setError(e.message); }));
     return () => { cancelled = true; };
   }, [sport, slateDate]);
+
+  // Live-slate polling: silently refresh slate data every 90 seconds so
+  // Kalshi moves, new PP line pastes, and odds updates reach the frontend
+  // without requiring a hard refresh. DK projections, PP edges, gem
+  // signals, and the WP delta indicator all re-derive from state, so
+  // updating `data` triggers a full re-compute downstream.
+  //
+  // Separate effect from the initial load because:
+  //   (1) We don't want the splash screen to replay on each poll
+  //   (2) We want polling ONLY for live slates, not archived ones
+  //   (3) We don't want the initial load delay knobs (MIN_LOAD_MS) to
+  //       apply to polled updates
+  //
+  // Errors during polling are logged to console but NOT surfaced to the
+  // user — a transient network blip shouldn't clear their view. The next
+  // successful poll will recover.
+  useEffect(() => {
+    if (slateDate && slateDate !== 'live') return; // archived = frozen
+    const POLL_INTERVAL_MS = 90_000;
+    let cancelled = false;
+    const tick = () => {
+      loadSlate(sport, slateDate)
+        .then(({ data: d }) => {
+          if (cancelled) return;
+          // Only update if we have data and it's shaped correctly. Guards
+          // against a transient empty response wiping out a working view.
+          if (d && (d.matches || d.dk_players)) {
+            setData(d);
+          }
+        })
+        .catch(e => console.warn('[overowned] Poll refresh failed (will retry):', e.message));
+    };
+    const id = setInterval(tick, POLL_INTERVAL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [sport, slateDate]);
   return { data, error };
 }
 
