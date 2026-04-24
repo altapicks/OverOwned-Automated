@@ -1965,7 +1965,7 @@ export default function App() {
     { id: 'dk', l: 'DraftKings Projections', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M3 17V9.5l4 3 2-6.5 3 6 3-6 2 6.5 4-3V17z"/><path d="M3 19h18"/></svg> },
     { id: 'pplines', l: 'PrizePicks Projections', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/></svg> },
     { id: 'build', l: 'Lineup Builder', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L4 14h7l-1 8 10-12h-7l1-8z"/></svg> },
-    { id: 'leverage', l: 'Live Leverage', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M7 3v18M4 7l3-4 3 4"/><path d="M17 21V3M14 17l3 4 3-4"/></svg> },
+    { id: 'tracker', l: 'Tracker', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> },
     { id: 'record', l: 'Track Record', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M7 15l4-5 4 3 6-8"/></svg> }
   ];
   const tabs = buildTabs();
@@ -2338,21 +2338,21 @@ export default function App() {
         {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
         {tab === 'pplines' && <PrizePicksTab slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} players={dkPlayers} />}
         {tab === 'build' && <BuilderTab players={dkPlayers} ownership={ownership} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} mc={data.matches?.length || 0} onGoToProjections={() => setTab('dk')} />}
-        {tab === 'leverage' && <LeverageTab players={dkPlayers} />}
+        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
         {tab === 'record' && <TrackRecordTab sport={sport} />}
       </>)}
       {sport === 'mma' && (<>
         {tab === 'dk' && <MMADKTab fighters={dkPlayers} fc={data.fights?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />}
         {tab === 'pp' && <MMAPPTab rows={ppRows} />}
         {tab === 'build' && <MMABuilderTab fighters={dkPlayers} ownership={ownership} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onGoToProjections={() => setTab('dk')} />}
-        {tab === 'leverage' && <LeverageTab players={dkPlayers} />}
+        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
         {tab === 'record' && <TrackRecordTab sport={sport} />}
       </>)}
       {sport === 'nba' && (<>
         {tab === 'dk' && <NBADKTab players={dkPlayers} gameInfo={data.game} own={ownership} cptOwn={cptOwnership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} cptLockedPlayers={cptLockedPlayers} flexLockedPlayers={flexLockedPlayers} cptExcludedPlayers={cptExcludedPlayers} flexExcludedPlayers={flexExcludedPlayers} onToggleCptLock={onToggleCptLock} onToggleCptExclude={onToggleCptExclude} onToggleFlexLock={onToggleFlexLock} onToggleFlexExclude={onToggleFlexExclude} />}
         {tab === 'pp' && <NBAPPTab rows={ppRows} />}
         {tab === 'build' && <NBABuilderTab players={dkPlayers} ownership={ownership} cptOwnership={cptOwnership} slateType={data.slate_type || 'showdown'} gameInfo={data.game} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} cptLockedPlayers={cptLockedPlayers} flexLockedPlayers={flexLockedPlayers} cptExcludedPlayers={cptExcludedPlayers} flexExcludedPlayers={flexExcludedPlayers} onGoToProjections={() => setTab('dk')} />}
-        {tab === 'leverage' && <LeverageTab players={dkPlayers} />}
+        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
         {tab === 'record' && <TrackRecordTab sport={sport} />}
       </>)}
       </ErrorBoundary>}
@@ -4495,23 +4495,56 @@ function CsvDropZone({ label, hint, onFile, filled, count, countLabel = 'players
   );
 }
 
-function LeverageTab({ players: rp }) {
-  const [cd, setCd] = useState(null); const [ul, setUl] = useState(null); const [err, setErr] = useState('');
-  // Contest CSV parser — two paths:
-  //
-  //   Path 1 (preferred): DK standard contest export format. Columns 8-10
-  //     contain Player / Roster Position / %Drafted. Each player appears
-  //     twice on showdown (once CPT, once UTIL); we sum the two for total
-  //     ownership. Works for all sports (tennis, MMA, NBA — any DK export
-  //     that includes the player breakdown section).
-  //
-  //   Path 2 (fallback): legacy substring-count on lineup lines. Kept for
-  //     backwards compat with older / non-standard CSVs that don't have
-  //     the %Drafted breakdown section.
-  //
-  // The file has a BOM character and \r\n line endings in DK's export, so
-  // we normalize both before parsing.
-  const handleContest = e => {
+
+// ═══════════════════════════════════════════════════════════════════════
+// TRACKER TAB — post-lock field ownership vs sim + live Kalshi
+// ═══════════════════════════════════════════════════════════════════════
+// After contest lock, user uploads a DK contest export CSV (same format
+// the legacy LeverageTab parsed). We extract %Drafted per player and
+// compare against our sim_ownership to surface leverage opportunities:
+//
+//   • Δ Own = actual − sim. Positive = field over-concentrated (red);
+//     negative = field under-rostered (green). Threshold ±10pp.
+//   • "Field Needs Most" = top 3 by actual ownership (who breaks the
+//     field if they miss).
+//   • "Biggest Field Error" = top 3 by |Δ| (where field diverged from
+//     our model most — your leverage if you called it correctly).
+//
+// Kalshi prob column updates live via the existing 90s slate polling —
+// no extra fetch path needed. Kalshi delta (▲/▼ since first load) is
+// preserved via the OddsCell + getWpBaseline localStorage mechanism
+// already wired for the DK tab.
+//
+// Persistence: parsed ownership map saved to localStorage keyed by
+// slateId so it survives refreshes. Cross-device + historical browsing
+// would require a Supabase table (contest_ownership_archives) — queued
+// as a follow-up, not in tonight's scope.
+function TrackerTab({ players: rp, ownership, slateId }) {
+  const [actualOwn, setActualOwn] = useState({});
+  const [uploadedAt, setUploadedAt] = useState(null);
+  const [error, setError] = useState('');
+  const [sortKey, setSortKey] = useState('deltaOwn');
+  const [sortDir, setSortDir] = useState('desc');
+
+  // Load persisted data for this slate on mount / slate change
+  useEffect(() => {
+    if (!slateId) return;
+    try {
+      const raw = localStorage.getItem(`tracker_${slateId}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setActualOwn(parsed.ownership || {});
+        setUploadedAt(parsed.uploadedAt || null);
+      } else {
+        setActualOwn({});
+        setUploadedAt(null);
+      }
+    } catch (e) {
+      console.warn('[tracker] localStorage load failed:', e);
+    }
+  }, [slateId]);
+
+  const handleFile = (e) => {
     const f = e.target.files[0];
     if (!f) return;
     const r = new FileReader();
@@ -4519,7 +4552,7 @@ function LeverageTab({ players: rp }) {
       try {
         const raw = evt.target.result.replace(/^\uFEFF/, '');
         const lines = raw.split(/\r?\n/);
-        // Minimal RFC4180 CSV line parser — handles quoted fields / commas in quotes
+        // Minimal RFC4180-ish CSV line parser — handles quoted fields
         const parseCsvLine = (line) => {
           const cols = [];
           let cur = '', inQuotes = false;
@@ -4528,110 +4561,248 @@ function LeverageTab({ players: rp }) {
             if (c === '"') {
               if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }
               else inQuotes = !inQuotes;
-            } else if (c === ',' && !inQuotes) {
-              cols.push(cur); cur = '';
-            } else {
-              cur += c;
-            }
+            } else if (c === ',' && !inQuotes) { cols.push(cur); cur = ''; }
+            else cur += c;
           }
           cols.push(cur);
           return cols;
         };
-        // ─── PATH 1: DK %Drafted column (preferred) ────────────────────
+        // DK standard contest export: columns 8-10 = Player / Roster Position / %Drafted
+        // Showdown players appear twice (CPT + UTIL); sum their ownership.
         const own = {};
-        let parsedPlayerRows = 0;
-        for (let i = 1; i < lines.length; i++) {
-          const line = lines[i];
-          if (!line || !line.includes(',')) continue;
+        for (const line of lines) {
+          if (!line || line.startsWith('Rank,')) continue;
           const cols = parseCsvLine(line);
-          if (cols.length < 10) continue;
-          const playerName = (cols[7] || '').trim();
-          const pctStr = (cols[9] || '').trim();
-          if (!playerName || !pctStr) continue;
-          const pct = parseFloat(pctStr.replace('%', ''));
-          if (!Number.isFinite(pct)) continue;
-          // Sum CPT% + UTIL% for total ownership (player can't be both
-          // in the same lineup, so slot%'s are additive).
-          own[playerName] = Math.round(((own[playerName] || 0) + pct) * 100) / 100;
-          parsedPlayerRows++;
+          if (cols.length < 11) continue;
+          const playerName = (cols[8] || '').trim();
+          const drafted = parseFloat((cols[10] || '').replace('%', ''));
+          if (!playerName || isNaN(drafted)) continue;
+          own[playerName] = (own[playerName] || 0) + drafted;
         }
-        if (parsedPlayerRows > 0) {
-          setCd(own);
-          setErr('');
+        if (Object.keys(own).length === 0) {
+          setError('No ownership data found in CSV. Expected DK contest export with Player / %Drafted columns.');
           return;
         }
-        // ─── PATH 2: substring count fallback ──────────────────────────
-        const ownFallback = {};
-        let ec = 0;
-        for (const line of lines) {
-          if (line.includes(',') && rp.some(p => line.includes(p.name))) {
-            ec++;
-            for (const p of rp) {
-              if (line.includes(p.name)) ownFallback[p.name] = (ownFallback[p.name] || 0) + 1;
-            }
-          }
+        setActualOwn(own);
+        const now = new Date().toISOString();
+        setUploadedAt(now);
+        if (slateId) {
+          try {
+            localStorage.setItem(`tracker_${slateId}`, JSON.stringify({ ownership: own, uploadedAt: now }));
+          } catch (e) { console.warn('[tracker] localStorage save failed:', e); }
         }
-        if (ec > 0) {
-          const op = {};
-          for (const [n, c] of Object.entries(ownFallback)) op[n] = Math.round(c / ec * 1000) / 10;
-          setCd(op);
-          setErr('');
-        } else {
-          setErr('No player data found in CSV');
-        }
-      } catch (e) {
-        setErr(e.message);
+        setError('');
+      } catch (err) {
+        setError('Failed to parse CSV: ' + err.message);
       }
+      // Reset input value so re-uploading the same file triggers onChange
+      e.target.value = '';
     };
     r.readAsText(f);
   };
-  const handleUser = e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = evt => { try { const lines = evt.target.result.split('\n'); const cnt = {}; let lc = 0; for (const line of lines) { if (!line.trim() || line.startsWith('P,') || line.startsWith('Rank')) continue; const hasP = rp.some(p => line.includes(p.name) || line.includes(String(p.id))); if (hasP) { lc++; for (const p of rp) { if (line.includes(p.name) || line.includes(String(p.id))) cnt[p.name] = (cnt[p.name] || 0) + 1; } } } if (lc > 0) { const ep = {}; for (const [n, c] of Object.entries(cnt)) ep[n] = Math.round(c / lc * 1000) / 10; setUl({ counts: ep, total: lc }); } } catch (e) { setErr(e.message); } }; r.readAsText(f); };
-  const ld = useMemo(() => { if (!cd || !ul) return []; return rp.filter(p => p.salary > 0).map(p => ({ name: p.name, salary: p.salary, proj: p.proj, val: p.val, userExp: ul.counts[p.name] || 0, fieldOwn: cd[p.name] || 0, leverage: Math.round(((ul.counts[p.name] || 0) - (cd[p.name] || 0)) * 10) / 10, opponent: p.opponent })).sort((a, b) => b.leverage - a.leverage); }, [cd, ul, rp]);
+
+  const handleClear = () => {
+    if (!confirm('Clear uploaded ownership data for this slate?')) return;
+    setActualOwn({});
+    setUploadedAt(null);
+    if (slateId) {
+      try { localStorage.removeItem(`tracker_${slateId}`); } catch {}
+    }
+  };
+
+  // Enriched rows — one per salaried player on the slate
+  const rows = useMemo(() => {
+    return (rp || []).filter(p => p.salary > 0).map(p => {
+      const sim = Math.round((ownership[p.name] || 0) * 10) / 10;
+      const actual = Math.round((actualOwn[p.name] || 0) * 10) / 10;
+      const delta = Math.round((actual - sim) * 10) / 10;
+      return {
+        name: p.name, opponent: p.opponent, salary: p.salary,
+        simOwn: sim, actualOwn: actual, deltaOwn: delta,
+        oddsProb: p.oddsProb, oddsSource: p.oddsSource,
+      };
+    });
+  }, [rp, ownership, actualOwn]);
+
+  const sortedRows = useMemo(() => {
+    const arr = [...rows];
+    arr.sort((a, b) => {
+      let va, vb;
+      switch (sortKey) {
+        case 'name': va = a.name; vb = b.name; break;
+        case 'opponent': va = a.opponent; vb = b.opponent; break;
+        case 'salary': va = a.salary; vb = b.salary; break;
+        case 'simOwn': va = a.simOwn; vb = b.simOwn; break;
+        case 'actualOwn': va = a.actualOwn; vb = b.actualOwn; break;
+        case 'kalshiProb': va = a.oddsProb ?? -1; vb = b.oddsProb ?? -1; break;
+        case 'deltaOwn':
+        default: va = a.deltaOwn; vb = b.deltaOwn;
+      }
+      if (va === vb) return 0;
+      const cmp = va > vb ? 1 : -1;
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+    return arr;
+  }, [rows, sortKey, sortDir]);
+
+  const toggleSort = (key) => {
+    if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortKey(key); setSortDir(key === 'name' || key === 'opponent' ? 'asc' : 'desc'); }
+  };
+
+  const hasData = Object.keys(actualOwn).length > 0;
+  const fieldNeeds = useMemo(() => {
+    if (!hasData) return [];
+    return [...rows].sort((a, b) => b.actualOwn - a.actualOwn).slice(0, 3);
+  }, [rows, hasData]);
+  const biggestErrors = useMemo(() => {
+    if (!hasData) return [];
+    return [...rows].sort((a, b) => Math.abs(b.deltaOwn) - Math.abs(a.deltaOwn)).slice(0, 3);
+  }, [rows, hasData]);
+
+  // Human-readable relative time for "uploaded X ago"
+  const timeAgoLocal = (iso) => {
+    if (!iso) return '';
+    try {
+      const then = new Date(iso).getTime();
+      const now = Date.now();
+      const diff = Math.round((now - then) / 1000);
+      if (diff < 60) return `${diff}s ago`;
+      if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+      if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+      return new Date(iso).toLocaleDateString();
+    } catch { return ''; }
+  };
+
+  // Delta cell: color-coded ±10pp threshold.
+  //   actual > sim (positive delta) = field over-owns = red (you had
+  //   leverage if you faded this player)
+  //   actual < sim (negative delta) = field under-owns = green (you had
+  //   leverage if you rostered this player)
+  const DeltaCell = ({ delta }) => {
+    const abs = Math.abs(delta);
+    let bg = 'transparent', color = 'var(--text-muted)';
+    if (abs >= 10) {
+      bg = delta > 0 ? 'rgba(239,68,68,0.12)' : 'rgba(74,222,128,0.12)';
+      color = delta > 0 ? '#EF4444' : '#4ADE80';
+    }
+    const sign = delta > 0 ? '+' : '';
+    return (
+      <span style={{ color, background: bg, padding: '2px 8px', borderRadius: 4, fontWeight: abs >= 10 ? 600 : 500, fontVariantNumeric: 'tabular-nums' }}>
+        {sign}{delta.toFixed(1)}pp
+      </span>
+    );
+  };
+
+  const SortHeader = ({ label, col, num }) => {
+    const active = sortKey === col;
+    return (
+      <th className={num ? 'num' : ''} style={{ cursor: 'pointer' }} onClick={() => toggleSort(col)}>
+        {label}
+        {active && <span style={{ marginLeft: 4, fontSize: 10 }}>{sortDir === 'asc' ? '▲' : '▼'}</span>}
+      </th>
+    );
+  };
+
   return (<>
-    <div className="section-hero">
-      <div className="section-hero-icon-wrap">
-        <svg className="section-hero-icon" viewBox="0 0 24 24" fill="none" stroke="#F5C518">
-          <path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>
-          <path d="M21 3v5h-5"/>
-          <path d="M21 12a9 9 0 0 1-15 6.7L3 16"/>
-          <path d="M3 21v-5h5"/>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 14, flexWrap: 'wrap' }}>
+      <div style={{
+        width: 56, height: 56, borderRadius: 10,
+        background: 'rgba(245,197,24,0.08)',
+        border: '1px solid rgba(245,197,24,0.25)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        flexShrink: 0,
+      }}>
+        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#F5C518" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
         </svg>
       </div>
-      <div className="section-hero-text">
-        <h2 className="section-hero-title">Live Leverage</h2>
-        <div className="section-hero-sub">Upload contest CSV + your lineups to compare vs the field</div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <h2 className="section-head" style={{ margin: 0, lineHeight: 1.1 }}>Tracker</h2>
+        <p className="section-sub" style={{ margin: '4px 0 0' }}>
+          {hasData ? `Ownership uploaded ${timeAgoLocal(uploadedAt)} · actual vs sim · live Kalshi` : 'Upload the DK contest export to see field ownership vs our sim'}
+        </p>
+      </div>
+      <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+        <label className="btn btn-primary" style={{ width: 'auto', cursor: 'pointer' }}>
+          {hasData ? 'Replace CSV' : 'Upload CSV'}
+          <input type="file" accept=".csv" onChange={handleFile} style={{ display: 'none' }} />
+        </label>
+        {hasData && (
+          <button className="btn btn-outline" style={{ width: 'auto' }} onClick={handleClear}>Clear</button>
+        )}
       </div>
     </div>
-    <div style={{ display: 'flex', gap: 16, marginBottom: 20, flexWrap: 'wrap' }}>
-      <CsvDropZone
-        label="Step 1: Contest CSV"
-        hint="DK contest file after lock"
-        onFile={handleContest}
-        filled={!!cd}
-        count={cd ? Object.keys(cd).length : 0}
-        countLabel="players"
-      />
-      <CsvDropZone
-        label="Step 2: Your Lineups"
-        hint="Your DK upload or readable CSV"
-        onFile={handleUser}
-        filled={!!ul}
-        count={ul ? ul.total : 0}
-        countLabel="lineups"
-      />
-    </div>
-    {err && <div style={{ color: 'var(--red)', fontSize: 13, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}><Icon name="warning" size={14} color="var(--red)"/> {err}</div>}
-    {ld.length > 0 && <>
-      <div className="metrics">
-        <div className="metric"><div className="metric-label"><Icon name="gem" size={13}/> Top Leverage</div><div className="metric-value" style={{ color: 'var(--green-text)' }}>{ld[0]?.name}</div><div className="metric-sub">You: {ld[0]?.userExp}% · Field: {ld[0]?.fieldOwn}% · +{ld[0]?.leverage}%</div></div>
-        <div className="metric"><div className="metric-label"><Icon name="bomb" size={13}/> Most Underweight</div><div className="metric-value" style={{ color: 'var(--red-text)' }}>{ld[ld.length - 1]?.name}</div><div className="metric-sub">You: {ld[ld.length - 1]?.userExp}% · Field: {ld[ld.length - 1]?.fieldOwn}% · {ld[ld.length - 1]?.leverage}%</div></div>
+
+    {error && <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#EF4444', padding: 10, borderRadius: 6, marginBottom: 12, fontSize: 12 }}>{error}</div>}
+
+    {hasData && (
+      <div className="metrics" style={{ marginBottom: 16 }}>
+        <div className="metric" style={{ flex: 1 }}>
+          <div className="metric-label"><Icon name="target" size={13}/> Field Needs Most</div>
+          <div style={{ marginTop: 8 }}>
+            {fieldNeeds.map((p, i) => (
+              <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', padding: '3px 0', fontSize: 13, gap: 8 }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><span style={{ color: 'var(--text-dim)', marginRight: 6 }}>{i + 1}.</span>{p.name}</span>
+                <span style={{ color: '#EF4444', fontWeight: 600, flexShrink: 0 }}>{p.actualOwn.toFixed(1)}%</span>
+              </div>
+            ))}
+          </div>
+          <div className="metric-sub" style={{ marginTop: 6 }}>Highest actual ownership</div>
+        </div>
+        <div className="metric" style={{ flex: 1 }}>
+          <div className="metric-label"><Icon name="gem" size={13}/> Biggest Field Error</div>
+          <div style={{ marginTop: 8 }}>
+            {biggestErrors.map((p, i) => (
+              <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', padding: '3px 0', fontSize: 13, gap: 8 }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}><span style={{ color: 'var(--text-dim)', marginRight: 6 }}>{i + 1}.</span>{p.name}</span>
+                <DeltaCell delta={p.deltaOwn} />
+              </div>
+            ))}
+          </div>
+          <div className="metric-sub" style={{ marginTop: 6 }}>|Actual − Sim| (your leverage)</div>
+        </div>
       </div>
-      <div className="table-wrap"><table><thead><tr><th>#</th><th></th><th>Player</th><th>Opp</th><th className="num">Proj</th><th className="num">Your Exp</th><th className="num">Field Own</th><th className="num">Leverage</th></tr></thead>
-      <tbody>{ld.map((p, i) => <tr key={p.name} className={p.leverage > 10 ? 'row-hl-green' : p.leverage < -10 ? 'row-hl-red' : ''}><td className="muted">{i + 1}</td><td>{p.leverage > 10 ? <Tip icon="gem" label="Strong overweight" /> : p.leverage < -10 ? <Tip icon="bomb" label="Underweight" /> : ''}</td><td className="name">{p.name}</td><td className="muted">{p.opponent}</td><td className="num">{fmt(p.proj, 1)}</td><td className="num" style={{ color: 'var(--primary-glow)' }}>{fmt(p.userExp, 1)}%</td><td className="num muted">{fmt(p.fieldOwn, 1)}%</td><td className="num"><span style={{ color: p.leverage > 0 ? 'var(--green)' : p.leverage < 0 ? 'var(--red)' : 'var(--text-dim)', fontWeight: Math.abs(p.leverage) > 10 ? 700 : 500, background: Math.abs(p.leverage) > 15 ? (p.leverage > 0 ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.12)') : 'transparent', padding: '2px 8px', borderRadius: 4 }}>{p.leverage > 0 ? '+' : ''}{fmt(p.leverage, 1)}%</span></td></tr>)}</tbody></table></div>
-    </>}
-    {!cd && !ul && <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--text-dim)' }}><div style={{ marginBottom: 8, color: 'var(--text-muted)' }}><Icon name="refresh" size={32}/></div><div style={{ fontSize: 14 }}>Upload both CSVs to see leverage vs field</div></div>}
+    )}
+
+    {hasData ? (
+      <div className="table-wrap">
+        <table>
+          <thead><tr>
+            <SortHeader label="Player" col="name" />
+            <SortHeader label="Opp" col="opponent" />
+            <SortHeader label="Sal" col="salary" num />
+            <SortHeader label="Sim" col="simOwn" num />
+            <SortHeader label="Actual" col="actualOwn" num />
+            <SortHeader label="Δ" col="deltaOwn" num />
+            <SortHeader label="Kalshi" col="kalshiProb" num />
+          </tr></thead>
+          <tbody>
+            {sortedRows.map(p => (
+              <tr key={p.name}>
+                <td className="name">{p.name}</td>
+                <td className="muted">{p.opponent}</td>
+                <td className="num">{fmtSal(p.salary)}</td>
+                <td className="num muted">{p.simOwn.toFixed(1)}%</td>
+                <td className="num" style={{ fontWeight: 600 }}>{p.actualOwn.toFixed(1)}%</td>
+                <td className="num"><DeltaCell delta={p.deltaOwn} /></td>
+                <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} delta={getWpBaseline(slateId, p.name, p.oddsProb)} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <div style={{ textAlign: 'center', padding: '60px 20px', color: 'var(--text-dim)' }}>
+        <div style={{ fontSize: 14, marginBottom: 12 }}>Upload your DK contest export CSV</div>
+        <div style={{ fontSize: 12, maxWidth: 440, margin: '0 auto' }}>
+          The contest export includes each player's % Drafted. We'll compare it to our sim ownership and surface leverage + field errors live as Kalshi moves.
+        </div>
+      </div>
+    )}
   </>);
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // MMA COMPONENTS — NEW
