@@ -3946,6 +3946,7 @@ function SlateWaiting({ message, sub }) {
 // snapshotting (so odds freeze at first-pitch) is a separate snapshot
 // job; this tab just renders whatever the slate payload provides.
 function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
+  const { isAdmin } = useAuth();
   const [actualOwn, setActualOwn] = useState({});
   const [uploadedAt, setUploadedAt] = useState(null);
   const [contestName, setContestName] = useState(null);
@@ -4089,10 +4090,23 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
   };
 
   const hasData = Object.keys(actualOwn).length > 0;
+  // v5.16: Field Needs Most ranks by NET ownership pull — a player's actual
+  // ownership minus their opponent's actual ownership. Tommy Paul at 42.7%
+  // when his opponent is at 10% = score 32.7 (real leverage on whichever
+  // side wins). Tennis is a binary outcome, so net ownership captures who
+  // "the field needs to win" more accurately than raw ownership alone.
+  const opponentOwn = useMemo(() => {
+    const m = {};
+    for (const r of rows) m[r.name] = r.actualOwn;
+    return m;
+  }, [rows]);
   const fieldNeeds = useMemo(() => {
     if (!hasData) return [];
-    return [...rows].sort((a, b) => b.actualOwn - a.actualOwn).slice(0, 3);
-  }, [rows, hasData]);
+    return [...rows]
+      .map((r) => ({ ...r, netOwn: r.actualOwn - (opponentOwn[r.opponent] || 0) }))
+      .sort((a, b) => b.netOwn - a.netOwn)
+      .slice(0, 3);
+  }, [rows, hasData, opponentOwn]);
   const biggestErrors = useMemo(() => {
     if (!hasData) return [];
     return [...rows].sort((a, b) => Math.abs(b.deltaOwn) - Math.abs(a.deltaOwn)).slice(0, 3);
@@ -4143,21 +4157,15 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
   };
 
   return (<>
-    <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 14, flexWrap: 'wrap' }}>
-      <div style={{
-        width: 56, height: 56, borderRadius: 10,
-        background: 'rgba(245,197,24,0.08)',
-        border: '1px solid rgba(245,197,24,0.25)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        flexShrink: 0,
-      }}>
-        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#F5C518" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+    <div className="section-hero">
+      <div className="section-hero-icon-wrap">
+        <svg className="section-hero-icon" viewBox="0 0 24 24" fill="none" stroke="#F5C518">
           <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
         </svg>
       </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <h2 className="section-head" style={{ margin: 0, lineHeight: 1.1 }}>Live Leverage Tracker</h2>
-        <p className="section-sub" style={{ margin: '4px 0 0' }}>
+      <div className="section-hero-text">
+        <h2 className="section-hero-title">Live Leverage Tracker</h2>
+        <div className="section-hero-sub">
           {hasData
             ? <>
                 {contestName ? <strong style={{ color: 'var(--text)' }}>{contestName}</strong> : 'Contest ownership'}
@@ -4165,18 +4173,22 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
                 {uploadedAt ? <> · uploaded {timeAgoLocal(uploadedAt)}</> : null}
                 <> · actual vs sim · live Kalshi</>
               </>
-            : 'Admin uploads the DK contest export once the slate locks. Shared view — every signed-in user sees the same data.'}
-        </p>
+            : (isAdmin
+                ? 'Upload the DK contest export once the slate locks. Shared view — every signed-in user sees the same data.'
+                : 'Live contest ownership posts here once the admin uploads the DK contest export after lock.')}
+        </div>
       </div>
-      <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-        <label className="btn btn-primary" style={{ width: 'auto', cursor: uploading ? 'wait' : 'pointer', opacity: uploading ? 0.6 : 1 }}>
-          {uploading ? 'Uploading…' : (hasData ? 'Replace CSV' : 'Upload CSV')}
-          <input type="file" accept=".csv" onChange={handleFile} disabled={uploading} style={{ display: 'none' }} />
-        </label>
-        {hasData && !uploading && (
-          <button className="btn btn-outline" style={{ width: 'auto' }} onClick={handleClear}>Clear</button>
-        )}
-      </div>
+      {isAdmin && (
+        <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+          <label className="btn btn-primary" style={{ width: 'auto', padding: '7px 14px', fontSize: 13, cursor: uploading ? 'wait' : 'pointer', opacity: uploading ? 0.6 : 1 }}>
+            {uploading ? 'Uploading…' : (hasData ? 'Replace CSV' : 'Upload CSV')}
+            <input type="file" accept=".csv" onChange={handleFile} disabled={uploading} style={{ display: 'none' }} />
+          </label>
+          {hasData && !uploading && (
+            <button className="btn btn-outline" style={{ width: 'auto', padding: '7px 14px', fontSize: 13 }} onClick={handleClear}>Clear</button>
+          )}
+        </div>
+      )}
     </div>
 
     {error && <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#EF4444', padding: 10, borderRadius: 6, marginBottom: 12, fontSize: 12 }}>{error}</div>}
