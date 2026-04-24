@@ -107,13 +107,14 @@ export function isSportEnabled(sport) {
 // to obtain the access token so the backend can verify admin_users membership.
 
 export async function fetchContestOwnership(slateId) {
-  if (!slateId) return { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null };
-  if (!API_BASE) return { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null };
+  const empty = { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null, _error: null };
+  if (!slateId) return { ...empty, _error: 'No slate selected' };
+  if (!API_BASE) return { ...empty, _error: 'Backend API not configured (VITE_API_URL missing)' };
   try {
     return await fetchJson(`${API_BASE}/api/tracker/${slateId}/ownership`, { timeoutMs: 10000 });
   } catch (err) {
     console.warn('[overowned] contest ownership fetch failed', err.message);
-    return { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null };
+    return { ...empty, _error: err.message };
   }
 }
 
