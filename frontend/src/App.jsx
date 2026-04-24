@@ -2532,15 +2532,25 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
   // v5.1: filter (simOwn || 0) > 0 — players without sim own data can't
   // be meaningfully ranked as traps OR gems. Null/undefined own reads as
   // 0 which artificially inflates gem scores.
+  // v5.4: no two players from the same match. When we add a player, we
+  // block their opponent from subsequent picks — only one side per match.
   const traps = useMemo(() => {
     const active = pw.filter(p => p.salary > 0 && (p.val || 0) > 0 && (p.simOwn || 0) > 0);
     if (active.length === 0) return [];
     const N = (mc || 0) >= 16 ? 4 : 2;
     const scored = active.map(p => ({
-      name: p.name,
+      p,
       score: (p.simOwn || 0) - (p.val || 0) * 5
     })).sort((a, b) => b.score - a.score);
-    return scored.slice(0, N).map(x => x.name);
+    const result = [];
+    const usedOpps = new Set();
+    for (const { p } of scored) {
+      if (usedOpps.has(p.name)) continue;
+      result.push(p.name);
+      if (p.opponent) usedOpps.add(p.opponent);
+      if (result.length >= N) break;
+    }
+    return result;
   }, [pw, mc]);
   // Derived single-name aliases for backward compat in display/comparisons
   const trap = traps[0] || '';
@@ -2551,10 +2561,8 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
   //   2. Sort by val descending
   //   3. Take top N×5 players, split into N tiers of 5
   //   4. Lowest sim own in each tier = Hidden Gem for that tier
-  // N = 4 for 16+ match slates (top 20 by val → 4 gems)
-  // N = 2 for ≤15 match slates (top 10 by val → 2 gems)
-  // This handles different ownership scales across slates without needing
-  // a magic constant to balance val vs simOwn in the formula.
+  // v5.4: same-match block — if a gem's opponent was picked in an earlier
+  // tier, skip them and pick the next-lowest-owned in the current tier.
   const hiddenGems = useMemo(() => {
     const active = pw.filter(p => p.salary > 0 && (p.val || 0) > 0 && (p.simOwn || 0) > 0);
     if (active.length === 0) return [];
@@ -2562,49 +2570,68 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
     const byVal = [...active].sort((a, b) => (b.val || 0) - (a.val || 0));
     const pool = byVal.slice(0, N * 5);
     const result = [];
+    const usedOpps = new Set();
     for (let i = 0; i < N; i++) {
       const tier = pool.slice(i * 5, (i + 1) * 5);
       if (tier.length === 0) break;
-      const gem = tier.reduce((lowest, p) => ((p.simOwn || 0) < (lowest.simOwn || 0) ? p : lowest));
-      result.push(gem.name);
+      // Sort tier by sim own ascending; pick first not blocked by opp rule
+      const sortedTier = [...tier].sort((a, b) => (a.simOwn || 0) - (b.simOwn || 0));
+      const picked = sortedTier.find(p => !usedOpps.has(p.name));
+      if (picked) {
+        result.push(picked.name);
+        if (picked.opponent) usedOpps.add(picked.opponent);
+      }
     }
     return result;
   }, [pw, mc]);
 
-  // Top 3 PP fades (ppEdge ≤ -2), excluding primary trap. Displayed in
-  // the Pivots box alongside primary/or-pivot gem picks.
+  // Top 3 PP fades (ppEdge ≤ -2), excluding the primary trap. Displayed
+  // in the Pivots box alongside primary/or-pivot picks.
+  // v5.4: same-match block — no two PP fades from the same match.
   const topPpFades = useMemo(() => {
     if ((mc || 0) < 16) return [];
-    return pw
+    const ranked = pw
       .filter(p => p.salary > 0 && typeof p.ppEdge === 'number' && p.ppEdge <= -2)
       .filter(p => p.name !== trap)
-      .sort((a, b) => (a.ppEdge || 0) - (b.ppEdge || 0))
-      .slice(0, 3)
-      .map(p => p.name);
+      .sort((a, b) => (a.ppEdge || 0) - (b.ppEdge || 0));
+    const result = [];
+    const usedOpps = new Set();
+    for (const p of ranked) {
+      if (usedOpps.has(p.name)) continue;
+      result.push(p.name);
+      if (p.opponent) usedOpps.add(p.opponent);
+      if (result.length >= 3) break;
+    }
+    return result;
   }, [pw, trap, mc]);
 
   // Pivots — v5.3: scan trap opponents in rank order. Primary = first
   // trap opponent with val ≥ 5.5. Or Pivot (16+ only) = second qualifying
   // trap opponent. No value fallback — that's what Hidden Gems is for.
-  // If zero/one trap opps qualify, Or Pivot (or both) is empty.
+  // v5.4: same-match block — if Trap #1 and Trap #2 happen to face each
+  // other, their opponents are each other and we must not pick both.
   const gem = useMemo(() => {
     if (traps.length === 0) return { primary: null, pivot: null };
     const is16Plus = (mc || 0) >= 16;
     const maxPivots = is16Plus ? 2 : 1;
     const qualifying = [];
+    const usedOpps = new Set();
     for (let i = 0; i < traps.length; i++) {
       const trapP = pw.find(p => p.name === traps[i]);
       if (!trapP) continue;
       const opp = pw.find(p => p.name === trapP.opponent);
-      if (opp && (opp.val || 0) >= 5.5 && !qualifying.some(q => q.name === opp.name)) {
-        qualifying.push({
-          name: opp.name,
-          kind: 'opponent',
-          wp: opp.wp,
-          fromTrap: i + 1,  // which trap rank (1-indexed) this pivots off
-        });
-        if (qualifying.length >= maxPivots) break;
-      }
+      if (!opp) continue;
+      if ((opp.val || 0) < 5.5) continue;
+      if (qualifying.some(q => q.name === opp.name)) continue;
+      if (usedOpps.has(opp.name)) continue;
+      qualifying.push({
+        name: opp.name,
+        kind: 'opponent',
+        wp: opp.wp,
+        fromTrap: i + 1,
+      });
+      if (opp.opponent) usedOpps.add(opp.opponent);
+      if (qualifying.length >= maxPivots) break;
     }
     return { primary: qualifying[0] || null, pivot: qualifying[1] || null };
   }, [pw, traps, mc]);
@@ -2802,53 +2829,85 @@ function computeOverOwnedCaps(rp, ownership, strength, matchCount) {
   };
 
   // ─── SELECTIONS ─────────────────────────────────────────────────────
+  // v5.4: every signal list enforces "no two players from the same match"
+  // via a `usedOpps` Set. When a player joins the list, their opponent is
+  // blocked from subsequent picks for that signal.
 
   // Biggest Traps — subtractive formula (simOwn − val × 5), highest first.
   const trapScore = (p) => (own(p.name)) - (p.val || 0) * 5;
   const rankedDesc = [...withSal].sort((a, b) => trapScore(b) - trapScore(a));
-  const trapsList = rankedDesc.slice(0, trapCount);
+  const trapsList = [];
+  {
+    const usedOpps = new Set();
+    for (const p of rankedDesc) {
+      if (usedOpps.has(p.name)) continue;
+      trapsList.push(p);
+      if (p.opponent) usedOpps.add(p.opponent);
+      if (trapsList.length >= trapCount) break;
+    }
+  }
 
-  // Hidden Gems — tier-based (v5.2). Sort by val desc, split into N tiers
-  // of 5, pick lowest sim own in each tier. Each gem represents its value
-  // tier's least-rostered player — genuine under-owned value at that level.
+  // Hidden Gems — tier-based. Sort by val desc, split into N tiers of 5,
+  // pick lowest sim own in each tier (skipping opp-blocked candidates).
   const byVal = [...withSal].sort((a, b) => (b.val || 0) - (a.val || 0));
   const gemPool = byVal.slice(0, gemCount * 5);
   const gemsList = [];
-  for (let i = 0; i < gemCount; i++) {
-    const tier = gemPool.slice(i * 5, (i + 1) * 5);
-    if (tier.length === 0) break;
-    const gem = tier.reduce((lo, p) => ((own(p.name) || 0) < (own(lo.name) || 0) ? p : lo));
-    gemsList.push(gem);
+  {
+    const usedOpps = new Set();
+    for (let i = 0; i < gemCount; i++) {
+      const tier = gemPool.slice(i * 5, (i + 1) * 5);
+      if (tier.length === 0) break;
+      const sortedTier = [...tier].sort((a, b) => (own(a.name) || 0) - (own(b.name) || 0));
+      const picked = sortedTier.find(p => !usedOpps.has(p.name));
+      if (picked) {
+        gemsList.push(picked);
+        if (picked.opponent) usedOpps.add(picked.opponent);
+      }
+    }
   }
 
-  // Guard against overlap (shouldn't happen in tennis — traps high-score,
-  // gems low-own within val tiers — but defensive anyway)
+  // Guard against overlap between traps and gems (shouldn't happen in
+  // tennis, defensive anyway)
   const gemNameSet = new Set(gemsList.map(p => p.name));
   const trapsListClean = trapsList.filter(p => !gemNameSet.has(p.name));
 
-  // Pivots — v5.3: scan trap opponents in rank order. Primary = first
-  // trap opp with val ≥ 5.5. Or Pivot (16+ only) = second qualifying trap
-  // opp. No value fallback — Hidden Gems covers that separately.
+  // Pivots — scan trap opps in rank order, first N with val ≥ 5.5.
+  // Same-match block: if two traps are opponents, only one pivot surfaces.
   const oppOf = (player) => player ? withSal.find(p => p.name === player.opponent) : null;
   const maxPivots = is16Plus ? 2 : 1;
   const qualifyingPivots = [];
-  for (const t of trapsListClean) {
-    const opp = oppOf(t);
-    if (opp && (opp.val || 0) >= 5.5 && !qualifyingPivots.some(q => q.name === opp.name)) {
+  {
+    const usedOpps = new Set();
+    for (const t of trapsListClean) {
+      const opp = oppOf(t);
+      if (!opp) continue;
+      if ((opp.val || 0) < 5.5) continue;
+      if (qualifyingPivots.some(q => q.name === opp.name)) continue;
+      if (usedOpps.has(opp.name)) continue;
       qualifyingPivots.push(opp);
+      if (opp.opponent) usedOpps.add(opp.opponent);
       if (qualifyingPivots.length >= maxPivots) break;
     }
   }
   const primaryPivot = qualifyingPivots[0] || null;
   const orPivot = qualifyingPivots[1] || null;
 
-  // PP Fades — top 3 by ppEdge ≤ -2, excluding Trap #1
+  // PP Fades — top 3 by ppEdge ≤ -2, excluding Trap #1, with same-match block.
   const topTrap = trapsListClean[0] || null;
-  const ppFades = withSal
+  const ppFadesRanked = withSal
     .filter(p => typeof p.ppEdge === 'number' && p.ppEdge <= -2)
     .filter(p => p.name !== topTrap?.name)
-    .sort((a, b) => (a.ppEdge || 0) - (b.ppEdge || 0))
-    .slice(0, 3);
+    .sort((a, b) => (a.ppEdge || 0) - (b.ppEdge || 0));
+  const ppFades = [];
+  {
+    const usedOpps = new Set();
+    for (const p of ppFadesRanked) {
+      if (usedOpps.has(p.name)) continue;
+      ppFades.push(p);
+      if (p.opponent) usedOpps.add(p.opponent);
+      if (ppFades.length >= 3) break;
+    }
+  }
 
   // ─── RULES ──────────────────────────────────────────────────────────
 
