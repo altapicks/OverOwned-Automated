@@ -208,6 +208,17 @@ export function PrizePicksTab({ slateId, players = [] }) {
     });
   }, [lines, getProjectedForStat]);
 
+  // Top 3 PP fades — the three rows with the most negative edges (biggest
+  // "we project WAY under the posted line"). These get visually flagged
+  // in the table with a gem icon + subtle green row highlight, same
+  // semantic as the DK tab's Hidden Gem markers. Exposed as a Set of
+  // row ids for O(1) lookup during render.
+  const topFadeIds = useMemo(() => {
+    const withEdge = enrichedLines.filter(l => l.edge != null && l.edge < -0.5);
+    withEdge.sort((a, b) => a.edge - b.edge);  // most negative first
+    return new Set(withEdge.slice(0, 3).map(l => l.id));
+  }, [enrichedLines]);
+
   // Sort — edge desc by default, but clicking a header cycles the sort.
   const sortedLines = useMemo(() => {
     const arr = [...enrichedLines];
@@ -317,6 +328,7 @@ export function PrizePicksTab({ slateId, players = [] }) {
           <table>
             <thead>
               <tr>
+                <th style={{ width: 24 }}></th>{/* gem-icon column */}
                 <SortHeader label="Player" col="player" />
                 <SortHeader label="Stat" col="stat" />
                 <SortHeader label="Line" col="line" num />
@@ -328,10 +340,35 @@ export function PrizePicksTab({ slateId, players = [] }) {
             </thead>
             <tbody>
               {sortedLines.length === 0 && (
-                <tr><td colSpan={isAdmin ? 7 : 6} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>No lines yet{isAdmin ? '. Click "Add Line" or "Paste CSV" to get started.' : '.'}</td></tr>
+                <tr><td colSpan={isAdmin ? 8 : 7} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>No lines yet{isAdmin ? '. Click "Add Line" or "Paste CSV" to get started.' : '.'}</td></tr>
               )}
-              {sortedLines.map(line => (
-                <tr key={line.id} style={flashId === line.id ? { background: 'rgba(245,197,24,0.15)', transition: 'background 0.3s' } : {}}>
+              {sortedLines.map(line => {
+                // Top 3 PP fades get the gem+green treatment — same visual
+                // semantic as Hidden Gems on the DK tab. Flash state (yellow
+                // highlight after admin edit) takes precedence so the user
+                // sees their edit confirmation.
+                const isFade = topFadeIds.has(line.id);
+                const rowStyle = flashId === line.id
+                  ? { background: 'rgba(245,197,24,0.15)', transition: 'background 0.3s' }
+                  : isFade
+                    ? { background: 'rgba(74,222,128,0.08)' }
+                    : {};
+                return (
+                <tr key={line.id} style={rowStyle}>
+                  <td style={{ textAlign: 'center', padding: '6px 4px' }}>
+                    {isFade && (
+                      <span title="Top PP Fade — model projects significantly under the posted line">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+                             stroke="#4ADE80" strokeWidth="1.75"
+                             strokeLinecap="round" strokeLinejoin="round"
+                             style={{ display: 'block', margin: '0 auto' }}>
+                          <path d="M6 3h12l3 6-9 12L3 9z"/>
+                          <path d="M3 9h18"/>
+                          <path d="M9 3l3 6 3-6"/>
+                        </svg>
+                      </span>
+                    )}
+                  </td>
                   <td className="name">{line.raw_player_name}</td>
                   <td className="muted">{line.stat_type}</td>
                   <td className="num">
@@ -348,7 +385,8 @@ export function PrizePicksTab({ slateId, players = [] }) {
                     <td><button onClick={() => onDelete(line.id)} style={{ background: 'none', border: 'none', color: 'var(--text-dim)', cursor: 'pointer', fontSize: 18 }}>×</button></td>
                   )}
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
