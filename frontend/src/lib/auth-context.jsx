@@ -16,6 +16,10 @@ const AuthContext = createContext(null);
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [subscription, setSubscription] = useState(null);
+  // v5.11: admin status derived from admin_users table. Non-admins see
+  // 0 rows due to RLS; admins see their own row. Used to hide subscribe
+  // prompts from admin accounts (who have full access without paying).
+  const [isAdmin, setIsAdmin] = useState(false);
   // 'loading' until we've checked session + subscription. Prevents UI flash of "not signed in"
   // when a returning user is actually still authenticated.
   const [status, setStatus] = useState('loading');
@@ -40,6 +44,24 @@ export function AuthProvider({ children }) {
     setSubscription(data || null);
   }, []);
 
+  // Check admin status against admin_users. RLS policy on that table uses
+  // is_admin() which means non-admins see 0 rows, admins see their own row.
+  // Either way the query succeeds — we just count rows.
+  const loadAdminStatus = useCallback(async (userId) => {
+    if (!userId) { setIsAdmin(false); return; }
+    const { data, error } = await supabase
+      .from('admin_users')
+      .select('user_id')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) {
+      console.warn('[auth] admin status check failed:', error.message);
+      setIsAdmin(false);
+      return;
+    }
+    setIsAdmin(!!data);
+  }, []);
+
   // On mount: check existing session + listen for auth state changes.
   useEffect(() => {
     let mounted = true;
@@ -49,7 +71,9 @@ export function AuthProvider({ children }) {
       if (!mounted) return;
       const u = session?.user ?? null;
       setUser(u);
-      if (u) await loadSubscription(u.id);
+      if (u) {
+        await Promise.all([loadSubscription(u.id), loadAdminStatus(u.id)]);
+      }
       setStatus(u ? 'authenticated' : 'unauthenticated');
     });
 
@@ -59,16 +83,17 @@ export function AuthProvider({ children }) {
       const u = session?.user ?? null;
       setUser(u);
       if (u) {
-        await loadSubscription(u.id);
+        await Promise.all([loadSubscription(u.id), loadAdminStatus(u.id)]);
         setStatus('authenticated');
       } else {
         setSubscription(null);
+        setIsAdmin(false);
         setStatus('unauthenticated');
       }
     });
 
     return () => { mounted = false; authSub.unsubscribe(); };
-  }, [loadSubscription]);
+  }, [loadSubscription, loadAdminStatus]);
 
   // Magic-link sign-in. Sends an email with a one-click login link.
   const signIn = useCallback(async (email) => {
@@ -88,7 +113,23 @@ export function AuthProvider({ children }) {
     await supabase.auth.signOut();
     setUser(null);
     setSubscription(null);
+    setIsAdmin(false);
     setStatus('unauthenticated');
+  }, []);
+
+  // v5.11: update display_name in auth.users.user_metadata.
+  // Returns { ok, error? } — the component handles UI feedback.
+  const updateDisplayName = useCallback(async (name) => {
+    const trimmed = (name || '').trim();
+    if (!trimmed) return { ok: false, error: 'Display name cannot be empty.' };
+    if (trimmed.length > 40) return { ok: false, error: 'Maximum 40 characters.' };
+    const { data, error } = await supabase.auth.updateUser({
+      data: { display_name: trimmed },
+    });
+    if (error) return { ok: false, error: error.message };
+    // Refresh local user object so UI picks up the change immediately.
+    if (data?.user) setUser(data.user);
+    return { ok: true };
   }, []);
 
   // Re-fetch subscription manually (used after returning from Stripe Checkout, to pick up
@@ -108,9 +149,14 @@ export function AuthProvider({ children }) {
     user,
     subscription,
     isSubscribed,
+    isAdmin,
+    // v5.11: convenience — prefer display_name from user_metadata, fall back
+    // to email. Used by UserMenu and anywhere else we want a friendly label.
+    displayName: (user?.user_metadata?.display_name && user.user_metadata.display_name.trim()) || null,
     status,           // 'loading' | 'authenticated' | 'unauthenticated'
     signIn,
     signOut,
+    updateDisplayName,
     refreshSubscription,
   };
 
