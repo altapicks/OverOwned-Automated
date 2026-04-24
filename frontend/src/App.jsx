@@ -3112,8 +3112,11 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
         const userMax = userSet.max !== undefined ? userSet.max : globalMax;
         const effMin = Math.max(userMin, cap.min || 0);
         const effMax = Math.min(userMax, cap.max !== undefined ? cap.max : 100);
+        // v5.7: gem projection boost (same as classic path)
+        const GEM_BOOST = { 1: 1.15, 2: 1.12, 3: 1.08, 4: 1.05 };
+        const gemBoost = (cap._signal === 'gem' && cap._rank && GEM_BOOST[cap._rank]) || 1;
         return {
-          name: p.name, projection: p.proj * jitter(), opponent: p.opponent,
+          name: p.name, projection: p.proj * jitter() * gemBoost, opponent: p.opponent,
           // Salary field kept for exposure table value calc (uses FLEX baseline)
           salary: p.flex_salary ?? p.salary, id: p.flex_id ?? p.id,
           cpt_salary: p.cpt_salary, acpt_salary: p.acpt_salary, flex_salary: p.flex_salary,
@@ -3135,7 +3138,13 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
       const userMax = userSet.max !== undefined ? userSet.max : globalMax;
       const effMin = Math.max(userMin, cap.min || 0);
       const effMax = Math.min(userMax, cap.max !== undefined ? cap.max : 100);
-      return { name: p.name, salary: p.salary, id: p.id, projection: p.proj * jitter(), opponent: p.opponent, maxExp: effMax, minExp: effMin };
+      // v5.7: gem projection boost — Hidden Gems sim out first, not by pure
+      // projection. Boost graduated by gem rank: #1 = +15%, #2 = +12%, #3 = +8%,
+      // #4 = +5%. Only applies when OverOwned Mode is on (cap._signal is set).
+      // Leaves original p.proj on the player object for exposure/value display.
+      const GEM_BOOST = { 1: 1.15, 2: 1.12, 3: 1.08, 4: 1.05 };
+      const gemBoost = (cap._signal === 'gem' && cap._rank && GEM_BOOST[cap._rank]) || 1;
+      return { name: p.name, salary: p.salary, id: p.id, projection: p.proj * jitter() * gemBoost, opponent: p.opponent, maxExp: effMax, minExp: effMin };
     });
     enforceMinNudge(pd, sp);
     // v3.23: 18+ match tennis slates use a $49,200 minSalary floor (up from
