@@ -260,10 +260,31 @@ export function processMatch(match) {
   const gw_a = adjustLine(o.gw_a_line, o.gw_a_over);
   const gw_b = adjustLine(o.gw_b_line, o.gw_b_over);
 
-  // Breaks
-  // Breaks - use Poisson like aces/DFs: convert over odds to expected value
-  const brk_a = poissonEV(o.brk_a_over, Math.ceil(o.brk_a_line));
-  const brk_b = poissonEV(o.brk_b_over, Math.ceil(o.brk_b_line));
+  // Breaks — two-tier fallback chain, same pattern as wp_a/wp_b above:
+  //   (1) Sharp Poisson fit from Underdog over line + price — preferred,
+  //       uses the lean to shift the projection vs. the posted integer
+  //   (2) posted_lines.{a,b}.breaks as projection center — fallback when
+  //       Underdog never posted Breaks odds for the match (common on
+  //       lower-tier tour stops). Raw line, no vig adjustment available.
+  //
+  // Without this fallback, matches with posted_lines but no sharp odds
+  // silently return 0.0 for breaks on both players, which masks the
+  // real projection and makes every break-related gem/fade signal dead.
+  let brk_a, brk_b;
+  if (o.brk_a_line != null && o.brk_a_over != null) {
+    brk_a = poissonEV(o.brk_a_over, Math.ceil(o.brk_a_line));
+  } else if (o.posted_lines?.a?.breaks != null) {
+    brk_a = o.posted_lines.a.breaks;
+  } else {
+    brk_a = 0;
+  }
+  if (o.brk_b_line != null && o.brk_b_over != null) {
+    brk_b = poissonEV(o.brk_b_over, Math.ceil(o.brk_b_line));
+  } else if (o.posted_lines?.b?.breaks != null) {
+    brk_b = o.posted_lines.b.breaks;
+  } else {
+    brk_b = 0;
+  }
 
   // Aces & DFs
   const ace_a = poissonEV(o.ace_a_5plus, 5);
