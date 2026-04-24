@@ -1974,21 +1974,29 @@ export default function App() {
   // Etcheverry", we still match via the last word.
   const rawDkPlayersWithManualOwn = useMemo(() => {
     if (!rawDkPlayers.length || Object.keys(manualOwn).length === 0) return rawDkPlayers;
-    const normalize = s => String(s || '').toLowerCase().replace(/[.,'’`]/g, '').replace(/\s+/g, ' ').trim();
+    // Normalize strips diacritics too — CSV may have "Joao Fonseca" while DK
+    // has "João Fonseca"; without NFD+accent-strip these fail to match.
+    const normalize = s => String(s || '')
+      .toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[.,'’`]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
     const surname = s => {
       const parts = normalize(s).split(' ').filter(Boolean);
       return parts[parts.length - 1] || '';
     };
-    // Build lookup maps from the import
-    const exact = {};
+    // Build lookup maps from the import, keyed by normalized name
+    const exactNorm = {};
     const bySurname = {};
     Object.entries(manualOwn).forEach(([name, pct]) => {
-      exact[name.trim()] = pct;
+      exactNorm[normalize(name)] = pct;
       const sn = surname(name);
       if (sn) bySurname[sn] = bySurname[sn] === undefined ? pct : null;
     });
     const findPct = (playerName) => {
-      if (exact[playerName] != null) return exact[playerName];
+      const n = normalize(playerName);
+      if (exactNorm[n] != null) return exactNorm[n];
       const sn = surname(playerName);
       if (sn && bySurname[sn] != null) return bySurname[sn];
       return null;
@@ -2028,43 +2036,35 @@ export default function App() {
   // projections, which doesn't change when the user privately edits their own
   // projections, so rawDkPlayers is also the semantically correct input.
   const ownershipData = useMemo(() => {
-    if (rawDkPlayersWithManualOwn.length === 0) return { overall: {}, cpt: {}, missingPoolOwn: [] };
-    // v3.25: manual Pool Own replaces the Monte Carlo simOwn. Users paste
-    // per-player pool ownership values into the slate JSON at build time.
-    // If ANY player on the slate has ss_pool_own, we treat the slate as
-    // "manually owned" and:
-    //   - use ss_pool_own directly for players that have it
-    //   - run Monte Carlo ONLY for players missing the field, as a safety
-    //     net so the app still functions
-    //   - surface missing players via a top banner so the user knows to fix
-    //     the slate before going live
-    const anyHasPoolOwn = rawDkPlayersWithManualOwn.some(p => typeof p.ss_pool_own === 'number');
-    if (anyHasPoolOwn) {
-      const missing = rawDkPlayersWithManualOwn.filter(p => typeof p.ss_pool_own !== 'number').map(p => p.name);
-      let simmed = { overall: {}, cpt: {} };
-      if (missing.length > 0) {
-        // Fallback sim for the players without provided values
-        if (sport === 'tennis') simmed = simulateOwnership(rawDkPlayersWithManualOwn);
-        else if (sport === 'mma') simmed = simulateMMAOwnership(rawDkPlayersWithManualOwn);
-        else if (sport === 'nba') simmed = simulateNBAOwnership(rawDkPlayersWithManualOwn, data?.slate_type || 'showdown');
-      }
+    if (rawDkPlayersWithManualOwn.length === 0) return { overall: {}, cpt: {}, missingPoolOwn: [], manualMode: false };
+    // Manual mode is active whenever manualOwn state has entries — even if
+    // ZERO players matched. This makes matching failures LOUD (N/A for
+    // every player + visible banner) instead of silently falling back to
+    // Monte Carlo and hiding the problem.
+    const manualActive = Object.keys(manualOwn).length > 0;
+    if (manualActive) {
+      const missing = rawDkPlayersWithManualOwn
+        .filter(p => typeof p.ss_pool_own !== 'number' && p.salary > 0)
+        .map(p => p.name);
       const overall = {};
       for (const p of rawDkPlayersWithManualOwn) {
-        overall[p.name] = typeof p.ss_pool_own === 'number'
-          ? p.ss_pool_own
-          : (simmed.overall[p.name] || 0);
+        if (typeof p.ss_pool_own === 'number') overall[p.name] = p.ss_pool_own;
+        // Missing players are deliberately NOT added to the map. Consumers
+        // pass through `own[p.name] || 0` for math (so leverage calcs still
+        // work), and a separate missingPoolOwn set for rendering N/A.
       }
-      return { overall, cpt: simmed.cpt || {}, missingPoolOwn: missing };
+      return { overall, cpt: {}, missingPoolOwn: missing, manualMode: true };
     }
-    // No manual values at all — behave like the original simulation.
-    if (sport === 'tennis') return { ...simulateOwnership(rawDkPlayersWithManualOwn), missingPoolOwn: [] };
-    if (sport === 'mma')    return { ...simulateMMAOwnership(rawDkPlayersWithManualOwn), missingPoolOwn: [] };
-    if (sport === 'nba')    return { ...simulateNBAOwnership(rawDkPlayersWithManualOwn, data?.slate_type || 'showdown'), missingPoolOwn: [] };
-    return { overall: {}, cpt: {}, missingPoolOwn: [] };
-  }, [rawDkPlayersWithManualOwn, sport, data]);
+    // No manual import yet — classic Monte Carlo behavior
+    if (sport === 'tennis') return { ...simulateOwnership(rawDkPlayersWithManualOwn), missingPoolOwn: [], manualMode: false };
+    if (sport === 'mma')    return { ...simulateMMAOwnership(rawDkPlayersWithManualOwn), missingPoolOwn: [], manualMode: false };
+    if (sport === 'nba')    return { ...simulateNBAOwnership(rawDkPlayersWithManualOwn, data?.slate_type || 'showdown'), missingPoolOwn: [], manualMode: false };
+    return { overall: {}, cpt: {}, missingPoolOwn: [], manualMode: false };
+  }, [rawDkPlayersWithManualOwn, sport, data, manualOwn]);
   const ownership = ownershipData.overall;
   const cptOwnership = ownershipData.cpt;
   const missingPoolOwn = ownershipData.missingPoolOwn || [];
+  const manualMode = ownershipData.manualMode || false;
 
   if (error) {
     const expectedUrl = sport === 'mma' ? './slate-mma.json'
@@ -2472,24 +2472,24 @@ export default function App() {
       </div>}
       {!buildError && <ErrorBoundary>
       {sport === 'tennis' && (<>
-        {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
+        {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} missingPoolOwn={missingPoolOwn} />}
         {tab === 'pplines' && <PrizePicksTab slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} players={dkPlayers} />}
         {tab === 'build' && <BuilderTab players={dkPlayers} ownership={ownership} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} mc={data.matches?.length || 0} onGoToProjections={() => setTab('dk')} />}
-        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
+        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} missingPoolOwn={missingPoolOwn} />}
         {tab === 'record' && <TrackRecordTab sport={sport} />}
       </>)}
       {sport === 'mma' && (<>
         {tab === 'dk' && <MMADKTab fighters={dkPlayers} fc={data.fights?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />}
         {tab === 'pp' && <MMAPPTab rows={ppRows} />}
         {tab === 'build' && <MMABuilderTab fighters={dkPlayers} ownership={ownership} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onGoToProjections={() => setTab('dk')} />}
-        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
+        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} missingPoolOwn={missingPoolOwn} />}
         {tab === 'record' && <TrackRecordTab sport={sport} />}
       </>)}
       {sport === 'nba' && (<>
         {tab === 'dk' && <NBADKTab players={dkPlayers} gameInfo={data.game} own={ownership} cptOwn={cptOwnership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} cptLockedPlayers={cptLockedPlayers} flexLockedPlayers={flexLockedPlayers} cptExcludedPlayers={cptExcludedPlayers} flexExcludedPlayers={flexExcludedPlayers} onToggleCptLock={onToggleCptLock} onToggleCptExclude={onToggleCptExclude} onToggleFlexLock={onToggleFlexLock} onToggleFlexExclude={onToggleFlexExclude} />}
         {tab === 'pp' && <NBAPPTab rows={ppRows} />}
         {tab === 'build' && <NBABuilderTab players={dkPlayers} ownership={ownership} cptOwnership={cptOwnership} slateType={data.slate_type || 'showdown'} gameInfo={data.game} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} cptLockedPlayers={cptLockedPlayers} flexLockedPlayers={flexLockedPlayers} cptExcludedPlayers={cptExcludedPlayers} flexExcludedPlayers={flexExcludedPlayers} onGoToProjections={() => setTab('dk')} />}
-        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} />}
+        {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} missingPoolOwn={missingPoolOwn} />}
         {tab === 'record' && <TrackRecordTab sport={sport} />}
       </>)}
       </ErrorBoundary>}
@@ -2687,8 +2687,11 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
 // ═══════════════════════════════════════════════════════════════════════
 // TENNIS COMPONENTS — UNCHANGED from v5 except BuilderTab gets contrarian
 // ═══════════════════════════════════════════════════════════════════════
-function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], excludedPlayers = [], onToggleLock, onToggleExclude, onClearLocks, onClearExcludes, slateId }) {
+function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], excludedPlayers = [], onToggleLock, onToggleExclude, onClearLocks, onClearExcludes, slateId, missingPoolOwn = [] }) {
   const [q, setQ] = useState('');
+  // Set of player names without imported sim own — render as N/A instead of
+  // a percentage. Cheap Set for O(1) lookup inside the hot render loop.
+  const missingSet = useMemo(() => new Set(missingPoolOwn), [missingPoolOwn]);
   const pw = useMemo(() => players.filter(p => p.salary > 0).map(p => ({ ...p, simOwn: own[p.name] || 0 })), [players, own]);
   const pwFiltered = useMemo(() => pw.filter(p => matchesSearch(p, q)), [pw, q]);
   const { sorted, sortKey, sortDir, toggleSort } = useSort(pwFiltered, 'val', 'desc');
@@ -3011,7 +3014,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
         <td><span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>{badges.map((bd, j) => <Tip key={j} icon={bd.icon} label={bd.label} size={14} />)}</span></td>
         <td className="name">{p.name}</td><td className="muted">{p.opponent}</td>
         <td className="num">{fmtSal(p.salary)}</td>
-        <td className="num" style={{ color: p.simOwn > 30 ? 'var(--amber)' : 'var(--text-muted)' }}>{fmt(p.simOwn, 1)}%</td>
+        <td className="num" style={{ color: p.simOwn > 30 ? 'var(--amber)' : 'var(--text-muted)' }}>{missingSet.has(p.name) ? <span style={{ fontStyle: 'italic', color: 'var(--text-dim)' }}>N/A</span> : fmt(p.simOwn, 1) + '%'}</td>
         <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} delta={getWpBaseline(slateId, p.name, p.oddsProb)} /></td>
         <td className="num">
           <span className={iv ? 'cell-top3' : 'cell-proj'}>
@@ -4871,12 +4874,13 @@ function SlateWaiting({ message, sub }) {
 // slateId so it survives refreshes. Cross-device + historical browsing
 // would require a Supabase table (contest_ownership_archives) — queued
 // as a follow-up, not in tonight's scope.
-function TrackerTab({ players: rp, ownership, slateId }) {
+function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
   const [actualOwn, setActualOwn] = useState({});
   const [uploadedAt, setUploadedAt] = useState(null);
   const [error, setError] = useState('');
   const [sortKey, setSortKey] = useState('deltaOwn');
   const [sortDir, setSortDir] = useState('desc');
+  const missingSet = useMemo(() => new Set(missingPoolOwn), [missingPoolOwn]);
 
   // Load persisted data for this slate on mount / slate change
   useEffect(() => {
@@ -5135,7 +5139,7 @@ function TrackerTab({ players: rp, ownership, slateId }) {
                 <td className="name">{p.name}</td>
                 <td className="muted">{p.opponent}</td>
                 <td className="num">{fmtSal(p.salary)}</td>
-                <td className="num muted">{p.simOwn.toFixed(1)}%</td>
+                <td className="num muted">{missingSet.has(p.name) ? <span style={{ fontStyle: 'italic' }}>N/A</span> : p.simOwn.toFixed(1) + '%'}</td>
                 <td className="num" style={{ fontWeight: 600 }}>{p.actualOwn.toFixed(1)}%</td>
                 <td className="num"><DeltaCell delta={p.deltaOwn} /></td>
                 <td className="num" style={{ textAlign: 'center' }}><OddsCell prob={p.oddsProb} source={p.oddsSource} delta={getWpBaseline(slateId, p.name, p.oddsProb)} /></td>
