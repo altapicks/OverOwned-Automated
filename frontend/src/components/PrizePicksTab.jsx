@@ -260,7 +260,7 @@ export function PrizePicksTab({ slateId, players = [] }) {
   if (loading) return <div className="empty"><p>Loading PrizePicks lines…</p></div>;
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 320px', gap: 16 }}>
+    <div className="pp-grid">
       <div>
         {/* Header: icon card on the left, title + subtitle in the middle,
             admin buttons on the right. Matches the mockup — larger card-style
@@ -347,15 +347,23 @@ export function PrizePicksTab({ slateId, players = [] }) {
                 // semantic as Hidden Gems on the DK tab. Flash state (yellow
                 // highlight after admin edit) takes precedence so the user
                 // sees their edit confirmation.
+                //
+                // Apply the tint at cell-level rather than row-level so the
+                // .name column (which has font-weight: 600) renders the
+                // identical green to the other cells. Row-level tint was
+                // creating a subtle color mismatch because bold text on a
+                // tinted background perceptually shifts hue.
                 const isFade = topFadeIds.has(line.id);
-                const rowStyle = flashId === line.id
-                  ? { background: 'rgba(245,197,24,0.15)', transition: 'background 0.3s' }
+                const isFlash = flashId === line.id;
+                const cellBg = isFlash
+                  ? 'rgba(245,197,24,0.15)'
                   : isFade
-                    ? { background: 'rgba(74,222,128,0.08)' }
-                    : {};
+                    ? 'rgba(74,222,128,0.10)'
+                    : 'transparent';
+                const cellStyle = { background: cellBg, transition: 'background 0.3s' };
                 return (
-                <tr key={line.id} style={rowStyle}>
-                  <td style={{ textAlign: 'center', padding: '6px 4px' }}>
+                <tr key={line.id}>
+                  <td style={{ ...cellStyle, textAlign: 'center', padding: '6px 4px' }}>
                     {isFade && (
                       <span title="Top PP Fade — model projects significantly under the posted line">
                         <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
@@ -369,20 +377,20 @@ export function PrizePicksTab({ slateId, players = [] }) {
                       </span>
                     )}
                   </td>
-                  <td className="name">{line.raw_player_name}</td>
-                  <td className="muted">{line.stat_type}</td>
-                  <td className="num">
+                  <td className="name" style={cellStyle}>{line.raw_player_name}</td>
+                  <td className="muted" style={cellStyle}>{line.stat_type}</td>
+                  <td className="num" style={cellStyle}>
                     {isAdmin ? (
                       <InlineLineEdit value={line.current_line} onSave={(v) => onInlineUpdate(line, v)} />
                     ) : (
                       <span className="cell-proj">{line.current_line}</span>
                     )}
                   </td>
-                  <td className="num muted">{line.projected != null ? (Math.round(line.projected * 100) / 100).toFixed(2) : '—'}</td>
-                  <td className="num"><EdgeCell edge={line.edge} direction={line.direction} /></td>
-                  <td className="muted" style={{ fontSize: 11 }}>{timeAgo(line.last_updated_at)}</td>
+                  <td className="num muted" style={cellStyle}>{line.projected != null ? (Math.round(line.projected * 100) / 100).toFixed(2) : '—'}</td>
+                  <td className="num" style={cellStyle}><EdgeCell edge={line.edge} direction={line.direction} /></td>
+                  <td className="muted" style={{ ...cellStyle, fontSize: 11 }}>{timeAgo(line.last_updated_at)}</td>
                   {isAdmin && (
-                    <td><button onClick={() => onDelete(line.id)} style={{ background: 'none', border: 'none', color: 'var(--text-dim)', cursor: 'pointer', fontSize: 18 }}>×</button></td>
+                    <td style={cellStyle}><button onClick={() => onDelete(line.id)} style={{ background: 'none', border: 'none', color: 'var(--text-dim)', cursor: 'pointer', fontSize: 18 }}>×</button></td>
                   )}
                 </tr>
                 );
