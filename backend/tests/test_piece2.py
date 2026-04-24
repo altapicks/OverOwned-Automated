@@ -125,55 +125,69 @@ def test_kalshi_path_strips_query():
     assert len(sig1) == len(sig2)
 
 
-def test_parse_player_names_from_title():
-    """Kalshi subtitles for tennis matches follow 'LastA vs LastB' format."""
-    from app.services.kalshi import _parse_player_names_from_title
-    # Canonical Kalshi format: last names, "vs" separator
-    assert _parse_player_names_from_title("Vacherot vs Korda") == ("Vacherot", "Korda")
-    assert _parse_player_names_from_title("Sinner vs Alcaraz") == ("Sinner", "Alcaraz")
-    # "vs." with period variant
-    assert _parse_player_names_from_title("Sinner vs. Alcaraz") == ("Sinner", "Alcaraz")
-    # Uppercase variants
-    assert _parse_player_names_from_title("Sinner VS Alcaraz") == ("Sinner", "Alcaraz")
-    # Multi-word surnames preserved verbatim (last-name key extraction handles them later)
-    assert _parse_player_names_from_title("De Minaur vs Draper") == ("De Minaur", "Draper")
-    # Unparseable titles return None
-    assert _parse_player_names_from_title("ATP Tennis Match") is None
-    assert _parse_player_names_from_title("") is None
-    assert _parse_player_names_from_title("Sinner wins title") is None
+def test_dollar_to_prob_midpoint():
+    """Kalshi yes_bid_dollars and yes_ask_dollars should midpoint to prob."""
+    from app.services.kalshi import _dollar_to_prob
+    assert _dollar_to_prob("0.60", "0.62") == 0.61
+    assert _dollar_to_prob("0.5600", "0.5600") == 0.56
 
 
-def test_last_name_key_basic():
-    """Extract normalized last-name matching key."""
-    from app.services.kalshi import _last_name_key
-    assert _last_name_key("Jannik Sinner") == "sinner"
-    assert _last_name_key("Sinner") == "sinner"
-    assert _last_name_key("Carlos Alcaraz") == "alcaraz"
+def test_dollar_to_prob_single_side():
+    """If only bid or only ask is present, return that value."""
+    from app.services.kalshi import _dollar_to_prob
+    assert _dollar_to_prob("0.42", None) == 0.42
+    assert _dollar_to_prob(None, "0.58") == 0.58
 
 
-def test_last_name_key_strips_accents():
-    from app.services.kalshi import _last_name_key
-    assert _last_name_key("Müller") == "muller"
-    assert _last_name_key("Novák Djoković") == "djokovic"
+def test_dollar_to_prob_invalid():
+    """None/empty/out-of-range values return None."""
+    from app.services.kalshi import _dollar_to_prob
+    assert _dollar_to_prob(None, None) is None
+    assert _dollar_to_prob("not_a_number", None) is None
+    assert _dollar_to_prob("1.5", None) is None  # outside valid 0-1 range
+    assert _dollar_to_prob("-0.1", None) is None
 
 
-def test_last_name_key_drops_particles():
-    """Common surname particles (de, van, der) are dropped to match
-    the conventional last name that Kalshi uses."""
-    from app.services.kalshi import _last_name_key
-    assert _last_name_key("Alex de Minaur") == "minaur"
-    assert _last_name_key("Botic van de Zandschulp") == "zandschulp"
-    assert _last_name_key("Thiago Seyboth Wild") == "wild"
-
-
-def test_last_name_key_hyphenated():
-    """Hyphenated last names stay as one token."""
-    from app.services.kalshi import _last_name_key
-    assert _last_name_key("Chris O'Connell") == "o'connell"
-    assert _last_name_key("Pavel Kotov-Stepan") == "kotov-stepan"
-
-
-def test_last_name_key_empty():
-    from app.services.kalshi import _last_name_key
-    assert _last_name_key("") == ""
-    assert _last_name_key("   ") == ""
+def test_event_grouping_structure():
+    """Verify the event-ticker grouping pattern works on a realistic Kalshi
+    response shape. This is the structure our fetch_tick() will encounter."""
+    markets = [
+        {
+            "ticker": "KXWTAMATCH-26APR24PUTKOS-PUT",
+            "event_ticker": "KXWTAMATCH-26APR24PUTKOS",
+            "yes_sub_title": "Yulia Putintseva",
+            "yes_bid_dollars": "0.4200",
+            "yes_ask_dollars": "0.4400",
+        },
+        {
+            "ticker": "KXWTAMATCH-26APR24PUTKOS-KOS",
+            "event_ticker": "KXWTAMATCH-26APR24PUTKOS",
+            "yes_sub_title": "Marta Kostyuk",
+            "yes_bid_dollars": "0.5600",
+            "yes_ask_dollars": "0.5800",
+        },
+        {
+            "ticker": "KXWTAMATCH-26APR24TAUSIN-TAU",
+            "event_ticker": "KXWTAMATCH-26APR24TAUSIN",
+            "yes_sub_title": "Clara Tauson",
+            "yes_bid_dollars": "0.7000",
+            "yes_ask_dollars": "0.7200",
+        },
+        {
+            "ticker": "KXWTAMATCH-26APR24TAUSIN-SIN",
+            "event_ticker": "KXWTAMATCH-26APR24TAUSIN",
+            "yes_sub_title": "Katerina Siniakova",
+            "yes_bid_dollars": "0.2800",
+            "yes_ask_dollars": "0.3000",
+        },
+    ]
+    # Group like fetch_tick does
+    events = {}
+    for m in markets:
+        events.setdefault(m["event_ticker"], []).append(m)
+    assert len(events) == 2
+    # Each event has two sides
+    for event_markets in events.values():
+        assert len(event_markets) == 2
+        names = [m["yes_sub_title"] for m in event_markets]
+        assert all(names)  # both named
