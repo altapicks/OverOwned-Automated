@@ -263,35 +263,25 @@ export function PrizePicksTab({ slateId, players = [] }) {
     <div className="pp-grid">
       <div>
         {/* Header: icon card on the left, title + subtitle in the middle,
-            admin buttons on the right. Matches the mockup — larger card-style
-            bullseye treatment, subtitle explains what "edge" means so the
-            hint strip below can focus on actionable guidance. */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 14 }}>
-          <div style={{
-            width: 56, height: 56, borderRadius: 10,
-            background: 'rgba(245,197,24,0.08)',
-            border: '1px solid rgba(245,197,24,0.25)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            flexShrink: 0,
-          }}>
-            <svg viewBox="0 0 24 24" width="28" height="28" fill="none"
-                 stroke="#F5C518" strokeWidth="1.75"
-                 strokeLinecap="round" strokeLinejoin="round">
+            admin buttons on the right. */}
+        <div className="section-hero">
+          <div className="section-hero-icon-wrap">
+            <svg className="section-hero-icon" viewBox="0 0 24 24" fill="none" stroke="#F5C518">
               <circle cx="12" cy="12" r="9"/>
               <circle cx="12" cy="12" r="5"/>
               <circle cx="12" cy="12" r="1.5" fill="#F5C518" stroke="none"/>
             </svg>
           </div>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <h2 className="section-head" style={{ margin: 0, lineHeight: 1.1 }}>PrizePicks Projections</h2>
-            <p className="section-sub" style={{ margin: '4px 0 0 0' }}>
+          <div className="section-hero-text">
+            <h2 className="section-hero-title">PrizePicks Projections</h2>
+            <div className="section-hero-sub">
               All plays sorted by edge · Edge = Projected − PP Line
-            </p>
+            </div>
           </div>
           {isAdmin && (
             <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-              <button className="btn btn-outline" style={{ width: 'auto' }} onClick={() => setShowAdd(true)}>Add Line</button>
-              <button className="btn btn-primary" style={{ width: 'auto' }} onClick={() => setShowBulk(true)}>Paste CSV</button>
+              <button className="btn btn-outline" style={{ width: 'auto', padding: '7px 14px', fontSize: 13 }} onClick={() => setShowAdd(true)}>Add Line</button>
+              <button className="btn btn-primary" style={{ width: 'auto', padding: '7px 14px', fontSize: 13 }} onClick={() => setShowBulk(true)}>Paste CSV</button>
             </div>
           )}
         </div>
@@ -340,7 +330,13 @@ export function PrizePicksTab({ slateId, players = [] }) {
             </thead>
             <tbody>
               {sortedLines.length === 0 && (
-                <tr><td colSpan={isAdmin ? 8 : 7} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>No lines yet{isAdmin ? '. Click "Add Line" or "Paste CSV" to get started.' : '.'}</td></tr>
+                <tr><td colSpan={isAdmin ? 8 : 7} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>
+                  No PrizePicks lines for this slate yet.
+                  {isAdmin && <> Click "Add Line" or "Paste CSV" to get started.</>}
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8, fontFamily: 'monospace' }}>
+                    slate_id: {slateId || '(none)'}
+                  </div>
+                </td></tr>
               )}
               {sortedLines.map(line => {
                 // Top 3 PP fades get the gem+green treatment — same visual
