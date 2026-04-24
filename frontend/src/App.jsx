@@ -423,27 +423,40 @@ function americanToImpliedProb(ml) {
 }
 
 // Render the Kalshi column cell.
-//   Kalshi has a market  → show NN% centered, colored by implied probability:
-//                          gold for heavy favorites, amber for clear favorites,
-//                          neutral near 50/50, cool blue tones for underdogs.
-//                          The color gradient lets users scan favorites at a glance.
-//   Kalshi has no market → show "Not Live" in muted styling
-// Column header carries the Kalshi brand attribution, so individual cells
-// don't need per-row badges.
-function oddsColorForProb(p) {
-  // Tiered color gradient tuned for OverOwned's gold-and-navy palette.
-  //   ≥85%  → bright gold (heavy favorite, strong signal)
-  //   ≥65%  → warm amber (clear favorite)
-  //   ≥50%  → neutral text (slight favorite)
-  //   ≥35%  → cool steel blue (slight dog)
-  //   ≥15%  → muted blue-gray (clear dog)
-  //   <15%  → very muted (heavy dog)
-  if (p >= 0.85) return { color: '#F5C518', weight: 700 };          // OO gold
-  if (p >= 0.65) return { color: '#F5A623', weight: 650 };          // amber
-  if (p >= 0.50) return { color: 'var(--text, #E5E7EB)', weight: 600 };
-  if (p >= 0.35) return { color: '#7B9ECC', weight: 550 };          // steel blue
-  if (p >= 0.15) return { color: '#566B88', weight: 500 };          // muted blue
-  return { color: 'var(--text-dim, #6B7280)', weight: 500 };
+//   Kalshi has a market  → NN% centered, colored along a smooth green→red
+//                          gradient anchored at 50/50 (muted). Higher the
+//                          win probability, deeper the green. Lower, deeper
+//                          the red. Matches the --green/--red palette used
+//                          by Biggest Trap row highlighting.
+//   Kalshi has no market → "Not Live" centered, italic muted (12px so it
+//                          stays legible on mobile).
+function lerp(a, b, t) { return a + (b - a) * t; }
+function lerpColor(c1, c2, t) {
+  return {
+    r: Math.round(lerp(c1.r, c2.r, t)),
+    g: Math.round(lerp(c1.g, c2.g, t)),
+    b: Math.round(lerp(c1.b, c2.b, t)),
+  };
+}
+
+// Palette matched to --green (#4ADE80) and --red (#EF4444) from styles.css,
+// with --text-muted (#8B9ABA) as the neutral 50% anchor.
+const ODDS_MUTED = { r: 139, g: 154, b: 186 };
+const ODDS_GREEN = { r: 74, g: 222, b: 128 };
+const ODDS_RED   = { r: 239, g: 68, b: 68 };
+
+function oddsStyleForProb(p) {
+  const dist = Math.abs(p - 0.5);       // 0 at 50%, 0.5 at extremes
+  const t = Math.min(1, dist * 2);      // 0 at 50%, 1 at 100% or 0%
+  const target = p >= 0.5 ? ODDS_GREEN : ODDS_RED;
+  const c = lerpColor(ODDS_MUTED, target, t);
+  // Weight scales subtly: 550 near pickem, 700 at extremes. Gives a slight
+  // visual "weight cascade" when the column is sorted.
+  const weight = Math.round(550 + t * 150);
+  return {
+    color: `rgb(${c.r}, ${c.g}, ${c.b})`,
+    fontWeight: weight,
+  };
 }
 
 function OddsCell({ prob, source }) {
@@ -454,10 +467,10 @@ function OddsCell({ prob, source }) {
           display: 'block',
           textAlign: 'center',
           color: 'var(--text-dim)',
-          fontSize: 11,
+          fontSize: 12,
           fontWeight: 500,
           fontStyle: 'italic',
-          opacity: 0.6,
+          opacity: 0.65,
           letterSpacing: '0.02em',
         }}
         title="No active Kalshi market for this match"
@@ -467,15 +480,14 @@ function OddsCell({ prob, source }) {
     );
   }
   const pct = Math.round(prob * 100);
-  const { color, weight } = oddsColorForProb(prob);
+  const style = oddsStyleForProb(prob);
   return (
     <span
       style={{
         display: 'block',
         textAlign: 'center',
-        color,
-        fontWeight: weight,
         fontVariantNumeric: 'tabular-nums',
+        ...style,
       }}
     >
       {pct}%
@@ -873,10 +885,11 @@ function useSort(data, dk = 'val', dd = 'desc') {
   const toggle = useCallback(k => { if (k === sk) setSd(d => d === 'asc' ? 'desc' : 'asc'); else { setSk(k); setSd('desc'); } }, [sk]);
   return { sorted, sortKey: sk, sortDir: sd, toggleSort: toggle };
 }
-function SH({ label, colKey, sortKey, sortDir, onSort, num, tip }) {
+function SH({ label, colKey, sortKey, sortDir, onSort, num, ctr, tip }) {
   const a = colKey === sortKey;
   const cls = [a ? 'sorted' : '', num ? 'num' : ''].filter(Boolean).join(' ');
-  return <th className={cls} onClick={() => onSort(colKey)} title={tip}>{label}{a && <span className="sort-arrow">{sortDir === 'asc' ? '▲' : '▼'}</span>}</th>;
+  const thStyle = ctr ? { textAlign: 'center' } : undefined;
+  return <th className={cls} style={thStyle} onClick={() => onSort(colKey)} title={tip}>{label}{a && <span className="sort-arrow">{sortDir === 'asc' ? '▲' : '▼'}</span>}</th>;
 }
 
 // Small inline 🔒 / 🚫 button pair rendered in its own column on DK tabs.
@@ -2549,7 +2562,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
     <SearchBar value={q} onChange={setQ} placeholder="Search players, opponents" total={pw.length} filtered={pwFiltered.length} />
     <LockBar lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />
     <div className="table-wrap"><table><thead><tr>
-      <th>#</th><th></th><S label="Player" colKey="name" /><th>Opp</th><S label="Sal" colKey="salary" num /><S label="Sim Own" colKey="simOwn" num tip="Projected field ownership (imported from Pool Own, or simulated if unavailable)" /><S label={<span style={{ display: 'block', textAlign: 'center', fontWeight: 600, letterSpacing: '0.02em' }}>Kalshi</span>} colKey="oddsProb" num tip="Kalshi prediction market implied probability. Color-coded by win probability. Matches without an active Kalshi market show 'Not Live'." /><S label="Proj" colKey="proj" num /><S label="Val" colKey="val" num /><S label="P(2-0)" colKey="pStraight" num /><S label="GW" colKey="gw" num /><S label="GL" colKey="gl" num /><S label="SW" colKey="sw" num /><S label="Aces" colKey="aces" num /><S label="DFs" colKey="dfs" num /><S label="Breaks" colKey="breaks" num /><th>Time</th><th></th>
+      <th>#</th><th></th><S label="Player" colKey="name" /><th>Opp</th><S label="Sal" colKey="salary" num /><S label="Sim Own" colKey="simOwn" num tip="Projected field ownership (imported from Pool Own, or simulated if unavailable)" /><S label="Kalshi" colKey="oddsProb" ctr tip="Kalshi prediction market implied probability. Color-coded by win probability — green above 50%, red below 50%, more saturated at the extremes. Matches without an active Kalshi market show 'Not Live'." /><S label="Proj" colKey="proj" num /><S label="Val" colKey="val" num /><S label="P(2-0)" colKey="pStraight" num /><S label="GW" colKey="gw" num /><S label="GL" colKey="gl" num /><S label="SW" colKey="sw" num /><S label="Aces" colKey="aces" num /><S label="DFs" colKey="dfs" num /><S label="Breaks" colKey="breaks" num /><th>Time</th><th></th>
     </tr></thead>
     <tbody>{sorted.map((p, i) => {
       const iv = t3v.includes(p.name), is = t3s.includes(p.name);
