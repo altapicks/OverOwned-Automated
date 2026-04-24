@@ -94,6 +94,10 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
                 # so the frontend reads match.opening_odds.kalshi_prob_a without
                 # drilling. Mirrors how live odds are laid out.
                 opening_odds=_build_opening_odds_model(m.get("opening_odds")),
+                # closing_odds uses the same nested shape as opening_odds,
+                # captured at slate lock time. Frontend uses it everywhere
+                # except the Live Leverage Tracker.
+                closing_odds=_build_opening_odds_model(m.get("closing_odds")),
                 adj_a=0,
                 adj_b=0,
             )
