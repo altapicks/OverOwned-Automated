@@ -105,6 +105,10 @@ class FrontendPPLine(BaseModel):
     player: str
     stat: str
     line: float
+    mult: Optional[str] = ""
+    # Source platform: 'prizepicks' for Fantasy Score lines from admin UI,
+    # 'underdog' for stat-prop lines promoted from matches.odds.posted_lines.
+    source: Optional[str] = "prizepicks"
 
 
 class FrontendSlate(BaseModel):
