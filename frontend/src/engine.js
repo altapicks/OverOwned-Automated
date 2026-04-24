@@ -157,19 +157,20 @@ function poissonTail(lambda, k) {
   return clamp(1 - cdf, 0.01, 0.95);
 }
 
-// True if a match row has the full set of betting-line odds fields needed
-// for the sharp (non-baseline) projection path. Checks presence of the
-// core set/game/prop lines that would come from a sportsbook feed like
-// the manual bet365 pulls we had on archive slates.
+// True if a match row has enough stat-prop fields to run sharp mode.
+// Sharp mode needs: a wp source (Kalshi OR ml), games won lines, and ace props.
+// Set betting 4-way (set_a_20/21/b_20/21) is preferred when present, but we
+// can derive it from p3set + wp when only p3set is available (the case when
+// sharp odds come from Underdog-style feeds that give us Sets Played, not 4-way).
 function hasRichOdds(o) {
   if (!o || typeof o !== 'object') return false;
-  // Need at least ml + set betting + games + aces to hit the sharp path
-  return (
-    o.ml_a != null && o.ml_b != null &&
-    o.set_a_20 != null && o.set_a_21 != null &&
-    o.set_b_20 != null && o.set_b_21 != null &&
-    o.gw_a_line != null && o.ace_a_5plus != null
-  );
+  const hasWpSource = (o.kalshi_prob_a != null && o.kalshi_prob_b != null) ||
+                      (o.ml_a != null && o.ml_b != null);
+  const hasSetMarket = (o.set_a_20 != null && o.set_a_21 != null &&
+                        o.set_b_20 != null && o.set_b_21 != null) ||
+                       o.p3set != null;
+  return hasWpSource && hasSetMarket &&
+         o.gw_a_line != null && o.ace_a_5plus != null;
 }
 
 // ============================================================
@@ -191,10 +192,7 @@ export function processMatch(match) {
     wp_b = 0.5;
   }
 
-  // BASELINE MODE: if we don't have the rich betting-line set (set betting,
-  // game totals, ace/DF props), use the Kalshi-anchored baseline model.
-  // This is the default path for the live product until Alta uploads per-day
-  // accurate stat values or a sportsbook prop feed lands.
+  // BASELINE MODE: no rich stat-prop data at all.
   if (!hasRichOdds(o)) {
     const base = baselineStatsFromWp(wp_a, wp_b);
     return {
@@ -203,13 +201,26 @@ export function processMatch(match) {
     };
   }
 
-  // SHARP MODE: full betting-line odds available. Use the original engine
-  // math calibrated on bet365-style lines (archive slates + future piece #3).
+  // SHARP MODE: stat-prop data available. Use sportsbook math.
 
-  // Set betting (normalize 4-way)
-  const rawSet = [o.set_a_20, o.set_a_21, o.set_b_20, o.set_b_21].map(americanToProb);
-  const setTotal = rawSet.reduce((a, b) => a + b, 0);
-  const [p_a20, p_a21, p_b20, p_b21] = rawSet.map(p => p / setTotal);
+  // Set betting (4-way). Two paths:
+  //   (a) Full 4-way market present (bet365-style): use directly, normalize.
+  //   (b) Only p3set available (Underdog-style): derive from wp + p3set.
+  //       P(A 2-0) = wp_a × (1 - p3set),  P(A 2-1) = wp_a × p3set
+  //       P(B 2-0) = wp_b × (1 - p3set),  P(B 2-1) = wp_b × p3set
+  //       Sum = 1. Exact when outcome is independent of set count.
+  let p_a20, p_a21, p_b20, p_b21;
+  if (o.set_a_20 != null && o.set_a_21 != null && o.set_b_20 != null && o.set_b_21 != null) {
+    const rawSet = [o.set_a_20, o.set_a_21, o.set_b_20, o.set_b_21].map(americanToProb);
+    const setTotal = rawSet.reduce((a, b) => a + b, 0);
+    [p_a20, p_a21, p_b20, p_b21] = rawSet.map(p => p / setTotal);
+  } else {
+    const p3 = o.p3set;
+    p_a20 = wp_a * (1 - p3);
+    p_a21 = wp_a * p3;
+    p_b20 = wp_b * (1 - p3);
+    p_b21 = wp_b * p3;
+  }
 
   // Games won (adjust by over lean)
   const gw_a = adjustLine(o.gw_a_line, o.gw_a_over);
