@@ -35,8 +35,9 @@ class DKDraftable(BaseModel):
 # React app can consume /api/slates/today without structural changes.
 # ──────────────────────────────────────────────────────────────────────
 class FrontendMatchOdds(BaseModel):
-    """Placeholder odds block — populated by downstream services (Odds API,
-    Kalshi, bet365). Shape matches existing slate.json to avoid UI changes."""
+    """Odds block — populated by downstream services (Odds API, Kalshi, bet365).
+    Shape matches existing slate.json to avoid UI changes, plus Kalshi fields
+    added in piece #2 for the gold [K] badge in the Odds column."""
     ml_a: Optional[int] = None
     ml_b: Optional[int] = None
     set_a_20: Optional[int] = None
@@ -59,6 +60,10 @@ class FrontendMatchOdds(BaseModel):
     df_a_3plus: Optional[int] = None
     df_b_2plus: Optional[int] = None
     df_b_3plus: Optional[int] = None
+    # Kalshi implied probabilities (0.0-1.0). Promoted from matches.odds.kalshi_prob_a/b
+    # by the ingestion layer. Frontend reads these to render the gold [K] Odds badge.
+    kalshi_prob_a: Optional[float] = None
+    kalshi_prob_b: Optional[float] = None
 
 
 class FrontendMatch(BaseModel):
