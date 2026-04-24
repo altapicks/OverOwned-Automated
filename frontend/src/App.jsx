@@ -2489,6 +2489,46 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
             No live slate · showing most recent
           </span>;
         })()}
+        {/* v5.8: Passive Live indicator. Purely informative — tells the user
+            their data is auto-refreshing every 90s so they understand why
+            Kalshi odds, sim own, and PP lines shift during a build session.
+            Not a toggle; no click behavior. Shows "Archived" on historical
+            slates. */}
+        {(() => {
+          const isLive = slateDate === 'live';
+          return (
+            <span
+              className="oo-live-pill"
+              title={isLive
+                ? 'Data refreshes every 90 seconds. Expect Kalshi odds, sim own, and PP lines to shift as the market moves and closer to match time.'
+                : 'Historical slate — no live updates.'}
+              style={{
+                marginLeft: 8, padding: '2px 10px', borderRadius: 999,
+                background: isLive ? 'rgba(74, 222, 128, 0.10)' : 'rgba(139, 154, 186, 0.08)',
+                border: isLive ? '1px solid rgba(74, 222, 128, 0.35)' : '1px solid rgba(139, 154, 186, 0.25)',
+                color: isLive ? '#4ADE80' : 'var(--text-dim)',
+                fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5,
+                textTransform: 'uppercase', whiteSpace: 'nowrap',
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                cursor: 'help',
+              }}
+            >
+              <span style={{
+                width: 7, height: 7, borderRadius: '50%',
+                background: isLive ? '#4ADE80' : '#8B9ABA',
+                animation: isLive ? 'oo-live-pulse 2s ease-in-out infinite' : 'none',
+                boxShadow: isLive ? '0 0 6px rgba(74, 222, 128, 0.6)' : 'none',
+              }} />
+              {isLive ? 'Live' : 'Archived'}
+            </span>
+          );
+        })()}
+        <style>{`
+          @keyframes oo-live-pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50%      { opacity: 0.55; transform: scale(0.85); }
+          }
+        `}</style>
         {data.last_updated && <span className="topbar-date-updated"> · <span style={{color:'var(--green)',fontSize:12}}>Updated {data.last_updated}</span></span>}
       </div>}
       <a href="https://x.com/OverOwnedDFS" target="_blank" rel="noopener noreferrer" className="twitter-btn" title="@OverOwnedDFS">
@@ -3156,7 +3196,7 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
   };
   const exportProjections = () => { let c = 'Player,Salary,Win%,Proj,Value,GW,GL,SW,Aces,DFs,Breaks,P(2-0),Opp\n'; sp.forEach(p => { c += `${p.name},${p.salary},${(p.wp * 100).toFixed(0)}%,${p.proj},${p.val},${fmt(p.gw)},${fmt(p.gl)},${fmt(p.sw)},${fmt(p.aces)},${fmt(p.dfs)},${fmt(p.breaks)},${fmtPct(p.pStraight)},${p.opponent}\n`; }); dl(c, 'projections.csv'); };
   const overrideCount = useMemo(() => rp.filter(p => p._overridden).length, [rp]);
-  const canBuild = overrideCount >= 2;
+  const canBuild = true;  // v5.8: compliance gate retired; 1% variance floor handles CSV differentiation
   useBuilderShortcuts({ run, canBuild, isBuilding }); // v3.24.14: B/R to build/rebuild
   // v3.24.14: empty state for malformed/empty slates. sp is the list of
   // players with salary>0 — if it's empty the builder panels render as
@@ -3195,31 +3235,9 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
         <div className="section-hero-sub">Set exposure %, build optimized lineups, export to DK</div>
       </div>
     </div>
-    {!canBuild && (
-      <div style={{ padding: '14px 18px', marginBottom: 16, background: 'rgba(245,197,24,0.08)', border: '1px solid rgba(245,197,24,0.35)', borderRadius: 10 }}>
-        <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--primary)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}><Icon name="warning" size={15} color="#F5C518"/> DraftKings Compliance Warning</div>
-        <div style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-          DraftKings policies require you to make some changes to our default projections before you can build lineups.
-          Head to the <strong style={{ color: 'var(--text)' }}>DK Projections</strong> tab and edit at least <strong style={{ color: 'var(--primary)' }}>2 projections</strong> by any amount — this proves the lineups are your own work, not a shared export.
-          <span style={{ color: 'var(--text-dim)' }}> Currently changed: <strong style={{ color: overrideCount >= 2 ? 'var(--green)' : 'var(--red)' }}>{overrideCount}</strong>/2</span>
-        </div>
-        {onGoToProjections && (
-          <button
-            onClick={onGoToProjections}
-            className="oo-jump-btn"
-            style={{
-              marginTop: 10, padding: '7px 14px', fontSize: 12, fontWeight: 600,
-              background: 'var(--primary)', color: '#0A1628', border: 'none',
-              borderRadius: 6, cursor: 'pointer', display: 'inline-flex',
-              alignItems: 'center', gap: 6
-            }}
-          >
-            Jump to DK Projections
-            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-          </button>
-        )}
-      </div>
-    )}
+    {/* v5.8: DK compliance banner removed. The 1% variance floor on every
+        build guarantees structurally-distinct CSVs, so the 2-projection-edit
+        gate is no longer needed for DK's anti-duplicate rule. */}
     <ContrarianPanel enabled={contrarianOn} onToggle={setContrarianOn} strength={contrarianStrength} onStrengthChange={setContrarianStrength} />
     {contrarianOn && Object.keys(contrarianCaps).length > 0 && (() => {
       // OverOwned Mode display (v5.5) — top 5 changes by |bound - fieldOwn|.
