@@ -106,6 +106,69 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    # PP lines: pull active rows from prizepicks_lines table for this slate
+    # and include posted_lines (Underdog stat props) from matches.odds for
+    # multi-stat edge detection. Frontend buildProjections uses this to
+    # compute ppEdge per player, which feeds Hidden Gem + PP Fade signals
+    # in the DK tab and OverOwned Build ruleset.
+    pp_rows = (
+        db.table("prizepicks_lines")
+        .select("raw_player_name, stat_type, current_line")
+        .eq("slate_id", slate_id)
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
+    pp_lines_out = [
+        {
+            "player": r["raw_player_name"],
+            "stat": r["stat_type"],
+            "line": float(r["current_line"]),
+            "mult": "",  # multiplier not tracked in current admin UI
+            "source": "prizepicks",
+        }
+        for r in pp_rows
+    ]
+
+    # Also add Underdog stat-prop lines from matches.odds.posted_lines as
+    # a second source. Each match row has {"a": {games_won, aces, dfs, ...},
+    # "b": {...}} written by the Underdog ingestion SQL. Convert to the
+    # same flat {player, stat, line} shape as pp_lines so the frontend's
+    # ppRows builder can process both uniformly.
+    UD_STAT_MAP = {
+        "games_won": "Games Won",
+        "aces": "Aces",
+        "dfs": "Double Faults",
+        "breaks": "Breakpoints Won",
+        "games_played": "Games Played",
+        "first_set_games_won": "1st Set Games Won",
+        "first_set_games_played": "1st Set Games Played",
+        "sets_played": "Sets Played",
+        "sets_won": "Sets Won",
+        "tiebreakers_played": "Tiebreakers Played",
+    }
+    for m in matches:
+        odds = m.get("odds") or {}
+        posted = odds.get("posted_lines") or {}
+        for side_key, player_field in [("a", "player_a"), ("b", "player_b")]:
+            p = m.get(player_field) or {}
+            pname = p.get("display_name")
+            side_lines = posted.get(side_key) or {}
+            if not pname or not side_lines:
+                continue
+            for ud_key, display_stat in UD_STAT_MAP.items():
+                val = side_lines.get(ud_key)
+                if val is None:
+                    continue
+                pp_lines_out.append({
+                    "player": pname,
+                    "stat": display_stat,
+                    "line": float(val),
+                    "mult": "",
+                    "source": "underdog",
+                })
+
     return FrontendSlate(
         date=slate["slate_date"],
         sport=slate["sport"],
@@ -113,7 +176,7 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         lock_time=slate.get("lock_time"),
         matches=frontend_matches,
         dk_players=frontend_players,
-        pp_lines=[],  # populated by PP service later
+        pp_lines=pp_lines_out,
         meta=meta,
     )
 
