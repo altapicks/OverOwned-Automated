@@ -548,7 +548,7 @@ async def _write_kalshi_odds(match_id: str, slate_id: str, odds_block: dict):
     audit + the fallback display logic that shows "via Kalshi" vs "via Market".
     """
     db = get_client()
-    row = db.table("matches").select("odds").eq("id", match_id).single().execute().data
+    row = db.table("matches").select("odds, opening_odds").eq("id", match_id).single().execute().data
     if not row:
         return
     current = row.get("odds") or {}
@@ -562,6 +562,14 @@ async def _write_kalshi_odds(match_id: str, slate_id: str, odds_block: dict):
         current["kalshi_prob_b"] = odds_block["implied_prob_b"]
 
     db.table("matches").update({"odds": current}).eq("id", match_id).execute()
+
+    # Opening odds preservation (see _write_match_odds docstring).
+    opening = row.get("opening_odds") or {}
+    if not isinstance(opening, dict):
+        opening = {}
+    if "kalshi" not in opening:
+        opening["kalshi"] = odds_block
+        db.table("matches").update({"opening_odds": opening}).eq("id", match_id).execute()
 
     db.table("odds_history").insert(
         {
