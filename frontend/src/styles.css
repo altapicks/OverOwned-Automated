@@ -216,6 +216,15 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 ::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
 
+/* ── PrizePicks tab grid ─────────────────────
+   Main table (1fr) + Line Movements panel (320px fixed) on desktop.
+   Stacks on mobile so neither column overflows horizontally. */
+.pp-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 16px;
+}
+
 /* ── Mobile Responsive ─────────────────────── */
 @media (max-width: 768px) {
   .topbar { padding: 10px 12px; flex-wrap: wrap; gap: 4px; }
@@ -237,4 +246,6 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .lineup-grid { grid-template-columns: 1fr; }
   .ctrl-row input { width: 44px; font-size: 11px; }
   .btn { padding: 12px 16px; font-size: 13px; }
+  /* PP tab: collapse to single-column, movements panel below */
+  .pp-grid { grid-template-columns: minmax(0, 1fr); gap: 12px; }
 }
