@@ -692,6 +692,95 @@ function buildMMAProjections(data) {
 // ═══════════════════════════════════════════════════════════════════════
 // OWNERSHIP SIMULATORS
 // ═══════════════════════════════════════════════════════════════════════
+// Post-process raw optimizer ownership to match realistic DFS field behavior.
+// Pure optimizer output = hypothetical 100%-optimizer field (everyone
+// simultaneously plays the theoretically best lineups). Real fields are a
+// mix of optimizer users, recreational players, chalk-averse contrarians,
+// and narrative-chasers.
+//
+// Four calibrated adjustments, all zero-sum so total ownership still sums
+// to n_roster × 100 (preserving the pigeonhole property):
+//
+//   CHALK_CAP (48%)  — realistic field ceiling. Above 50% = "obvious play"
+//                       that many contrarians deliberately fade.
+//   DOG_CAP (22%)    — recreational aversion to cheap-dog punts. Optimizer
+//                       finds them value, casual users find them "gross."
+//   MID_FLOOR (12%)  — default safe-pick behavior for priced-up mid-tier
+//                       with genuine projection.
+//   Redistribution   — excess from chalk/dog caps → mid-tier value plays
+//                       (the spot where "I'm not playing chalk" drifts).
+//
+// These values were chosen to match observed tennis DK classic contest
+// ownership distributions. Conservative enough to not over-correct.
+function humanizeOwnership(rawOwnership, pData) {
+  const CHALK_CAP = 48;
+  const DOG_CAP = 22;
+  const MID_FLOOR = 12;
+
+  const result = { ...rawOwnership };
+  const salaries = pData.map(p => p.salary).sort((a, b) => a - b);
+  const projections = pData.map(p => p.projection).sort((a, b) => a - b);
+  const medianProj = projections[Math.floor(projections.length / 2)] || 0;
+
+  // Pass 1: apply chalk cap + dog cap, accumulate redistributable excess
+  let excess = 0;
+  pData.forEach(p => {
+    const cur = result[p.name] || 0;
+    if (cur > CHALK_CAP) {
+      excess += cur - CHALK_CAP;
+      result[p.name] = CHALK_CAP;
+    }
+    if (p.salary < 6000 && result[p.name] > DOG_CAP) {
+      excess += result[p.name] - DOG_CAP;
+      result[p.name] = DOG_CAP;
+    }
+  });
+
+  // Pass 2: redistribute excess to mid-tier value plays ($7000-$8200).
+  // Weight by value (proj/salary) so the best-value mid-tier gets more.
+  // Falls back to uniform across mid-tier if no value signal available.
+  const midTier = pData.filter(p => p.salary >= 7000 && p.salary <= 8200);
+  if (midTier.length > 0 && excess > 0) {
+    const valueSum = midTier.reduce((s, p) =>
+      s + Math.max(0, p.projection / (p.salary / 1000)), 0);
+    if (valueSum > 0) {
+      midTier.forEach(p => {
+        const val = Math.max(0, p.projection / (p.salary / 1000));
+        result[p.name] += excess * (val / valueSum);
+      });
+    } else {
+      midTier.forEach(p => { result[p.name] += excess / midTier.length; });
+    }
+  }
+
+  // Pass 3: mid-tier floor. Players in the mid-salary band with
+  // above-median projection must hit 12% minimum — models the "default
+  // safe pick" behavior where recreational users gravitate to priced-up
+  // mid-tier plays over chalk or deep dogs. Shortfall comes proportionally
+  // from top-owned players (the ones real field fades most).
+  midTier.forEach(p => {
+    if ((p.projection || 0) > medianProj && (result[p.name] || 0) < MID_FLOOR) {
+      const shortfall = MID_FLOOR - result[p.name];
+      const donors = pData.filter(x => (result[x.name] || 0) > 20)
+                          .sort((a, b) => result[b.name] - result[a.name]);
+      const donorSum = donors.reduce((s, d) => s + result[d.name], 0);
+      if (donorSum > 0) {
+        donors.forEach(d => {
+          result[d.name] -= shortfall * (result[d.name] / donorSum);
+        });
+      }
+      result[p.name] = MID_FLOOR;
+    }
+  });
+
+  // Round to 1 decimal for display stability
+  Object.keys(result).forEach(k => {
+    result[k] = Math.max(0, Math.round(result[k] * 10) / 10);
+  });
+
+  return result;
+}
+
 // Tennis ownership sim — exposure from top 1500 highest-scoring lineups.
 // For showdown, also tracks captain-specific ownership (some players chalky
 // as CPT but rare as FLEX, e.g. low-salary dogs optimizers love to captain).
@@ -730,8 +819,11 @@ function simulateOwnership(players, n = 1500) {
     const matchCount = Math.floor(pData.length / 2);
     const minSal = matchCount >= 18 ? 49200 : 48000;
     const res = optimize(pData, n, 50000, 6, minSal);
-    const overall = {};
-    pData.forEach((p, i) => { overall[p.name] = res.counts[i] / res.lineups.length * 100; });
+    const rawOwnership = {};
+    pData.forEach((p, i) => { rawOwnership[p.name] = res.counts[i] / res.lineups.length * 100; });
+    // Apply humanization post-processing to match realistic field behavior
+    // rather than pure optimizer output.
+    const overall = humanizeOwnership(rawOwnership, pData);
     return { overall, cpt: {} };
   } catch { return { overall: {}, cpt: {} }; }
 }
