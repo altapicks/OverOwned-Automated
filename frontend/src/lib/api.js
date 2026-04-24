@@ -99,3 +99,60 @@ export const FEATURES = {
 export function isSportEnabled(sport) {
   return FEATURES[sport] === true;
 }
+
+// ── Live Leverage Tracker: contest ownership API ─────────────────────
+// Read is public (no auth). Write is admin-only; uses supabase.auth.getSession()
+// to obtain the access token so the backend can verify admin_users membership.
+
+import { supabase } from './supabase';
+
+export async function fetchContestOwnership(slateId) {
+  if (!slateId) return { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null };
+  if (!API_BASE) return { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null };
+  try {
+    return await fetchJson(`${API_BASE}/api/tracker/${slateId}/ownership`, { timeoutMs: 10000 });
+  } catch (err) {
+    console.warn('[overowned] contest ownership fetch failed', err.message);
+    return { ownership: {}, uploaded_at: null, contest_name: null, total_entries: null };
+  }
+}
+
+async function getAccessToken() {
+  const { data: { session } } = await supabase.auth.getSession();
+  const token = session?.access_token;
+  if (!token) throw new Error('Not signed in — sign in as an admin to upload contest CSVs.');
+  return token;
+}
+
+export async function uploadContestOwnership(slateId, file) {
+  if (!API_BASE) throw new Error('Backend API not configured');
+  const token = await getAccessToken();
+  const form = new FormData();
+  form.append('file', file);
+  const r = await fetch(`${API_BASE}/api/tracker/${slateId}/ownership`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    if (r.status === 403) throw new Error("You're signed in but not in the admin list. Ask an admin to grant access.");
+    if (r.status === 401) throw new Error('Session expired. Sign in again and retry.');
+    throw new Error(`${r.status}: ${text || r.statusText}`);
+  }
+  return await r.json();
+}
+
+export async function clearContestOwnership(slateId) {
+  if (!API_BASE) throw new Error('Backend API not configured');
+  const token = await getAccessToken();
+  const r = await fetch(`${API_BASE}/api/tracker/${slateId}/ownership`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    throw new Error(`${r.status}: ${text || r.statusText}`);
+  }
+  return await r.json();
+}
