@@ -352,10 +352,15 @@ async def _write_match_odds(
     match_id: str, slate_id: str, source: str,
     engine_fields: dict, raw_market_payload: dict,
 ):
-    """Merge engine-shape fields into matches.odds.<source>, append to odds_history."""
+    """Merge engine-shape fields into matches.odds.<source>, append to odds_history.
+
+    Also seeds matches.opening_odds on first ingest for this source — that
+    column is frozen forever after, giving archived slates a canonical
+    closing-line-movement baseline independent of any user's localStorage.
+    """
     db = get_client()
     row = (
-        db.table("matches").select("odds").eq("id", match_id).single().execute().data
+        db.table("matches").select("odds, opening_odds").eq("id", match_id).single().execute().data
     )
     if not row:
         return
@@ -372,6 +377,15 @@ async def _write_match_odds(
             current[k] = engine_fields[k]
 
     db.table("matches").update({"odds": current}).eq("id", match_id).execute()
+
+    # Opening odds preservation — write only if this source has never been
+    # recorded. Never overwrite. Frontend reads this for archived-slate delta.
+    opening = row.get("opening_odds") or {}
+    if not isinstance(opening, dict):
+        opening = {}
+    if source not in opening:
+        opening[source] = engine_fields
+        db.table("matches").update({"opening_odds": opening}).eq("id", match_id).execute()
 
     db.table("odds_history").insert(
         {
