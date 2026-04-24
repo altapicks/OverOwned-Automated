@@ -105,14 +105,48 @@ export function PrizePicksTab({ slateId, players = [] }) {
   // guards below. React tracks hooks by call order — returning early before
   // calling these hooks on the first render and then calling them on the
   // second render produces error #310.
+  // Build two lookups:
+  //   exact:   full-name → player
+  //   surname: last-word → player  (used as fallback)
+  // PP lines often drop middle particles ("Tomas Etcheverry" vs DK roster's
+  // "Tomas Martin Etcheverry"; "Alex Minaur" vs "Alex de Minaur"). Surname
+  // match catches these — tennis slates are typically unique by surname so
+  // false-positive risk is low. If ambiguity ever becomes a real problem,
+  // we can add a first-initial tiebreaker.
   const playersByName = useMemo(() => {
-    const m = {};
-    (players || []).forEach(p => { m[p.name] = p; });
-    return m;
+    const exact = {};
+    const bySurname = {};
+    const norm = s => String(s || '').trim();
+    const surnameOf = s => {
+      const parts = norm(s).split(/\s+/);
+      return parts[parts.length - 1]?.toLowerCase() || '';
+    };
+    (players || []).forEach(p => {
+      exact[norm(p.name)] = p;
+      const sn = surnameOf(p.name);
+      if (sn) {
+        // If two DK players share a surname, the second one overwrites the
+        // first — which means we won't surface a match for the shadowed
+        // player via fallback. That's the conservative choice: silent miss
+        // beats incorrect attribution.
+        bySurname[sn] = bySurname[sn] === undefined ? p : null;
+      }
+    });
+    return { exact, bySurname, surnameOf };
   }, [players]);
 
+  const lookupPlayer = useCallback((rawName) => {
+    const { exact, bySurname, surnameOf } = playersByName;
+    const trimmed = String(rawName || '').trim();
+    const hit = exact[trimmed];
+    if (hit) return hit;
+    const sn = surnameOf(trimmed);
+    if (sn && bySurname[sn]) return bySurname[sn];
+    return null;
+  }, [playersByName]);
+
   const getProjectedForStat = useCallback((playerName, stat) => {
-    const p = playersByName[playerName];
+    const p = lookupPlayer(playerName);
     if (!p) return null;
     // Stat label → projected field on player object
     switch (stat) {
@@ -129,7 +163,7 @@ export function PrizePicksTab({ slateId, players = [] }) {
       case 'Tiebreakers Played': return p.stats?.tiebreakersPlayed;
       default: return null;
     }
-  }, [playersByName]);
+  }, [lookupPlayer]);
 
   // Enrich each line with projected + edge + direction, ready for display/sort.
   const enrichedLines = useMemo(() => {
@@ -284,7 +318,7 @@ function InlineLineEdit({ value, onSave }) {
 }
 
 function MovementRow({ move }) {
-  const colorMap = { up: '#EF4444', down: '#4ADE80', new: '#F5C518', removed: 'var(--text-dim)' };
+  const colorMap = { up: '#4ADE80', down: '#EF4444', new: '#F5C518', removed: 'var(--text-dim)' };
   const arrowMap = { up: '↑', down: '↓', new: '+', removed: '✕' };
   const c = colorMap[move.direction] || 'var(--text)';
   return (
