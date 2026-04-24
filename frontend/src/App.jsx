@@ -133,28 +133,24 @@ function applyContrarian(proj, ownership, strength, fairOwn = 20, value = null, 
   return proj * (1 + strength * clampedDelta * baseScale * valueWeight);
 }
 
-// v3.24.14: one-line definitions for OverOwned Mode signal badges. Used
-// as `title` attributes on badge spans so hovering reveals what the
-// signal means without opening the full explainer modal.
+// v5.0: one-line definitions for OverOwned Mode signal badges. Used as
+// `title` attributes on badge spans so hovering reveals what the signal
+// means without opening the full explainer modal. Keyed by the root
+// badge label; rank suffixes (#1/#2/#3/#4) and kind suffixes ((Trap opp),
+// (Value)) are stripped before lookup.
 const SIGNAL_TOOLTIPS = {
-  'Trap': 'TRAP — Highly owned but win-probability does not justify the price. Field piles in; OverOwned fades.',
-  'Or Trap': 'OR TRAP — Alternative trap candidate when the primary trap is locked or excluded.',
-  'Gem': 'HIDDEN GEM — Underowned relative to win equity, often the trap\'s opponent. OverOwned floors exposure above field.',
-  'Pivot': 'PIVOT — Secondary gem, typically emerging from a PrizePicks line the DFS field has not pricing in yet.',
-  'Or Pivot': 'OR PIVOT — Salary-equivalent alternative to the primary gem. Diversifies the contrarian stack.',
-  'PP Fade': 'PP FADE — PrizePicks market is flagging this player to miss their line by a clear margin. Cross-market signal.',
-  'PP Fade Opp': 'PP FADE OPPONENT — Opponent of a PP fade. When the fade misses, their opponent is more likely to win.',
-  'Gem Opp': 'GEM OPPONENT — Opponent of a Hidden Gem. Field over-rosters this player to block the gem; OverOwned fades that block.',
-  'Straight Sets': 'STRAIGHT-SETS CAP — Top favorite most likely to win without dropping a set. Capped to avoid cash-lineup overlap.',
-  'Top Val': 'TOP VALUE CAP — One of the slate\'s top 10 by value. Capped hard on 16+ match slates to prevent same-core overlap.',
-  'Top Val Opp': 'TOP VALUE OPPONENT — Opponent of a high-value chalk play. Boosted when the chalk has equity-undermining win rate.',
-  'Mid Fade': 'MID-TIER FADE — High-ownership salary-band winner. Capped below field to force diversity on deep slates.',
-  'Mid Pivot': 'MID-TIER PIVOT — Second-highest mid-tier. Floored above its own simulated ownership as a mid-salary leverage play.',
+  'Biggest Trap': 'BIGGEST TRAP — Over-owned relative to fantasy value (simOwn − val × 5). Field piles in; OverOwned caps exposure graduated 8–14%.',
+  'Hidden Gem': 'HIDDEN GEM — Under-owned relative to fantasy value. True leverage play — OverOwned floors exposure aggressively.',
+  'Primary Pivot': 'PRIMARY PIVOT — Trap #1\'s opponent (if value ≥ 5.5) or top under-owned value. OverOwned floors at max(25%, simOwn × 2).',
+  'Or Pivot': 'OR PIVOT — Same rule for Trap #2\'s opponent. 16+ match slates only. Floor at max(20%, simOwn × 1.8).',
+  'PP Fade': 'PP FADE — Top PrizePicks market fade (projected to miss line by 2+ points). OverOwned floors at simOwn × 1.5 (+50% leverage).',
+  'Top 3 Value': 'TOP 3 VALUE — Highest projected points per dollar on the slate. Informational — not an OverOwned rule.',
+  'Top 3 Straight Sets': 'TOP 3 STRAIGHT SETS — Highest probability of winning in straight sets. Informational — not an OverOwned rule.',
 };
 const signalTooltip = (label) => {
   if (!label) return '';
-  // Pivot #1, Pivot #2 etc. — strip trailing rank for lookup
-  const key = label.replace(/\s*#\d+$/, '').trim();
+  // Strip rank suffix ("#1") AND kind suffix ("(Trap opp)" / "(Value)") for lookup
+  const key = label.replace(/\s*#\d+$/, '').replace(/\s*\([^)]*\)\s*$/, '').trim();
   return SIGNAL_TOOLTIPS[key] || SIGNAL_TOOLTIPS[label] || '';
 };
 
@@ -222,10 +218,9 @@ function ContrarianPanel({ enabled, onToggle, strength, onStrengthChange }) {
   );
 }
 
-// v3.24.14: OverOwned Mode explainer modal. Opened from the "?" icon next
-// to the toggle. Covers: what the mode does mechanically, what each signal
-// badge means, and when to dial strength up vs. down. Tennis-centric
-// because the rule pipeline is tennis-specific (16+ match slates).
+// OverOwned Mode explainer modal (v4.0). Opened from the "?" icon next
+// to the toggle. Covers the new unified ruleset, signal badges, and
+// strength slider behavior. Mobile-responsive via @media rule below.
 function OverOwnedHelpModal({ onClose }) {
   useEffect(() => {
     const onEsc = (e) => { if (e.key === 'Escape') onClose(); };
@@ -239,10 +234,17 @@ function OverOwnedHelpModal({ onClose }) {
         flex: '0 0 auto', padding: '2px 8px', borderRadius: 4,
         background: `${color}22`, border: `1px solid ${color}66`,
         color, fontSize: 10, fontWeight: 700, letterSpacing: 0.4,
-        textTransform: 'uppercase', minWidth: 62, textAlign: 'center',
+        textTransform: 'uppercase', minWidth: 72, textAlign: 'center',
         fontVariantCaps: 'all-small-caps'
       }}>{badge}</span>
-      <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55, flex: 1 }}>{children}</div>
+      <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55, flex: 1, minWidth: 0 }}>{children}</div>
+    </div>
+  );
+  const RuleRow = ({ rule, target, cap }) => (
+    <div className="oo-help-rule-row" style={{ display: 'flex', gap: 10, padding: '6px 0', fontSize: 12, color: 'var(--text-muted)', borderBottom: '1px dashed var(--border)' }}>
+      <span style={{ flex: '0 0 auto', width: 20, color: 'var(--text-dim)', fontWeight: 600 }}>{rule}</span>
+      <span style={{ flex: '1 1 auto', minWidth: 0 }}>{target}</span>
+      <span className="oo-help-rule-cap" style={{ flex: '0 0 auto', color: 'var(--text)', fontFamily: 'var(--font-mono, monospace)', fontSize: 11, textAlign: 'right' }}>{cap}</span>
     </div>
   );
   return (
@@ -264,7 +266,9 @@ function OverOwnedHelpModal({ onClose }) {
           .oo-help-modal .oo-help-mechanics { padding: 10px 12px !important; }
           .oo-help-modal .oo-help-mechanics li { font-size: 11.5px !important; }
           .oo-help-modal .oo-help-glossary-row { padding: 7px 0 !important; gap: 10px !important; }
-          .oo-help-modal .oo-help-badge { min-width: 54px !important; font-size: 9px !important; padding: 2px 6px !important; }
+          .oo-help-modal .oo-help-badge { min-width: 60px !important; font-size: 9px !important; padding: 2px 6px !important; }
+          .oo-help-modal .oo-help-rule-row { font-size: 11px !important; gap: 8px !important; flex-wrap: wrap !important; }
+          .oo-help-modal .oo-help-rule-cap { font-size: 10px !important; width: 100% !important; text-align: left !important; padding-left: 30px !important; }
           .oo-help-modal .oo-help-footer { font-size: 10.5px !important; }
         }
       `}</style>
@@ -273,44 +277,69 @@ function OverOwnedHelpModal({ onClose }) {
         onClick={e => e.stopPropagation()}
         style={{
           background: 'var(--card)', borderRadius: 12, padding: '22px 24px',
-          maxWidth: 560, width: '100%', maxHeight: '85vh', overflow: 'auto',
+          maxWidth: 580, width: '100%', maxHeight: '85vh', overflow: 'auto',
           border: '1px solid var(--border-light)',
           boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
             <Icon name="swords" size={18} color="#F5C518"/>
-            <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text)', margin: 0 }}>OverOwned Mode — what it does</h2>
+            <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text)', margin: 0 }}>OverOwned Mode</h2>
           </div>
           <button onClick={onClose} aria-label="Close" style={{
             background: 'transparent', border: 'none', color: 'var(--text-muted)',
             fontSize: 26, cursor: 'pointer', lineHeight: 1, padding: '0 8px',
-            minWidth: 36, minHeight: 36,  // iOS tap target
+            minWidth: 36, minHeight: 36,
           }}>×</button>
         </div>
         <p className="oo-help-lede" style={{ fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6, marginBottom: 14 }}>
-          OverOwned Mode rewrites per-player exposure caps to fade the chalk the field is about to over-roster and boost the hidden leverage plays the field will under-roster. It's the difference between an optimizer that builds the field's lineups and one that builds <em>around</em> the field's lineups.
+          OverOwned Mode rewrites per-player exposure caps to fade the chalk the field is over-rostering and boost the leverage plays the field is under-rostering. The difference between an optimizer that builds the field's lineups and one that builds <em>around</em> them.
         </p>
+
+        {/* How it selects signals */}
         <div className="oo-help-mechanics" style={{ background: 'var(--bg)', borderRadius: 8, padding: '12px 14px', marginBottom: 14, border: '1px solid var(--border)' }}>
-          <div style={{ fontSize: 11, color: 'var(--text-dim)', fontWeight: 600, letterSpacing: 0.8, textTransform: 'uppercase', marginBottom: 6 }}>When OverOwned is ON</div>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', fontWeight: 600, letterSpacing: 0.8, textTransform: 'uppercase', marginBottom: 6 }}>How signals are picked</div>
           <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.6 }}>
-            <li>Trap player's exposure is <strong style={{ color: 'var(--red)' }}>capped</strong> well below their projected field ownership</li>
-            <li>Hidden Gem's exposure is <strong style={{ color: 'var(--green)' }}>floored</strong> well above their field ownership</li>
-            <li>PP Fade opponents and gem opponents get secondary caps so you don't leak back into the chalk through the side door</li>
-            <li>On 10+ match slates, mid-tier and top-value plays also get tiered caps to prevent structural salary-filler overlap</li>
+            <li><strong style={{ color: 'var(--text)' }}>Core formula</strong> — <code style={{ fontSize: 11 }}>score = simOwn − val × 5</code>. Compares ownership to fantasy value directly.</li>
+            <li><strong style={{ color: 'var(--text)' }}>Biggest Traps</strong> — top 4 (16+) or top 2 (≤15) by <em>highest</em> score. Over-owned for the value they deliver.</li>
+            <li><strong style={{ color: 'var(--text)' }}>Hidden Gems</strong> — top 4 (16+) or top 2 (≤15) by <em>lowest</em> score. Under-owned for the value they deliver.</li>
+            <li><strong style={{ color: 'var(--text)' }}>Primary Pivot</strong> — Trap #1's opponent if val ≥ 5.5, else top under-owned value play.</li>
+            <li><strong style={{ color: 'var(--text)' }}>Or Pivot</strong> — same logic for Trap #2's opponent. 16+ only.</li>
+            <li><strong style={{ color: 'var(--text)' }}>PP Fades</strong> — top 3 by most-negative <code style={{ fontSize: 11 }}>ppEdge ≤ -2</code>, excluding Trap #1.</li>
           </ul>
         </div>
+
+        {/* Exposure rules at base strength */}
+        <div className="oo-help-mechanics" style={{ background: 'var(--bg)', borderRadius: 8, padding: '12px 14px', marginBottom: 14, border: '1px solid var(--border)' }}>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', fontWeight: 600, letterSpacing: 0.8, textTransform: 'uppercase', marginBottom: 6 }}>Exposure caps at strength 0.6</div>
+          <RuleRow rule="1" target="Biggest Trap #1" cap="max 8%" />
+          <RuleRow rule="2" target="Biggest Trap #2" cap="max 10%" />
+          <RuleRow rule="3" target="Biggest Trap #3 (16+ only)" cap="max 12%" />
+          <RuleRow rule="4" target="Biggest Trap #4 (16+ only)" cap="max 14%" />
+          <RuleRow rule="5" target="Primary Pivot" cap="min = max(25%, simOwn × 2)" />
+          <RuleRow rule="6" target="Or Pivot (16+ only)" cap="min = max(20%, simOwn × 1.8)" />
+          <RuleRow rule="7" target="PP Fades (top 3)" cap="min = simOwn × 1.5" />
+          <RuleRow rule="8" target="Hidden Gem #1" cap="min = max(25%, simOwn × 2)" />
+          <RuleRow rule="9" target="Hidden Gem #2" cap="min = max(22%, simOwn × 1.8)" />
+          <RuleRow rule="10" target="Hidden Gem #3 (16+ only)" cap="min = max(18%, simOwn × 1.5)" />
+          <RuleRow rule="11" target="Hidden Gem #4 (16+ only)" cap="min = max(15%, simOwn × 1.3)" />
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 10, lineHeight: 1.5 }}>
+            Hidden Gems replaces the old "auto-build under-owned value" rule. Each gem gets a graduated leverage floor; the optimizer auto-generates contrarian-value lineups as a side effect of respecting those floors.
+          </div>
+        </div>
+
+        {/* Signal glossary — what each badge means on a player row */}
         <div style={{ fontSize: 10, color: 'var(--text-dim)', fontWeight: 600, letterSpacing: 0.8, textTransform: 'uppercase', marginBottom: 2 }}>Signal glossary</div>
-        <Row badge="Trap" color="#EF4444">Highly projected, highly owned, but win-probability doesn't justify the price. Field piles in; you fade.</Row>
-        <Row badge="Gem" color="#4ADE80">Opponent of the Trap (or the best salary-band value if opponent doesn't qualify). Underowned relative to their win equity — boost hard.</Row>
-        <Row badge="Pivot" color="#4ADE80">A secondary gem the field also misses. Typically emerges from PP line comparisons when the PP market is flagging an edge the DFS field hasn't caught up to.</Row>
-        <Row badge="Or Pivot" color="#4ADE80">A "pivot off the gem" — same slot, lower ownership, similar projection ceiling. Diversifies your contrarian stack.</Row>
-        <Row badge="PP Fade" color="#EF4444">Player the PrizePicks market has flagged as a fade (projected to miss their line by a clear margin). Cross-market signal the DFS field is ignoring.</Row>
-        <Row badge="PP Fade Opp" color="#F59E0B">Opponent of a PP fade. When the fade is likely to miss, their opponent is more likely to win — secondary leverage.</Row>
-        <Row badge="Gem Opp" color="#F59E0B">Opponent of a Hidden Gem. Field over-rosters the gem's opponent to block them; you fade those blockers.</Row>
+        <Row badge="Big Trap" color="#EF4444">Over-owned for value (simOwn − val × 5). Ranked #1–#4 with graduated caps 8–14% at base strength.</Row>
+        <Row badge="Hidden Gem" color="#4ADE80">Under-owned for value — the inverse ranking. Ranked #1–#4 with graduated floors 25%–15% at base strength.</Row>
+        <Row badge="Primary Pivot" color="#4ADE80">Trap #1's opponent or top under-owned value fallback. Game-theory pivot off the chalk.</Row>
+        <Row badge="Or Pivot" color="#4ADE80">Same rule for Trap #2. 16+ match slates only.</Row>
+        <Row badge="PP Fade" color="#4ADE80">PrizePicks line flags the player to miss by 2+ points. Cross-market leverage the DFS field hasn't caught up to.</Row>
+
+        {/* Strength guidance */}
         <p className="oo-help-footer" style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 14, marginBottom: 0, lineHeight: 1.5, fontStyle: 'italic' }}>
-          Strength controls how aggressive the caps are: 60% (the default) is calibrated to the long-run hit rate on a 16+ match slate. Push higher on large-field GPPs where leverage pays more, lower on cash/small-field where variance hurts more than it helps.
+          Strength controls aggression: 0.6 (default) is calibrated to long-run hit rate. Push higher on large-field GPPs where leverage pays more, lower on cash/small-field where variance hurts more than it helps. At 0, all rules become no-ops.
         </p>
       </div>
     </div>
@@ -2495,36 +2524,42 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
   // are — they're just a bad play. The 30% floor restricts the label to
   // players with genuine match-win equity, which is where the GPP bust
   // risk actually lives.
-  const trap = useMemo(() => {
-    const active = pw.filter(p => p.salary > 0 && (p.wp || 0) >= 0.30);
-    if (active.length === 0) return '';
+  // v5.0: Formula changed from (simOwn − wp × 100) to (simOwn − val × 5).
+  // Compares field ownership to fantasy value directly — a highly-owned
+  // player at low value is the truest trap regardless of win probability.
+  // Returns array of top N names: 4 for 16+ match slates, 2 for smaller.
+  const traps = useMemo(() => {
+    const active = pw.filter(p => p.salary > 0 && (p.val || 0) > 0);
+    if (active.length === 0) return [];
+    const N = (mc || 0) >= 16 ? 4 : 2;
     const hasOwn = active.some(p => (p.simOwn || 0) > 0);
-    if (!hasOwn) return [...active].sort((a, b) => b.proj - a.proj)[0]?.name || '';
-    const scored = active.map(p => {
-      const own = p.simOwn || 0;
-      const wp  = (p.wp || 0) * 100;
-      return { name: p.name, score: own - wp };
-    }).sort((a, b) => b.score - a.score);
-    return scored[0]?.name || '';
-  }, [pw]);
+    if (!hasOwn) return [...active].sort((a, b) => b.proj - a.proj).slice(0, N).map(p => p.name);
+    const scored = active.map(p => ({
+      name: p.name,
+      score: (p.simOwn || 0) - (p.val || 0) * 5
+    })).sort((a, b) => b.score - a.score);
+    return scored.slice(0, N).map(x => x.name);
+  }, [pw, mc]);
+  // Derived single-name aliases for backward compat in display/comparisons
+  const trap = traps[0] || '';
+  const orTrap = traps[1] || '';
 
-  // v3.24: "Or Trap" — #2 in the same (simOwn − wp×100) ranking.
-  // Only displayed on 16+ match tennis slates where the ruleset fades both.
-  const orTrap = useMemo(() => {
-    if ((mc || 0) < 16) return '';
-    const active = pw.filter(p => p.salary > 0 && (p.wp || 0) >= 0.30 && p.name !== trap);
-    if (active.length === 0) return '';
-    const scored = active.map(p => {
-      const own = p.simOwn || 0;
-      const wp  = (p.wp || 0) * 100;
-      return { name: p.name, score: own - wp };
-    }).sort((a, b) => b.score - a.score);
-    return scored[0]?.name || '';
-  }, [pw, trap, mc]);
+  // Hidden Gems — mirror of Biggest Traps. Same formula, inverse ranking:
+  // top N by LOWEST (simOwn − val × 5). These are the "true under-owned
+  // value" plays, separate from the Pivots box (trap-opponents logic).
+  const hiddenGems = useMemo(() => {
+    const active = pw.filter(p => p.salary > 0 && (p.val || 0) > 0);
+    if (active.length === 0) return [];
+    const N = (mc || 0) >= 16 ? 4 : 2;
+    const scored = active.map(p => ({
+      name: p.name,
+      score: (p.simOwn || 0) - (p.val || 0) * 5
+    })).sort((a, b) => a.score - b.score);  // ascending — lowest first
+    return scored.slice(0, N).map(x => x.name);
+  }, [pw, mc]);
 
-  // v3.24: Top 3 PP fades (ppEdge ≤ -2), excluding trap. Displayed as
-  // "or pivot: A, B, C" on 16+ match slates. Just the names — we don't
-  // expose the formula to users.
+  // Top 3 PP fades (ppEdge ≤ -2), excluding primary trap. Displayed in
+  // the Pivots box alongside primary/or-pivot gem picks.
   const topPpFades = useMemo(() => {
     if ((mc || 0) < 16) return [];
     return pw
@@ -2535,10 +2570,10 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
       .map(p => p.name);
   }, [pw, trap, mc]);
 
-  // Hidden Gem — new simpler spec (OverOwned Mode v2):
-  //   Primary: trap's opponent IF their val >= 5.5; else top under-owned
+  // Pivots — renamed from "Hidden Gem" box. Content unchanged:
+  //   Primary: Trap #1's opponent IF their val >= 5.5; else top under-owned
   //            value via score = val × (1 − simOwn/50).
-  //   Pivot (16+ match slates only): or-trap's opponent IF their val >= 5.5;
+  //   Pivot (16+ match slates only): Trap #2's opponent IF their val >= 5.5;
   //            else top under-owned value, excluding the primary.
   // Returns { primary, pivot } with kind ∈ {'opponent', 'value'}.
   const gem = useMemo(() => {
@@ -2579,46 +2614,69 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
   }, [pw, trap, orTrap, mc]);
   const gemName = gem.primary?.name || '';
   const pivotName = gem.pivot?.name || '';
-  const gemNames = [gemName, pivotName].filter(Boolean);
+  // pivotBadgeNames = the Primary Pivot + Or Pivot (old "gem" concept,
+  // now relabeled "Pivot"). These are trap-opponent-based picks.
+  const pivotBadgeNames = [gemName, pivotName].filter(Boolean);
   const S = p => <SH {...p} sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />;
   return (<>
     <div className="metrics">
       <div className="metric"><div className="metric-label"><Icon name="trophy" size={13}/> Top Value</div><div className="metric-value">{t3v.map((n, i) => { const p = players.find(x => x.name === n); return <div key={i} style={{ fontSize: i === 0 ? '16px' : '13px', color: i === 0 ? undefined : 'var(--text-muted)' }}>{i + 1}. {n} <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{fmt(p?.val, 2)}</span></div>; })}</div></div>
-      <div className="metric"><div className="metric-label"><Icon name="target" size={13}/> Top Straight Sets</div><div className="metric-value">{t3s.map((n, i) => { const p = players.find(x => x.name === n); return <div key={i} style={{ fontSize: i === 0 ? '16px' : '13px', color: i === 0 ? undefined : 'var(--text-muted)' }}>{n} <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{fmtPct(p?.pStraight)}</span></div>; })}</div></div>
+      {/* Pivots box — formerly "Hidden Gem". Shows trap-opponent-based
+          primary pivot, or pivot (16+), and PP Fades. These are the
+          game-theory "pivot off the trap" plays. */}
       <div className="metric">
-        <div className="metric-label"><Icon name="gem" size={13}/> Hidden Gem</div>
-        {/* Primary gem — always shown if identified */}
+        <div className="metric-label"><Icon name="swords" size={13}/> Pivots</div>
         <div className="metric-value" style={{ color: 'var(--green-text)' }}>{gem.primary?.name || '-'}</div>
         <div className="metric-sub">
           {gem.primary?.kind === 'opponent'
             ? `Trap's opponent · ${fmtPct(gem.primary.wp)} win prob`
             : gem.primary?.kind === 'value'
             ? 'Top under-owned value'
-            : 'No gem identified'}
+            : 'No pivot identified'}
         </div>
-        {/* Or Pivot gem — 16+ match slates only */}
         {(mc || 0) >= 16 && gem.pivot && (
           <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px dashed var(--border)', fontSize: 11, color: 'var(--text-dim)' }}>
             or Pivot: <span style={{ color: 'var(--green-text)' }}>{gem.pivot.name}</span>
           </div>
         )}
-        {/* PP Fades — top 3 by negative PP edge, always shown if present */}
         {topPpFades.length > 0 && (
           <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-dim)' }}>
             PP Fade: <span style={{ color: 'var(--text-muted)' }}>{topPpFades.join(', ')}</span>
           </div>
         )}
       </div>
+      {/* Hidden Gems box — list of top N by lowest (simOwn − val × 5).
+          True under-owned value plays. Mirror of Biggest Traps. */}
       <div className="metric">
-        <div className="metric-label"><Icon name="bomb" size={13}/> Biggest Trap</div>
-        <div className="metric-value" style={{ color: 'var(--red-text)' }}>{trap || '-'}</div>
-        <div className="metric-sub">Who the field needs most</div>
-        {/* v3.24: 16+ match slates show "or: X" for the second-worst trap. */}
-        {(mc || 0) >= 16 && orTrap && (
-          <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px dashed var(--border)', fontSize: 11, color: 'var(--text-dim)' }}>
-            or: <span style={{ color: 'var(--red-text)' }}>{orTrap}</span>
-          </div>
-        )}
+        <div className="metric-label"><Icon name="gem" size={13}/> Hidden Gems</div>
+        <div className="metric-value" style={{ color: 'var(--green-text)' }}>
+          {hiddenGems.length === 0
+            ? '-'
+            : hiddenGems.map((n, i) => {
+                const p = players.find(x => x.name === n);
+                return <div key={i} style={{ fontSize: i === 0 ? '16px' : '13px', color: i === 0 ? 'var(--green-text)' : 'var(--text-muted)' }}>
+                  {i + 1}. {n} <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{p ? `${fmt(p.simOwn, 1)}% · ${fmt(p.val, 2)}` : ''}</span>
+                </div>;
+              })}
+        </div>
+        <div className="metric-sub" style={{ marginTop: 4 }}>Under-owned for value</div>
+      </div>
+      {/* Biggest Traps box — list of top N by highest (simOwn − val × 5).
+          Formula changed from (simOwn − wp × 100) to compare ownership
+          to value directly. */}
+      <div className="metric">
+        <div className="metric-label"><Icon name="bomb" size={13}/> Biggest Traps</div>
+        <div className="metric-value" style={{ color: 'var(--red-text)' }}>
+          {traps.length === 0
+            ? '-'
+            : traps.map((n, i) => {
+                const p = players.find(x => x.name === n);
+                return <div key={i} style={{ fontSize: i === 0 ? '16px' : '13px', color: i === 0 ? 'var(--red-text)' : 'var(--text-muted)' }}>
+                  {i + 1}. {n} <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{p ? `${fmt(p.simOwn, 1)}% · ${fmt(p.val, 2)}` : ''}</span>
+                </div>;
+              })}
+        </div>
+        <div className="metric-sub" style={{ marginTop: 4 }}>Over-owned for value</div>
       </div>
     </div>
     <SearchBar value={q} onChange={setQ} placeholder="Search players, opponents" total={pw.length} filtered={pwFiltered.length} />
@@ -2629,28 +2687,28 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
     <tbody>{sorted.map((p, i) => {
       const iv = t3v.includes(p.name), is = t3s.includes(p.name);
       // v3.24.1: on 16+ slates gemNames is the top-2 array; ≤15 is single-name array.
-      const ig = gemNames.includes(p.name);
-      // v3.24: on 16+ slates, any of the top 3 PP fades gets the pivot badge
-      // (not just #1), and orTrap shows as a trap.
+      const ig = hiddenGems.includes(p.name);       // Hidden Gem (new: true under-owned value)
       const isBig = (mc || 0) >= 16;
-      const ip = topPpFades.includes(p.name);  // PP fade badge
-      const it = p.name === trap || (isBig && orTrap && p.name === orTrap);
-      const iog = isBig && gem.pivot?.name === p.name;  // or-pivot gem
+      const ip = topPpFades.includes(p.name);        // PP Fade badge
+      const it = traps.includes(p.name);             // Biggest Trap (may be #1-4)
+      const iPivot = gem.primary?.name === p.name;   // Primary Pivot (trap opp or value)
+      const iOrPivot = isBig && gem.pivot?.name === p.name;  // Or Pivot
       const badges = [];
       if (iv) badges.push({ icon: 'trophy', label: 'Top 3 Value' });
       if (is) badges.push({ icon: 'target',  label: 'Top 3 Straight Sets' });
-      if (ig) {
+      if (ig) badges.push({ icon: 'gem',     label: `Hidden Gem #${hiddenGems.indexOf(p.name) + 1}` });
+      if (iPivot) {
         const kindLabel = gem.primary?.kind === 'opponent' ? 'Trap opp' : 'Value';
-        badges.push({ icon: 'gem', label: `Hidden Gem (${kindLabel})` });
+        badges.push({ icon: 'swords', label: `Primary Pivot (${kindLabel})` });
       }
-      if (iog) {
+      if (iOrPivot) {
         const kindLabel = gem.pivot?.kind === 'opponent' ? 'Or-trap opp' : 'Value';
-        badges.push({ icon: 'gem', label: `Or Pivot (${kindLabel})` });
+        badges.push({ icon: 'swords', label: `Or Pivot (${kindLabel})` });
       }
-      if (ip) badges.push({ icon: 'gem',     label: `PP Fade #${topPpFades.indexOf(p.name) + 1}` });
-      if (it) badges.push({ icon: 'bomb',    label: isBig && p.name === orTrap ? 'Or Trap' : 'Biggest Trap' });
+      if (ip) badges.push({ icon: 'swords',  label: `PP Fade #${topPpFades.indexOf(p.name) + 1}` });
+      if (it) badges.push({ icon: 'bomb',     label: `Biggest Trap #${traps.indexOf(p.name) + 1}` });
       const isOver = overrides && overrides[p.name] != null;
-      return <tr key={p.name} className={ig || iog ? 'row-hl-green' : ip ? 'row-hl-green' : it ? 'row-hl-red' : ''}>
+      return <tr key={p.name} className={ig || iPivot || iOrPivot || ip ? 'row-hl-green' : it ? 'row-hl-red' : ''}>
         <td className="muted">{i + 1}</td>
         <td><span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>{badges.map((bd, j) => <Tip key={j} icon={bd.icon} label={bd.label} size={14} />)}</span></td>
         <td className="name">{p.name}</td><td className="muted">{p.opponent}</td>
@@ -2678,35 +2736,50 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// OVEROWNED MODE — unified exposure ruleset (v4.0)
+// OVEROWNED MODE — unified exposure ruleset (v5.0)
 // ═══════════════════════════════════════════════════════════════════════
-// One rule set for all tennis slates. Slate size gates the or-tier:
-//   ≤15 matches → 1 trap + 1 gem (primary only)
-//   16+ matches → 2 traps + 2 gems (primary + or-pivot)
+// New trap/gem formula: score = simOwn − val × 5. Ownership compared to
+// fantasy value directly (not win probability). Negative score = under-
+// owned for value = gem. Positive score = over-owned for value = trap.
 //
-// Base exposures at strength 0.6 (see docstring for scaling):
-//   Biggest Trap        max 8%
-//   Or Trap             max 10%                     (16+ only)
-//   Hidden Gem Primary  min = max(25%, simOwn × 2)  [+100% leverage floor]
-//   Or Pivot Gem        min = max(20%, simOwn × 1.8) [+80% leverage floor, 16+ only]
-//   PP Fades (top 3)    each min = simOwn × 1.5      [+50% leverage floor]
-//   UO Value Top 5      each min = simOwn × 1.3      [+30% leverage floor]
+// Slate size determines list depth:
+//   ≤15 matches → 2 Biggest Traps + 2 Hidden Gems
+//   16+ matches → 4 Biggest Traps + 4 Hidden Gems
 //
-// Under-owned value score: val × (1 − simOwn/50). Penalizes ownership
-// smoothly — 6.0 val at 10% own scores 4.8, at 30% scores 2.4.
+// Three separate signal groups:
+//   • Biggest Traps — top N by HIGHEST score. Graduated caps.
+//   • Hidden Gems — top N by LOWEST score. Graduated floors.
+//   • Pivots — trap-opponent-based picks (Primary + Or Pivot) plus PP Fades.
+//     Primary Pivot = Trap #1's opponent (val≥5.5) else top under-owned value.
+//     Or Pivot = Trap #2's opponent (val≥5.5) else top under-owned value.
+//     PP Fades = top 3 by negative ppEdge.
+//
+// Base exposures at strength 0.6:
+//   Biggest Trap #1        max 8%
+//   Biggest Trap #2        max 10%
+//   Biggest Trap #3        max 12%   (16+ only)
+//   Biggest Trap #4        max 14%   (16+ only)
+//   Primary Pivot          min = max(25%, simOwn × 2)
+//   Or Pivot               min = max(20%, simOwn × 1.8)  (16+ only)
+//   PP Fades (top 3)       each min = simOwn × 1.5
+//   Hidden Gem #1          min = max(25%, simOwn × 2)
+//   Hidden Gem #2          min = max(22%, simOwn × 1.8)
+//   Hidden Gem #3          min = max(18%, simOwn × 1.5)  (16+ only)
+//   Hidden Gem #4          min = max(15%, simOwn × 1.3)  (16+ only)
 //
 // Strength scaling: factor = strength / 0.6.
-//   • Max caps divided by factor (higher strength → lower cap, more fade)
+//   • Max caps divided by factor (higher strength = lower cap, more fade)
 //   • Absolute min floors multiplied by factor
 //   • Leverage min boost scales linearly: (1 + baseLev × factor)
-// At strength 0, all rules become no-ops (empty caps object).
+// At strength 0, all rules become no-ops.
 //
-// Stack safety: setMin uses Math.max, setMax uses Math.min — rules compose
-// order-independently. After applying, any player with both min+max gets
-// min clamped to ≤ max (defensive safety for contradictory rules).
+// Stack safety: setMin uses Math.max, setMax uses Math.min — rules
+// compose order-independently. When a Hidden Gem is also the Primary
+// Pivot, the higher floor wins. Any player with both min and max gets
+// min clamped to ≤ max.
 function computeOverOwnedCaps(rp, ownership, strength, matchCount) {
   if (strength === 0) return {};
-  const withSal = rp.filter(p => p.salary > 0);
+  const withSal = rp.filter(p => p.salary > 0 && (p.val || 0) > 0);
   if (withSal.length === 0) return {};
 
   const caps = {};
@@ -2714,8 +2787,10 @@ function computeOverOwnedCaps(rp, ownership, strength, matchCount) {
   const roundInt = (x) => Math.max(0, Math.min(100, Math.round(x)));
   const own = (name) => ownership[name] || 0;
   const is16Plus = matchCount >= 16;
+  const trapCount = is16Plus ? 4 : 2;
+  const gemCount = is16Plus ? 4 : 2;
 
-  // Stack-safe setters — order-independent stacking
+  // Stack-safe setters
   const setMin = (name, v) => {
     caps[name] = caps[name] || {};
     caps[name].min = caps[name].min !== undefined ? Math.max(caps[name].min, v) : v;
@@ -2735,15 +2810,18 @@ function computeOverOwnedCaps(rp, ownership, strength, matchCount) {
 
   // ─── SELECTIONS ─────────────────────────────────────────────────────
 
-  // Biggest Trap + Or Trap — max(simOwn − wp×100), wp ≥ 30% gate
-  const trapPool = withSal.filter(p => (p.wp || 0) >= 0.30);
-  const rankedTraps = trapPool
-    .map(p => ({ p, score: own(p.name) - (p.wp || 0) * 100 }))
-    .sort((a, b) => b.score - a.score);
-  const trap = rankedTraps[0]?.p || null;
-  const orTrap = is16Plus ? (rankedTraps[1]?.p || null) : null;
+  // Biggest Traps + Hidden Gems — same formula, opposite rankings
+  const score = (p) => (own(p.name)) - (p.val || 0) * 5;
+  const rankedDesc = [...withSal].sort((a, b) => score(b) - score(a));
+  const rankedAsc  = [...withSal].sort((a, b) => score(a) - score(b));
+  const trapsList = rankedDesc.slice(0, trapCount);
+  const gemsList = rankedAsc.slice(0, gemCount);
+  // Guard against overlap in tiny slates (shouldn't happen in tennis)
+  const gemNames = new Set(gemsList.map(p => p.name));
+  const trapsListClean = trapsList.filter(p => !gemNames.has(p.name));
 
-  // Under-owned value helper: val × (1 − simOwn/50), excluding given names
+  // Pivots — trap-opponent-based picks from top 2 traps
+  const oppOf = (player) => player ? withSal.find(p => p.name === player.opponent) : null;
   const topUnderOwnedValue = (excludeNames) => {
     const exclude = new Set(excludeNames.filter(Boolean));
     const ranked = withSal
@@ -2752,72 +2830,62 @@ function computeOverOwnedCaps(rp, ownership, strength, matchCount) {
       .sort((a, b) => b.score - a.score);
     return ranked[0]?.p || null;
   };
-  const oppOf = (player) => player ? withSal.find(p => p.name === player.opponent) : null;
 
-  // Hidden Gem Primary — trap's opp if val ≥ 5.5, else top under-owned value
-  let gem = null;
-  if (trap) {
-    const trapOpp = oppOf(trap);
-    gem = (trapOpp && (trapOpp.val || 0) >= 5.5)
-      ? trapOpp
-      : topUnderOwnedValue([trap.name, orTrap?.name]);
+  const trap1 = trapsListClean[0] || trapsList[0] || null;
+  const trap2 = trapsListClean[1] || trapsList[1] || null;
+
+  let primaryPivot = null;
+  if (trap1) {
+    const opp = oppOf(trap1);
+    primaryPivot = (opp && (opp.val || 0) >= 5.5)
+      ? opp
+      : topUnderOwnedValue([trap1.name, trap2?.name]);
   }
 
-  // Or Pivot Gem (16+ only) — or trap's opp if val ≥ 5.5, else top UO value
-  let orGem = null;
-  if (is16Plus && orTrap) {
-    const orTrapOpp = oppOf(orTrap);
-    if (orTrapOpp && (orTrapOpp.val || 0) >= 5.5 && orTrapOpp.name !== gem?.name) {
-      orGem = orTrapOpp;
+  let orPivot = null;
+  if (is16Plus && trap2) {
+    const opp = oppOf(trap2);
+    if (opp && (opp.val || 0) >= 5.5 && opp.name !== primaryPivot?.name) {
+      orPivot = opp;
     } else {
-      orGem = topUnderOwnedValue([trap?.name, orTrap.name, gem?.name]);
+      orPivot = topUnderOwnedValue([trap1?.name, trap2.name, primaryPivot?.name]);
     }
   }
 
-  // PP Fades — top 3 by ppEdge ≤ -2, excluding primary trap
+  // PP Fades — top 3 by ppEdge ≤ -2, excluding Trap #1
   const ppFades = withSal
     .filter(p => typeof p.ppEdge === 'number' && p.ppEdge <= -2)
-    .filter(p => p.name !== trap?.name)
+    .filter(p => p.name !== trap1?.name)
     .sort((a, b) => (a.ppEdge || 0) - (b.ppEdge || 0))
     .slice(0, 3);
 
-  // Under-Owned Value Top 5 — boost top prospects not already flagged
-  const identified = new Set([
-    trap?.name, orTrap?.name, gem?.name, orGem?.name,
-    ...ppFades.map(p => p.name),
-  ].filter(Boolean));
-  const uoTop5 = withSal
-    .filter(p => !identified.has(p.name))
-    .map(p => ({ p, score: (p.val || 0) * (1 - Math.min(own(p.name) / 50, 1)) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 5)
-    .map(x => x.p);
-
   // ─── RULES ──────────────────────────────────────────────────────────
 
-  // (1) Biggest Trap — max 8% at base
-  if (trap) setMax(trap.name, scaledMax(8));
+  // (1-4) Biggest Traps — graduated max caps: 8, 10, 12, 14 at base
+  const trapCaps = [8, 10, 12, 14];
+  trapsListClean.forEach((p, i) => {
+    if (i < trapCount) setMax(p.name, scaledMax(trapCaps[i]));
+  });
 
-  // (2) Or Trap — max 10% at base (16+ only)
-  if (is16Plus && orTrap) setMax(orTrap.name, scaledMax(10));
+  // (5) Primary Pivot — min = max(25%, simOwn × 2)
+  if (primaryPivot) setMin(primaryPivot.name, scaledMin(25, own(primaryPivot.name), 1.0));
 
-  // (3) Hidden Gem Primary — min = max(25%, simOwn × 2) at base
-  if (gem) setMin(gem.name, scaledMin(25, own(gem.name), 1.0));
+  // (6) Or Pivot — min = max(20%, simOwn × 1.8) [16+ only]
+  if (is16Plus && orPivot) setMin(orPivot.name, scaledMin(20, own(orPivot.name), 0.8));
 
-  // (4) Or Pivot Gem — min = max(20%, simOwn × 1.8) at base (16+ only)
-  if (is16Plus && orGem) setMin(orGem.name, scaledMin(20, own(orGem.name), 0.8));
-
-  // (5) PP Fades — each min = simOwn × 1.5 at base (+50% leverage, no abs floor)
+  // (7) PP Fades — each min = simOwn × 1.5 (+50% leverage)
   for (const pp of ppFades) {
     setMin(pp.name, scaledMin(0, own(pp.name), 0.5));
   }
 
-  // (6) UO Value Top 5 — each min = simOwn × 1.3 at base (+30% leverage)
-  for (const p of uoTop5) {
-    setMin(p.name, scaledMin(0, own(p.name), 0.3));
-  }
+  // (8-11) Hidden Gems — graduated min floors
+  const gemAbsFloors  = [25, 22, 18, 15];
+  const gemLevBoosts  = [1.0, 0.8, 0.5, 0.3];
+  gemsList.forEach((p, i) => {
+    if (i < gemCount) setMin(p.name, scaledMin(gemAbsFloors[i], own(p.name), gemLevBoosts[i]));
+  });
 
-  // Defensive: if a player has both min and max, clamp min to ≤ max
+  // Defensive clamp: ensure min ≤ max for any player with both
   for (const name in caps) {
     if (caps[name].min !== undefined && caps[name].max !== undefined) {
       caps[name].min = Math.min(caps[name].min, caps[name].max);
