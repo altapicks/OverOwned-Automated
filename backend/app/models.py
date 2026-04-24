@@ -86,6 +86,10 @@ class FrontendMatch(BaseModel):
     # archive view so the "moved from X to Y" delta is canonical across all
     # users (live view still uses per-user localStorage baselines).
     opening_odds: FrontendMatchOdds = Field(default_factory=FrontendMatchOdds)
+    # Closing odds — snapshot taken at slate lock_time, frozen thereafter.
+    # Frontend prefers this over `odds` everywhere except the Live Leverage
+    # Tracker (which always shows live odds). Empty for pre-v5.14 data.
+    closing_odds: FrontendMatchOdds = Field(default_factory=FrontendMatchOdds)
     adj_a: float = 0
     adj_b: float = 0
 
