@@ -1,18 +1,18 @@
-"""Slate watcher job — v6.0.
+"""Slate watcher job — v6.1 (SGO).
 
-Runs on a schedule (default 15min). Responsibilities (v6.0 simplified):
-  1. Tick The Odds API for tennis (fills moneylines + games-won lines as
-     fallback for slates that don't have those values from the manual upload)
-  2. Tick Kalshi for tennis (live market probabilities → live Leverage Tracker)
-  3. Snapshot closing_odds for any slate past lock_time
+Runs on a schedule (default 15min). Responsibilities:
 
-DK scraping, slate auto-creation, and slate classification have been
-REMOVED in v6.0. Slates are now created exclusively via the manual upload
-endpoint at POST /api/admin/slates/upload. This eliminates the UTC-rollover
-ghost-slate problem and ambiguity around "which slate is today".
+1. Tick SGO odds for tennis (Pinnacle ML, total sets, set spread,
+   per-player game O/U → matches.odds.sgo + promoted flat keys)
+2. Tick SGO PrizePicks props for tennis (Fantasy Score, Aces, Break Points
+   → prizepicks_lines via deactivate-then-insert)
+3. Tick Kalshi for tennis (live match-winner probabilities → matches.odds.kalshi
+   + kalshi_prob_a/_b — UNCHANGED, the source of truth for win %)
+4. Snapshot closing_odds for any slate past lock_time
 
-The watcher only ATTACHES odds to manually-created matches — it never
-creates slates or matches itself.
+Manual CSV upload at POST /api/admin/slates/upload remains the slate-creation
+path AND the last-resort override layer — sync_slate_contents preserves all
+matches.odds.* market sources on re-upload, only replacing posted_lines.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import get_settings
 from app.db import get_client
-from app.services import kalshi, odds_api
+from app.services import kalshi, sgo_odds, sgo_prizepicks
 from app.services.dk_client import SPORT_CODE_MAP
 
 logger = logging.getLogger(__name__)
@@ -42,14 +42,26 @@ async def run_slate_watcher_once() -> dict:
         sport_name = SPORT_CODE_MAP.get(sport_code, sport_code.lower())
         if sport_name != "tennis":
             continue
-        try:
-            odds_summary = await odds_api.fetch_tick(sport_code)
-            logger.info("The Odds API tick: %s", odds_summary)
-            results["sports"].setdefault(sport_name, {})["odds_api"] = odds_summary
-        except Exception as e:
-            logger.exception("Odds API tick failed: %s", e)
-            results["sports"].setdefault(sport_name, {})["odds_api_error"] = str(e)
 
+        # SGO sportsbook odds (Pinnacle ML, total sets, set spread, per-player games)
+        try:
+            sgo_summary = await sgo_odds.fetch_tick(sport_code)
+            logger.info("SGO odds tick: %s", sgo_summary)
+            results["sports"].setdefault(sport_name, {})["sgo_odds"] = sgo_summary
+        except Exception as e:
+            logger.exception("SGO odds tick failed: %s", e)
+            results["sports"].setdefault(sport_name, {})["sgo_odds_error"] = str(e)
+
+        # SGO PrizePicks props (Fantasy Score, Aces, Break Points)
+        try:
+            pp_summary = await sgo_prizepicks.fetch_tick(sport_code)
+            logger.info("SGO PrizePicks tick: %s", pp_summary)
+            results["sports"].setdefault(sport_name, {})["sgo_prizepicks"] = pp_summary
+        except Exception as e:
+            logger.exception("SGO PrizePicks tick failed: %s", e)
+            results["sports"].setdefault(sport_name, {})["sgo_prizepicks_error"] = str(e)
+
+        # Kalshi win-% (UNCHANGED — source of truth for win probability)
         try:
             kalshi_summary = await kalshi.fetch_tick()
             logger.info("Kalshi tick: %s", kalshi_summary)
@@ -59,9 +71,6 @@ async def run_slate_watcher_once() -> dict:
             results["sports"].setdefault(sport_name, {})["kalshi_error"] = str(e)
 
     # ── Closing odds snapshot ──────────────────────────────────────────
-    # For any slate whose lock_time has passed, copy match.odds → match.closing_odds
-    # (one-time per match). Frontend reads closing_odds everywhere except the
-    # Live Leverage Tracker, which keeps using live odds.
     try:
         snap_summary = await _snapshot_closing_odds()
         logger.info("closing_odds snapshot: %s", snap_summary)
@@ -75,11 +84,7 @@ async def run_slate_watcher_once() -> dict:
 
 async def _snapshot_closing_odds() -> dict:
     """Snapshot matches.odds into matches.closing_odds for every match whose
-    slate has passed lock_time and whose closing_odds is still empty.
-
-    Idempotent: after the first successful run for a slate, closing_odds is
-    non-empty so this is a no-op for those rows on subsequent cycles.
-    """
+    slate has passed lock_time and whose closing_odds is still empty."""
     db = get_client()
     now_iso = _utc_now_iso()
     slates = (
@@ -113,6 +118,7 @@ async def _snapshot_closing_odds() -> dict:
                 continue
             db.table("matches").update({"closing_odds": odds}).eq("id", m["id"]).execute()
             total_snapped += 1
+
     return {"snapshotted": total_snapped, "slates_checked": len(slates)}
 
 
@@ -139,7 +145,7 @@ async def scheduled_watcher():
     scheduler.add_job(_job, trigger=trigger, id="slate_watcher", max_instances=1, coalesce=True)
     scheduler.start()
     logger.info(
-        "Slate watcher started (interval=%d min, sports=%s) — v6.0 (no DK scraping)",
+        "Slate watcher started (interval=%d min, sports=%s) — v6.1 (SGO)",
         s.dk_poll_interval_minutes,
         s.sports_list,
     )
