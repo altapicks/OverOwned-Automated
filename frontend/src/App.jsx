@@ -2809,7 +2809,9 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
       <div className="metric"><div className="metric-label"><Icon name="trophy" size={13}/> Top Value</div><div className="metric-value">{t3v.map((n, i) => { const p = players.find(x => x.name === n); return <div key={i} style={{ fontSize: i === 0 ? '16px' : '13px', color: i === 0 ? undefined : 'var(--text-muted)' }}>{i + 1}. {n} <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{fmt(p?.val, 2)}</span></div>; })}</div></div>
       {/* Pivots box — trap-opponent-based picks. Primary = first trap opp
           with val ≥ 5.5 scanning down the trap list; Or = second qualifying
-          trap opp. Plus PP Fades row. v6.1: enabled on all slate sizes. */}
+          trap opp. Plus PP Fades row. v6.1.1: engine still applies these on
+          ≤15 slates (in OverOwned mode), but display is gated to 16+ to keep
+          the small-slate dashboard uncluttered. */}
       <div className="metric">
         <div className="metric-label"><Icon name="swords" size={13}/> Pivots</div>
         <div className="metric-value" style={{ color: 'var(--green-text)' }}>{gem.primary?.name || '-'}</div>
@@ -2818,12 +2820,12 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
             ? `Trap #${gem.primary.fromTrap} opp · ${fmtPct(gem.primary.wp)} win prob`
             : 'No pivot identified'}
         </div>
-        {gem.pivot && (
+        {(mc || 0) >= 16 && gem.pivot && (
           <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px dashed var(--border)', fontSize: 11, color: 'var(--text-dim)' }}>
             or Pivot: <span style={{ color: 'var(--green-text)' }}>{gem.pivot.name}</span> <span style={{ fontSize: 10, color: 'var(--text-dim)' }}>(Trap #{gem.pivot.fromTrap} opp)</span>
           </div>
         )}
-        {topPpFades.length > 0 && (
+        {(mc || 0) >= 16 && topPpFades.length > 0 && (
           <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-dim)' }}>
             PP Fade: <span style={{ color: 'var(--text-muted)' }}>{topPpFades.join(', ')}</span>
           </div>
@@ -2872,10 +2874,14 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
       const iv = t3v.includes(p.name), is = t3s.includes(p.name);
       // v3.24.1: on 16+ slates gemNames is the top-2 array; ≤15 is single-name array.
       const ig = hiddenGems.includes(p.name);       // Hidden Gem (new: true under-owned value)
-      const ip = topPpFades.includes(p.name);        // PP Fade badge
+      // v6.1.1: Or Pivot + PP Fade badges hidden on ≤15 slates (engine still
+      // applies caps; display suppressed for visual cleanliness). isBig
+      // gates ONLY badge display, not signal selection or exposure rules.
+      const isBig = (mc || 0) >= 16;
+      const ip = isBig && topPpFades.includes(p.name);        // PP Fade badge (display-only gate)
       const it = traps.includes(p.name);             // Biggest Trap (may be #1-4)
       const iPivot = gem.primary?.name === p.name;   // Primary Pivot (trap opp or value)
-      const iOrPivot = gem.pivot?.name === p.name;   // Or Pivot (v6.1: all slate sizes)
+      const iOrPivot = isBig && gem.pivot?.name === p.name;   // Or Pivot (display-only gate)
       const badges = [];
       if (iv) badges.push({ icon: 'trophy', label: 'Top 3 Value', color: 'var(--primary)' });
       if (is) badges.push({ icon: 'target',  label: 'Top 3 Straight Sets', color: 'var(--primary)' });
