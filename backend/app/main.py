@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app.config import get_settings
-from app.routes import health, players, prizepicks, slates, tracker
+from app.routes import admin_slate, health, players, prizepicks, slates, tracker
 
 
 def _configure_logging(level: str):
@@ -145,6 +145,7 @@ def create_app() -> FastAPI:
     app.include_router(players.router)
     app.include_router(prizepicks.router)
     app.include_router(tracker.router)
+    app.include_router(admin_slate.router)
 
     return app
 
