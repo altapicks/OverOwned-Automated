@@ -1,8 +1,7 @@
-"""Manual slate ingestion service — v6.0.
+"""Manual slate ingestion service — v6.0b.
 
-Replaces the DK-scraping ingest. The operator (admin) uploads a single
-CSV per slate that contains everything the app needs:
-
+Replaces the DK-scraping ingest. The operator (admin) uploads a single CSV
+per slate that contains everything the app needs:
   - Player identity (name, opponent for match pairing)
   - DK player ID + salary (for lineup builder + DK upload CSV export)
   - sim_own (per-player projected field ownership, 0-100)
@@ -10,25 +9,27 @@ CSV per slate that contains everything the app needs:
   - Stat-prop lines: aces, dfs, breaks, gw, gl, sw, sl (Underdog-style)
   - PrizePicks Fantasy Score line per player
 
-Idempotent: re-uploading the same {sport, slate_date} updates the
-existing slate IN PLACE — keeps the slate_id stable so attached
-PrizePicks lines and contest_ownership rows survive corrections.
+v6.0b: sync_slate_contents is non-destructive to live market data.
+Re-uploads preserve matches.odds.kalshi, matches.odds.the_odds_api, and
+matches.closing_odds. Only columns owned by the CSV (player IDs, tournament,
+surface, best_of, start_time, status, posted_lines) are touched. Orphaned
+matches/slate_players (present before but missing from the new CSV) are
+deleted, and the counts are surfaced in the result so the operator notices
+if they uploaded the wrong file.
 
-Kalshi continues to attach live odds to the manual-created matches on
-its 15-min cycle. Odds API continues as a fallback for moneylines and
-games-won lines if those columns are empty in the CSV.
+Schema notes (verified against current DB):
+  - slate_players has NO surrogate `id` column. Primary key is composite
+    (slate_id, player_id, roster_position). Updates and deletes use the
+    composite filter, not a single id.
+  - matches DOES have an `id` column. Updates/deletes use it.
 
-Inputs: parsed CSV rows + slate header (tournament, surface, lock_time,
-sport, slate_date).
+Kalshi continues to attach live odds on its 15-min cycle. Odds API
+continues as a fallback for moneylines and games-won lines.
 
-Outputs: a result object with:
-  - slate_id (created or updated)
-  - counts of matches / players / lines processed
-  - warnings: unmatched names, unpaired players, schema issues
-
-The route handler in app/routes/admin_slate.py wraps this with HTTP +
-auth + multipart parsing.
+The route handler in app/routes/admin_slate.py wraps this with HTTP + auth
++ multipart parsing.
 """
+
 from __future__ import annotations
 
 import csv
@@ -95,7 +96,6 @@ def parse_csv(text: str) -> tuple[list[dict], list[str]]:
         return [], errors
 
     for i, raw in enumerate(reader, start=2):  # +2 because header is row 1
-        # Skip blank lines (all values empty / whitespace)
         if not any((v or "").strip() for v in raw.values()):
             continue
         normalized = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
@@ -132,7 +132,7 @@ def _normalize_row(raw: dict, row_num: int) -> dict:
         "salary": salary,
     }
 
-    # sim_own: optional, 0-100, default 0 (per spec — no Monte Carlo fallback)
+    # sim_own: 0-100, default 0 (no Monte Carlo fallback per spec)
     sim_raw = raw.get("sim_own", "")
     if sim_raw == "":
         out["sim_own"] = 0.0
@@ -145,10 +145,8 @@ def _normalize_row(raw: dict, row_num: int) -> dict:
             raise ValueError(f"sim_own must be 0-100 for {name}, got {sim_val}")
         out["sim_own"] = sim_val
 
-    # start_time: optional, ISO 8601 or "9:00 AM"-like (parsed leniently downstream)
     out["start_time"] = raw.get("start_time", "") or None
 
-    # Stat prop lines: optional. Each is a number or empty.
     for csv_key in STAT_LINE_MAP:
         raw_val = raw.get(csv_key, "")
         if raw_val == "":
@@ -159,7 +157,6 @@ def _normalize_row(raw: dict, row_num: int) -> dict:
             except ValueError:
                 raise ValueError(f"{csv_key} must be a number for {name}, got '{raw_val}'")
 
-    # PrizePicks Fantasy Score line — separate table
     pp_fs_raw = raw.get("pp_fs_line", "")
     if pp_fs_raw == "":
         out["pp_fs_line"] = None
@@ -178,22 +175,15 @@ def _normalize_row(raw: dict, row_num: int) -> dict:
 
 
 def resolve_names(rows: list[dict]) -> tuple[dict[str, str], list[str]]:
-    """For each unique name in rows + opponents, find the canonical_id.
-
-    Returns (name → canonical_id map, list of unresolved names).
-    """
+    """For each unique name in rows + opponents, find the canonical_id."""
     db = get_client()
     all_names = set()
     for r in rows:
         all_names.add(r["name"])
         all_names.add(r["opponent"])
-
     if not all_names:
         return {}, []
 
-    # Pull all candidate players. For ~thousands of rows in a typical
-    # season-spanning players table this is fine; if it grows we can
-    # scope by sport.
     candidates = (
         db.table("players")
         .select("canonical_id, display_name, aliases")
@@ -202,9 +192,6 @@ def resolve_names(rows: list[dict]) -> tuple[dict[str, str], list[str]]:
         or []
     )
 
-    # Build a normalized lookup: lowercase + accent-stripped → canonical_id.
-    # Aliases get the same treatment so common alt-names work without
-    # editing display_name.
     def _norm(s: str) -> str:
         return _strip_accents(s).lower().strip()
 
@@ -226,9 +213,6 @@ def resolve_names(rows: list[dict]) -> tuple[dict[str, str], list[str]]:
 
 
 def _strip_accents(s: str) -> str:
-    """Best-effort accent stripping — handles common Latin diacritics
-    without pulling in unicodedata's full Unicode normalization (which
-    behaves identically here for our use case)."""
     import unicodedata
     return "".join(
         c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)
@@ -243,14 +227,7 @@ def _strip_accents(s: str) -> str:
 def pair_matches(
     rows: list[dict], resolved: dict[str, str]
 ) -> tuple[list[dict], list[str]]:
-    """Pair player rows into matches via the opponent column.
-
-    A valid match has both sides present in the CSV with reciprocal opponent
-    references (Paul→Etcheverry AND Etcheverry→Paul). Asymmetric or missing
-    pairings produce warnings; only valid pairs become matches.
-
-    Returns (list of match dicts, list of warnings).
-    """
+    """Pair player rows into matches via the opponent column."""
     warnings: list[str] = []
     by_name = {r["name"]: r for r in rows}
 
@@ -263,12 +240,10 @@ def pair_matches(
             warnings.append(f"{a_name} listed as their own opponent")
             continue
         if a_name not in resolved or b_name not in resolved:
-            # Already reported in unresolved list; skip
             continue
         if b_name not in by_name:
             warnings.append(f"{a_name} → opponent '{b_name}' has no row in CSV")
             continue
-        # Reciprocity check
         if by_name[b_name]["opponent"] != a_name:
             warnings.append(
                 f"Asymmetric: {a_name}→{b_name} but {b_name}→"
@@ -281,7 +256,6 @@ def pair_matches(
             continue
         seen_pairs.add(pair_key)
 
-        # Pick "a" deterministically: alphabetically lower canonical_id
         a_cid = resolved[a_name]
         b_cid = resolved[b_name]
         if a_cid > b_cid:
@@ -300,7 +274,7 @@ def pair_matches(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# DB write — upsert slate + matches + slate_players + lines
+# DB write — slate upsert
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -322,9 +296,8 @@ def upsert_slate(
 ) -> str:
     """Find-or-create the slate row for (sport, slate_date). Returns slate_id.
 
-    Re-upload semantics: same (sport, slate_date) → updates the existing
-    row in place (preserves slate_id so attached PP lines + contest
-    ownership survive). New (sport, slate_date) → creates a new row.
+    Explicit-allowlist update: only touches slate_label and lock_time.
+    Preserves first_seen_at, id, dk_draft_group_id, and any future columns.
     """
     db = get_client()
     existing = (
@@ -339,7 +312,17 @@ def upsert_slate(
         .data
     )
 
-    payload = {
+    if existing:
+        slate_id = existing[0]["id"]
+        update_payload = {
+            "slate_label": slate_label or tournament,
+            "lock_time": lock_time,
+        }
+        db.table("slates").update(update_payload).eq("id", slate_id).execute()
+        logger.info("Updated existing slate %s for %s %s", slate_id, sport, slate_date)
+        return slate_id
+
+    insert_payload = {
         "sport": sport,
         "slate_date": slate_date,
         "slate_label": slate_label or tournament,
@@ -347,26 +330,75 @@ def upsert_slate(
         "salary_cap": 50000,
         "lock_time": lock_time,
         "status": "active",
-        "last_synced_at": "now()",
+        "dk_draft_group_id": _synthetic_draft_group_id(),
     }
-
-    if existing:
-        slate_id = existing[0]["id"]
-        # Drop the now() literal — supabase-py needs proper ISO; let DB default handle it
-        payload.pop("last_synced_at", None)
-        db.table("slates").update(payload).eq("id", slate_id).execute()
-        logger.info("Updated existing slate %s for %s %s", slate_id, sport, slate_date)
-        return slate_id
-
-    # New slate — also set dk_draft_group_id (synthetic) and first_seen_at
-    payload["dk_draft_group_id"] = _synthetic_draft_group_id()
-    inserted = db.table("slates").insert(payload).execute().data
+    inserted = db.table("slates").insert(insert_payload).execute().data
     slate_id = inserted[0]["id"]
     logger.info("Created new manual slate %s for %s %s", slate_id, sport, slate_date)
     return slate_id
 
 
-def replace_slate_contents(
+# ─────────────────────────────────────────────────────────────────────
+# DB write — sync_slate_contents (Option A: read-merge-write)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _merge_odds_preserving_market_data(
+    existing_odds: Optional[dict], new_posted_lines: dict
+) -> dict:
+    """Shallow merge: replace posted_lines wholesale, preserve all other keys.
+
+    existing_odds may contain kalshi, the_odds_api, moneyline, etc.
+    new_posted_lines is what this CSV upload produced.
+
+    Semantics:
+      - New CSV produced posted_lines → replace block wholesale
+      - New CSV produced no posted_lines BUT old odds had one → drop the block
+        (CSV is authoritative for whether posted_lines exist)
+      - All other top-level keys → untouched
+    """
+    merged = dict(existing_odds or {})
+    if new_posted_lines:
+        merged["posted_lines"] = new_posted_lines
+    elif "posted_lines" in merged:
+        del merged["posted_lines"]
+    return merged
+
+
+def _build_match_payload_from_pair(
+    m: dict, tournament: str, surface: Optional[str]
+) -> tuple[dict, dict]:
+    """Build the CSV-owned columns for a match + its posted_lines block."""
+    a_row = m["player_a_row"]
+    b_row = m["player_b_row"]
+    start_time = a_row.get("start_time") or b_row.get("start_time")
+
+    posted_a: dict[str, float] = {}
+    posted_b: dict[str, float] = {}
+    for csv_key, posted_key in STAT_LINE_MAP.items():
+        if a_row.get(csv_key) is not None:
+            posted_a[posted_key] = a_row[csv_key]
+        if b_row.get(csv_key) is not None:
+            posted_b[posted_key] = b_row[csv_key]
+    posted_lines: dict = {}
+    if posted_a:
+        posted_lines["a"] = posted_a
+    if posted_b:
+        posted_lines["b"] = posted_b
+
+    csv_cols = {
+        "player_a_id": m["player_a_id"],
+        "player_b_id": m["player_b_id"],
+        "tournament": tournament,
+        "surface": surface,
+        "best_of": 3,
+        "start_time": start_time,
+        "status": "scheduled",
+    }
+    return csv_cols, posted_lines
+
+
+def sync_slate_contents(
     *,
     slate_id: str,
     matches: list[dict],
@@ -374,60 +406,86 @@ def replace_slate_contents(
     surface: Optional[str],
     lock_time: Optional[str],
 ) -> dict:
-    """Wipe and re-create matches, slate_players, and stat lines for this slate.
+    """Non-destructively sync matches + slate_players for this slate.
 
-    Idempotent: produces the same DB state regardless of prior contents.
-    Preserves anything keyed by slate_id but stored in OTHER tables that
-    we don't manage here (contest_ownership, prizepicks_lines for FS — see
-    upsert_pp_fs_lines for those).
+    Read-merge-write — preserves live market data on re-upload:
+      - matches.odds.kalshi/the_odds_api: UNTOUCHED
+      - matches.odds.posted_lines:        REPLACED WHOLESALE from CSV
+      - matches.closing_odds/opening_odds: UNTOUCHED (separate columns)
+      - CSV-owned cols on matches:        refreshed from CSV
+
+    slate_players composite key: (slate_id, player_id, roster_position).
+    Tennis classic = 'P'. Future showdown work would key by all three.
+
+    Orphans (in DB but not in new CSV) are DELETED. Counts surfaced in
+    the result so the operator notices if the wrong CSV was uploaded.
     """
     db = get_client()
 
-    # ── 1. Wipe existing matches and slate_players for this slate ────
-    # FK from slate_players(match_id) to matches(id) is ON DELETE not set, so
-    # delete order matters: slate_players first, then matches.
-    db.table("slate_players").delete().eq("slate_id", slate_id).execute()
-    db.table("matches").delete().eq("slate_id", slate_id).execute()
+    # ── 1. Read existing matches + their odds (for the merge) ───────
+    existing_matches = (
+        db.table("matches")
+        .select("id, player_a_id, player_b_id, odds")
+        .eq("slate_id", slate_id)
+        .execute()
+        .data
+        or []
+    )
+    existing_by_pair: dict[frozenset, dict] = {
+        frozenset([m["player_a_id"], m["player_b_id"]]): m
+        for m in existing_matches
+    }
 
-    # ── 2. Re-insert matches ─────────────────────────────────────────
-    match_rows = []
+    # ── 2. Partition new matches into UPDATEs vs INSERTs ────────────
+    new_pairs: set[frozenset] = set()
+    to_insert: list[dict] = []
+    updates_done = 0
+
     for m in matches:
-        a_row = m["player_a_row"]
-        b_row = m["player_b_row"]
-        # Pick start_time: prefer player A's, fall back to B's, then null.
-        start_time = a_row.get("start_time") or b_row.get("start_time")
-        # Build posted_lines — nest stat lines under "a" and "b"
-        posted_a: dict[str, float] = {}
-        posted_b: dict[str, float] = {}
-        for csv_key, posted_key in STAT_LINE_MAP.items():
-            if a_row.get(csv_key) is not None:
-                posted_a[posted_key] = a_row[csv_key]
-            if b_row.get(csv_key) is not None:
-                posted_b[posted_key] = b_row[csv_key]
-        posted_lines = {}
-        if posted_a:
-            posted_lines["a"] = posted_a
-        if posted_b:
-            posted_lines["b"] = posted_b
-        odds_payload = {"posted_lines": posted_lines} if posted_lines else {}
+        pair_key = frozenset([m["player_a_id"], m["player_b_id"]])
+        new_pairs.add(pair_key)
+        csv_cols, posted_lines = _build_match_payload_from_pair(m, tournament, surface)
 
-        match_rows.append(
-            {
+        existing = existing_by_pair.get(pair_key)
+        if existing:
+            merged_odds = _merge_odds_preserving_market_data(
+                existing.get("odds"), posted_lines
+            )
+            update_payload = {**csv_cols, "odds": merged_odds}
+            db.table("matches").update(update_payload).eq("id", existing["id"]).execute()
+            updates_done += 1
+        else:
+            insert_payload = {
                 "slate_id": slate_id,
-                "player_a_id": m["player_a_id"],
-                "player_b_id": m["player_b_id"],
-                "tournament": tournament,
-                "surface": surface,
-                "best_of": 3,
-                "start_time": start_time,
-                "status": "scheduled",
-                "odds": odds_payload,
+                **csv_cols,
+                "odds": {"posted_lines": posted_lines} if posted_lines else {},
             }
-        )
-    if match_rows:
-        db.table("matches").insert(match_rows).execute()
+            to_insert.append(insert_payload)
 
-    # Pull back inserted matches to get their generated IDs (for slate_players.match_id)
+    if to_insert:
+        db.table("matches").insert(to_insert).execute()
+
+    # ── 3. Delete orphaned matches ──────────────────────────────────
+    orphan_match_ids = [
+        existing_by_pair[pk]["id"]
+        for pk in existing_by_pair
+        if pk not in new_pairs
+    ]
+    matches_orphaned = len(orphan_match_ids)
+    if orphan_match_ids:
+        logger.warning(
+            "Orphan matches on slate %s: %d match(es) present in DB but "
+            "missing from new CSV — deleting. If unexpected, verify the "
+            "correct CSV was uploaded.",
+            slate_id, matches_orphaned,
+        )
+        # Clear FK refs from slate_players first (match_id references match)
+        db.table("slate_players").update({"match_id": None}).in_(
+            "match_id", orphan_match_ids
+        ).execute()
+        db.table("matches").delete().in_("id", orphan_match_ids).execute()
+
+    # ── 4. Re-fetch matches for fresh IDs (slate_players need match_id) ──
     fresh_matches = (
         db.table("matches")
         .select("id, player_a_id, player_b_id")
@@ -436,12 +494,27 @@ def replace_slate_contents(
         .data
         or []
     )
-    match_id_by_pair = {
-        frozenset([m["player_a_id"], m["player_b_id"]]): m["id"] for m in fresh_matches
+    match_id_by_pair: dict[frozenset, str] = {
+        frozenset([m["player_a_id"], m["player_b_id"]]): m["id"]
+        for m in fresh_matches
     }
 
-    # ── 3. Re-insert slate_players ───────────────────────────────────
-    sp_rows = []
+    # ── 5. Read existing slate_players (composite-PK aware) ─────────
+    existing_sp = (
+        db.table("slate_players")
+        .select("player_id, roster_position")
+        .eq("slate_id", slate_id)
+        .execute()
+        .data
+        or []
+    )
+    existing_sp_player_ids: set[str] = {sp["player_id"] for sp in existing_sp}
+
+    # ── 6. Sync slate_players: UPDATE existing, INSERT new ──────────
+    new_player_ids: set[str] = set()
+    sp_to_insert: list[dict] = []
+    sp_updates_done = 0
+
     for m in matches:
         match_id = match_id_by_pair.get(
             frozenset([m["player_a_id"], m["player_b_id"]])
@@ -450,50 +523,78 @@ def replace_slate_contents(
             (m["player_a_row"], m["player_a_id"]),
             (m["player_b_row"], m["player_b_id"]),
         ]:
-            sp_rows.append(
-                {
-                    "slate_id": slate_id,
-                    "player_id": cid,
-                    "dk_player_id": side_row["dk_id"],
-                    "dk_player_id_override": side_row["dk_id"],  # bind to manual ID
-                    "dk_display_name": side_row["name"],
-                    "salary": side_row["salary"],
-                    "avg_ppg": 0,
-                    "roster_position": "P",
-                    "match_id": match_id,
-                    "ss_pool_own": side_row["sim_own"],
-                }
-            )
-    if sp_rows:
-        db.table("slate_players").insert(sp_rows).execute()
+            new_player_ids.add(cid)
+            payload_cols = {
+                "dk_player_id": side_row["dk_id"],
+                "dk_player_id_override": side_row["dk_id"],
+                "dk_display_name": side_row["name"],
+                "salary": side_row["salary"],
+                "avg_ppg": 0,
+                "match_id": match_id,
+                "ss_pool_own": side_row["sim_own"],
+            }
+            if cid in existing_sp_player_ids:
+                # UPDATE via composite filter
+                db.table("slate_players").update(payload_cols).eq(
+                    "slate_id", slate_id
+                ).eq("player_id", cid).eq("roster_position", "P").execute()
+                sp_updates_done += 1
+            else:
+                # INSERT — include the PK columns
+                sp_to_insert.append(
+                    {
+                        "slate_id": slate_id,
+                        "player_id": cid,
+                        "roster_position": "P",
+                        **payload_cols,
+                    }
+                )
+
+    if sp_to_insert:
+        db.table("slate_players").insert(sp_to_insert).execute()
+
+    # ── 7. Delete orphaned slate_players ────────────────────────────
+    orphan_player_ids = [
+        pid for pid in existing_sp_player_ids if pid not in new_player_ids
+    ]
+    sp_orphaned = len(orphan_player_ids)
+    if orphan_player_ids:
+        logger.warning(
+            "Orphan slate_players on slate %s: %d player(s) missing from "
+            "new CSV — deleting.",
+            slate_id, sp_orphaned,
+        )
+        db.table("slate_players").delete().eq("slate_id", slate_id).in_(
+            "player_id", orphan_player_ids
+        ).execute()
 
     return {
-        "matches_inserted": len(match_rows),
-        "slate_players_inserted": len(sp_rows),
+        "matches_total": len(matches),
+        "matches_updated": updates_done,
+        "matches_inserted": len(to_insert),
+        "matches_orphaned_and_deleted": matches_orphaned,
+        "slate_players_total": len(new_player_ids),
+        "slate_players_updated": sp_updates_done,
+        "slate_players_inserted": len(sp_to_insert),
+        "slate_players_orphaned_and_deleted": sp_orphaned,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PrizePicks FS lines — deactivate-then-upsert pattern
+# ─────────────────────────────────────────────────────────────────────
 
 
 def upsert_pp_fs_lines(
     *, slate_id: str, rows: list[dict], resolved: dict[str, str]
 ) -> int:
-    """Upsert prizepicks_lines rows for any row with a non-null pp_fs_line.
-
-    Stat type is always 'Fantasy Score'. The unique index on
-    (slate_id, raw_player_name, stat_type) ensures re-uploads update in
-    place rather than duplicating.
-
-    Re-upload behavior: if the new CSV omits a player who had an FS line
-    previously, that line is deactivated (is_active=false) — keeps the
-    history but stops it from showing in the active list.
-    """
+    """Upsert prizepicks_lines rows for any row with a non-null pp_fs_line."""
     db = get_client()
 
-    # Soft-deactivate any existing FS lines for this slate
     db.table("prizepicks_lines").update({"is_active": False}).eq(
         "slate_id", slate_id
     ).eq("stat_type", "Fantasy Score").execute()
 
-    # Insert/upsert active lines from this upload
     pp_rows = []
     for r in rows:
         if r.get("pp_fs_line") is None:
@@ -513,11 +614,98 @@ def upsert_pp_fs_lines(
             }
         )
     if pp_rows:
-        # on_conflict matches the unique index (slate_id, raw_player_name, stat_type)
         db.table("prizepicks_lines").upsert(
             pp_rows, on_conflict="slate_id,raw_player_name,stat_type"
         ).execute()
     return len(pp_rows)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Dry-run orphan preview (read-only)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _preview_orphans(
+    *, sport: str, slate_date: str, new_matches: list[dict]
+) -> dict:
+    """Read-only peek: if an active slate already exists for (sport, slate_date),
+    how many matches/slate_players would be orphaned by this upload?
+
+    Always returns a dict — never None, never raises. Used by dry_run.
+    """
+    db = get_client()
+    try:
+        existing = (
+            db.table("slates")
+            .select("id")
+            .eq("sport", sport)
+            .eq("slate_date", slate_date)
+            .eq("status", "active")
+            .order("first_seen_at", desc=True)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        logger.warning("Orphan preview slate-lookup failed: %s", e)
+        return {
+            "orphan_preview_matches": 0,
+            "orphan_preview_slate_players": 0,
+            "orphan_preview_available": False,
+        }
+
+    if not existing:
+        return {
+            "orphan_preview_matches": 0,
+            "orphan_preview_slate_players": 0,
+            "orphan_preview_available": True,
+        }
+
+    slate_id = existing[0]["id"]
+    new_pairs: set[frozenset] = {
+        frozenset([m["player_a_id"], m["player_b_id"]]) for m in new_matches
+    }
+    new_player_ids: set[str] = (
+        {m["player_a_id"] for m in new_matches}
+        | {m["player_b_id"] for m in new_matches}
+    )
+
+    try:
+        existing_matches = (
+            db.table("matches")
+            .select("player_a_id, player_b_id")
+            .eq("slate_id", slate_id)
+            .execute()
+            .data
+            or []
+        )
+        existing_sp = (
+            db.table("slate_players")
+            .select("player_id")
+            .eq("slate_id", slate_id)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        logger.warning("Orphan preview content-lookup failed: %s", e)
+        return {
+            "orphan_preview_matches": 0,
+            "orphan_preview_slate_players": 0,
+            "orphan_preview_available": False,
+        }
+
+    existing_pairs = {
+        frozenset([m["player_a_id"], m["player_b_id"]]) for m in existing_matches
+    }
+    existing_player_ids = {sp["player_id"] for sp in existing_sp}
+
+    return {
+        "orphan_preview_matches": len(existing_pairs - new_pairs),
+        "orphan_preview_slate_players": len(existing_player_ids - new_player_ids),
+        "orphan_preview_available": True,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -535,11 +723,7 @@ def ingest_manual_slate(
     lock_time: Optional[str],
     dry_run: bool = False,
 ) -> dict:
-    """End-to-end manual slate ingestion.
-
-    With dry_run=True returns parse + validation results without writing
-    anything — used to power the Admin tab's preview screen.
-    """
+    """End-to-end manual slate ingestion."""
     result: dict = {
         "ok": False,
         "warnings": [],
@@ -548,7 +732,6 @@ def ingest_manual_slate(
         "summary": {},
     }
 
-    # ── 1. Parse + validate CSV ──────────────────────────────────────
     rows, parse_errs = parse_csv(csv_text)
     if parse_errs:
         result["errors"].extend(parse_errs)
@@ -557,7 +740,6 @@ def ingest_manual_slate(
         result["errors"].append("CSV had no data rows")
         return result
 
-    # ── 2. Resolve names ─────────────────────────────────────────────
     resolved, unresolved = resolve_names(rows)
     if unresolved:
         result["unmatched_names"] = unresolved
@@ -565,11 +747,9 @@ def ingest_manual_slate(
             f"{len(unresolved)} unmatched name(s) — players must exist in the players table"
         )
 
-    # ── 3. Pair matches ──────────────────────────────────────────────
     matches, pair_warnings = pair_matches(rows, resolved)
     result["warnings"].extend(pair_warnings)
 
-    # ── 4. Sanity counts ─────────────────────────────────────────────
     paired_players = {m["player_a_id"] for m in matches} | {
         m["player_b_id"] for m in matches
     }
@@ -582,7 +762,6 @@ def ingest_manual_slate(
         "sim_own_total": round(sum(r["sim_own"] for r in rows), 1),
     }
 
-    # If unmatched names exist OR no matches paired, surface as preview-only
     if unresolved:
         result["errors"].append(
             "Cannot publish: unmatched names must be resolved first. "
@@ -594,10 +773,14 @@ def ingest_manual_slate(
         return result
 
     if dry_run:
+        result["summary"].update(
+            _preview_orphans(
+                sport=sport, slate_date=slate_date, new_matches=matches
+            )
+        )
         result["ok"] = True
         return result
 
-    # ── 5. Write to DB ───────────────────────────────────────────────
     slate_id = upsert_slate(
         sport=sport,
         slate_date=slate_date,
@@ -605,7 +788,7 @@ def ingest_manual_slate(
         surface=surface,
         lock_time=lock_time,
     )
-    write_summary = replace_slate_contents(
+    write_summary = sync_slate_contents(
         slate_id=slate_id,
         matches=matches,
         tournament=tournament,
