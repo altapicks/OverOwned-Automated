@@ -198,8 +198,20 @@ def resolve_names(rows: list[dict]) -> tuple[dict[str, str], list[str]]:
     lookup: dict[str, str] = {}
     for c in candidates:
         lookup[_norm(c["display_name"])] = c["canonical_id"]
-        for alias in c.get("aliases") or []:
-            lookup[_norm(alias)] = c["canonical_id"]
+        # v6.0c: aliases is stored as jsonb. Existing data uses an OBJECT
+        # keyed by source (e.g. {"dk": "Tommy Paul"}), so iterating over the
+        # raw value yields KEYS ("dk") not VALUES — which made the alias
+        # lookup dead code. Handle both shapes for forward/backward compat.
+        aliases_raw = c.get("aliases") or {}
+        if isinstance(aliases_raw, dict):
+            alias_values = aliases_raw.values()
+        elif isinstance(aliases_raw, list):
+            alias_values = aliases_raw
+        else:
+            alias_values = []
+        for alias in alias_values:
+            if isinstance(alias, str) and alias:
+                lookup[_norm(alias)] = c["canonical_id"]
 
     resolved: dict[str, str] = {}
     unresolved: list[str] = []
@@ -588,7 +600,16 @@ def sync_slate_contents(
 def upsert_pp_fs_lines(
     *, slate_id: str, rows: list[dict], resolved: dict[str, str]
 ) -> int:
-    """Upsert prizepicks_lines rows for any row with a non-null pp_fs_line."""
+    """Insert prizepicks_lines rows for any row with a non-null pp_fs_line.
+
+    v6.0c: previously used .upsert(on_conflict=...) but the matching unique
+    index is PARTIAL (WHERE is_active = true) and PostgREST rejects on_conflict
+    for partial indexes. We deactivate prior active rows first (so no conflict
+    can occur on the partial-active uniqueness), then plain-insert the new set.
+
+    Inactive rows accumulate in the DB but are filtered out by every read path
+    (the partial index keeps only the latest set queryable as 'active').
+    """
     db = get_client()
 
     db.table("prizepicks_lines").update({"is_active": False}).eq(
@@ -614,9 +635,7 @@ def upsert_pp_fs_lines(
             }
         )
     if pp_rows:
-        db.table("prizepicks_lines").upsert(
-            pp_rows, on_conflict="slate_id,raw_player_name,stat_type"
-        ).execute()
+        db.table("prizepicks_lines").insert(pp_rows).execute()
     return len(pp_rows)
 
 
