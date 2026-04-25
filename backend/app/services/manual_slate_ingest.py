@@ -609,19 +609,38 @@ def upsert_pp_fs_lines(
 
     Inactive rows accumulate in the DB but are filtered out by every read path
     (the partial index keeps only the latest set queryable as 'active').
+
+    v6.0e: explicit observability — supabase-py has been silently completing
+    .execute() without writing rows. Instead of trusting len(pp_rows) as the
+    written count, capture the actual response and verify the row count matches.
+    Loud failure with full context if anything is off.
     """
     db = get_client()
 
-    db.table("prizepicks_lines").update({"is_active": False}).eq(
+    deactivate_resp = db.table("prizepicks_lines").update({"is_active": False}).eq(
         "slate_id", slate_id
     ).eq("stat_type", "Fantasy Score").execute()
+    logger.info(
+        "PP FS deactivate: slate=%s rows_affected=%s",
+        slate_id,
+        len(getattr(deactivate_resp, "data", []) or []),
+    )
 
     pp_rows = []
+    skipped_no_fs = 0
+    skipped_unresolved = 0
     for r in rows:
         if r.get("pp_fs_line") is None:
+            skipped_no_fs += 1
             continue
         cid = resolved.get(r["name"])
         if not cid:
+            skipped_unresolved += 1
+            logger.warning(
+                "PP FS skipped row: name=%r had pp_fs_line but no resolved cid. "
+                "resolved keys sample: %r",
+                r.get("name"), list(resolved.keys())[:5],
+            )
             continue
         pp_rows.append(
             {
@@ -634,9 +653,53 @@ def upsert_pp_fs_lines(
                 "is_active": True,
             }
         )
-    if pp_rows:
-        db.table("prizepicks_lines").insert(pp_rows).execute()
-    return len(pp_rows)
+
+    logger.info(
+        "PP FS insert prep: slate=%s pp_rows_to_insert=%d skipped_no_fs=%d "
+        "skipped_unresolved=%d total_input_rows=%d",
+        slate_id, len(pp_rows), skipped_no_fs, skipped_unresolved, len(rows),
+    )
+
+    if not pp_rows:
+        logger.warning(
+            "PP FS insert skipped: pp_rows is empty (slate=%s, input rows=%d)",
+            slate_id, len(rows),
+        )
+        return 0
+
+    # Log a sample row for debugging shape issues
+    logger.info("PP FS insert sample payload[0]: %r", pp_rows[0])
+
+    try:
+        insert_resp = db.table("prizepicks_lines").insert(pp_rows).execute()
+    except Exception as exc:
+        logger.exception(
+            "PP FS insert raised exception: slate=%s pp_rows=%d err=%r",
+            slate_id, len(pp_rows), exc,
+        )
+        raise
+
+    written_data = getattr(insert_resp, "data", None) or []
+    written_count = len(written_data)
+
+    logger.info(
+        "PP FS insert result: slate=%s tried=%d written=%d response_type=%s",
+        slate_id, len(pp_rows), written_count, type(insert_resp).__name__,
+    )
+
+    if written_count != len(pp_rows):
+        logger.error(
+            "PP FS insert count mismatch! tried=%d written=%d. "
+            "Full response: %r",
+            len(pp_rows), written_count, insert_resp,
+        )
+        raise RuntimeError(
+            f"PP FS lines insert mismatch: tried {len(pp_rows)} rows, "
+            f"wrote {written_count}. Slate {slate_id}. "
+            f"Check Railway logs for full response."
+        )
+
+    return written_count
 
 
 # ─────────────────────────────────────────────────────────────────────
