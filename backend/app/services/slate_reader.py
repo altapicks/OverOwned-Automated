@@ -21,7 +21,7 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 
-def _build_opening_odds_model(raw: Optional[dict]) -> FrontendMatchOdds:
+def _build_opening_odds_model(raw: Optional[dict]) -> Optional[FrontendMatchOdds]:
     """Flatten stored opening_odds (source-keyed) into FrontendMatchOdds.
 
     Stored shape:
@@ -31,9 +31,16 @@ def _build_opening_odds_model(raw: Optional[dict]) -> FrontendMatchOdds:
     Flat keys used by engine.js/frontend:
       - kalshi_prob_a / kalshi_prob_b   from kalshi.implied_prob_*
       - ml_a / ml_b                     from the_odds_api.ml_*
+
+    v6.0d: Returns None when no real data is available — previously returned
+    a default FrontendMatchOdds() for empty/null raw, which Pydantic
+    serialized as {ml_a: null, ..., kalshi_prob_a: null, ...} (26 null keys).
+    The frontend's Object.keys().length > 0 check then incorrectly chose
+    closing_odds over live odds for slates that hadn't locked yet, displaying
+    "Not Live" on every match and killing posted_lines override.
     """
     if not raw or not isinstance(raw, dict):
-        return FrontendMatchOdds()
+        return None
     flat: dict = {}
     kalshi = raw.get("kalshi") or {}
     if isinstance(kalshi, dict):
@@ -46,6 +53,8 @@ def _build_opening_odds_model(raw: Optional[dict]) -> FrontendMatchOdds:
         for k in ("ml_a", "ml_b", "gw_a_line", "gw_a_over", "gw_b_line", "gw_b_over"):
             if odds_api.get(k) is not None:
                 flat[k] = odds_api[k]
+    if not flat:
+        return None
     return FrontendMatchOdds(**flat)
 
 
