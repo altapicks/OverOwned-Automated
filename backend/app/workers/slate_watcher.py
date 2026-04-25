@@ -11,9 +11,14 @@ Each job uses max_instances=1 + coalesce=True so a slow tick can't stack.
 The whole scheduler is wrapped in an async context manager so FastAPI's
 lifespan can start/stop it cleanly.
 
-The first tick is fired with `asyncio.create_task(...)` BEFORE we yield,
-so the HTTP server comes up immediately and Railway's healthcheck passes
-even on a cold deploy where the first SGO/Kalshi calls take 20-40s.
+Boot sequence is non-blocking:
+  1. Add jobs (NO next_run_time=now — that would block startup)
+  2. scheduler.start() (registers the timers, doesn't run anything)
+  3. asyncio.create_task(_tick_job()) — fire-and-forget warmup
+  4. yield → FastAPI starts serving /health immediately
+
+This guarantees Railway's healthcheck succeeds even if SGO/Kalshi
+external calls take 30+ seconds on a cold deploy.
 """
 
 from __future__ import annotations
@@ -21,7 +26,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -37,7 +41,11 @@ logger = logging.getLogger(__name__)
 
 async def _tick_job() -> None:
     """First-boot warmup: kick off odds + kalshi once so the UI has data
-    immediately rather than waiting for the next scheduled interval."""
+    immediately rather than waiting for the next scheduled interval.
+
+    Runs as a fire-and-forget task AFTER the FastAPI lifespan yields,
+    so a slow external API doesn't block the healthcheck.
+    """
     settings = get_settings()
     try:
         if settings.sgo_api_key:
@@ -94,24 +102,23 @@ async def scheduled_watcher():
     settings = get_settings()
     scheduler = AsyncIOScheduler(timezone="UTC")
 
-    # SGO every 15 min
+    # SGO every 15 min — first run after the interval elapses, NOT immediately.
+    # Immediate refresh is handled by _tick_job() below as a fire-and-forget task.
     scheduler.add_job(
         _sgo_job,
         trigger=IntervalTrigger(minutes=15),
         id="sgo_odds_tick",
         max_instances=1,
         coalesce=True,
-        next_run_time=datetime.now(timezone.utc),
     )
 
-    # Kalshi every 10 min
+    # Kalshi every 10 min — same pattern.
     scheduler.add_job(
         _kalshi_job,
         trigger=IntervalTrigger(minutes=10),
         id="kalshi_tick",
         max_instances=1,
         coalesce=True,
-        next_run_time=datetime.now(timezone.utc),
     )
 
     # DK auto-ingest daily at 11:00 UTC (~7am ET / 4am PT — well before any slate locks)
@@ -130,7 +137,8 @@ async def scheduled_watcher():
     )
 
     # Fire-and-forget the first warmup tick so /health responds before
-    # the (potentially slow) external API calls finish.
+    # the (potentially slow) external API calls finish. This must run
+    # AFTER scheduler.start() and BEFORE yield.
     asyncio.create_task(_tick_job())
 
     try:
