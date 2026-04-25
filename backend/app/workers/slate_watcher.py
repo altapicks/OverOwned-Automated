@@ -1,285 +1,141 @@
-"""Slate builder.
+"""Scheduled in-process watcher.
 
-Runs per draft group:
-1. Fetch draftables from DK
-2. Normalize each player name against the players master table
-3. Group players into matches using DK's competition_id
-4. Upsert slate, slate_players, and matches rows to Supabase
-5. Emit Discord notifications for new slates and unmatched names
+Runs three jobs on APScheduler's AsyncIOScheduler (shares the FastAPI loop):
 
-Idempotent: re-running on the same draft_group_id updates cleanly.
+  * SGO odds tick   — every 15 min, all active slates, primary tennis odds
+  * Kalshi tick     — every 10 min, ML probabilities for every active match
+  * DK auto-ingest  — once daily at 11:00 UTC, pulls Featured Classic
+                      draft groups for each enabled sport
+
+Each job uses max_instances=1 + coalesce=True so a slow tick can't stack.
+The whole scheduler is wrapped in an async context manager so FastAPI's
+lifespan can start/stop it cleanly.
+
+The first tick is fired with `asyncio.create_task(...)` BEFORE we yield,
+so the HTTP server comes up immediately and Railway's healthcheck passes
+even on a cold deploy where the first SGO/Kalshi calls take 20-40s.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import time
-from datetime import date
-from typing import Optional
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from app.db import get_client
-from app.models import DKDraftable, DKDraftGroup
-from app.services import notifier
-from app.services.dk_client import DraftKingsClient
-from app.services.normalizer import PlayerNormalizer
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from app.config import get_settings
+from app.services.dk_auto_ingest import run_dk_auto_ingest
+from app.services.kalshi import run_kalshi_tick
+from app.services.sgo_odds import run_sgo_tick
 
 logger = logging.getLogger(__name__)
 
 
-async def ingest_draft_group(
-    dk_client: DraftKingsClient,
-    draft_group: DKDraftGroup,
-    sport: str,
-    pre_fetched_draftables: list | None = None,
-    slate_type: str = "classic",
-    is_fallback: bool = False,
-) -> dict:
-    """Pull a draft group's draftables and upsert the whole slate.
+async def _tick_job() -> None:
+    """First-boot warmup: kick off odds + kalshi once so the UI has data
+    immediately rather than waiting for the next scheduled interval."""
+    settings = get_settings()
+    try:
+        if settings.sgo_api_key:
+            logger.info("Boot warmup: SGO odds tick starting")
+            await run_sgo_tick()
+            logger.info("Boot warmup: SGO odds tick done")
+        else:
+            logger.info("Boot warmup: SGO key missing, skipping SGO tick")
+    except Exception as e:
+        logger.exception("Boot warmup SGO tick failed: %s", e)
 
-    Returns a summary dict with counts suitable for ingestion_log.
+    try:
+        if settings.kalshi_key_id and settings.kalshi_private_key:
+            logger.info("Boot warmup: Kalshi tick starting")
+            await run_kalshi_tick()
+            logger.info("Boot warmup: Kalshi tick done")
+        else:
+            logger.info("Boot warmup: Kalshi creds missing, skipping Kalshi tick")
+    except Exception as e:
+        logger.exception("Boot warmup Kalshi tick failed: %s", e)
 
-    Args:
-        pre_fetched_draftables: if provided, skip the DK fetch (the watcher
-            already fetched them for classification). Saves a redundant call.
-        slate_type: 'classic' or 'showdown' — set by the classifier.
-        is_fallback: True when this is a Showdown ingested because no Classic
-            was available for the day.
-    """
-    t0 = time.perf_counter()
-    if pre_fetched_draftables is not None:
-        draftables = pre_fetched_draftables
-    else:
-        draftables, _competitions = await dk_client.get_draftables(draft_group.draft_group_id)
-    if not draftables:
-        return {"status": "empty", "players": 0, "matches": 0}
 
-    normalizer = PlayerNormalizer(sport=sport)
-    db = get_client()
+async def _sgo_job() -> None:
+    try:
+        await run_sgo_tick()
+    except Exception as e:
+        logger.exception("SGO tick failed: %s", e)
 
-    # ── 1. Upsert slate ──────────────────────────────────────────────
-    slate_date = _infer_slate_date(draftables)
-    slate_row = {
-        "sport": sport,
-        "dk_draft_group_id": draft_group.draft_group_id,
-        "slate_date": slate_date.isoformat(),
-        "slate_label": draft_group.slate_label,
-        "contest_type": slate_type,  # 'classic' | 'showdown' — from classifier
-        "salary_cap": draft_group.salary_cap,
-        "lock_time": draft_group.lock_time.isoformat() if draft_group.lock_time else None,
-        "is_fallback": is_fallback,
-    }
 
-    existing = (
-        db.table("slates")
-        .select("id, first_seen_at")
-        .eq("dk_draft_group_id", draft_group.draft_group_id)
-        .execute()
+async def _kalshi_job() -> None:
+    try:
+        await run_kalshi_tick()
+    except Exception as e:
+        logger.exception("Kalshi tick failed: %s", e)
+
+
+async def _dk_auto_ingest_job() -> None:
+    settings = get_settings()
+    if not settings.dk_auto_ingest_enabled:
+        logger.info("DK auto-ingest skipped (DK_AUTO_INGEST_ENABLED=false)")
+        return
+    try:
+        for sport in settings.sports_list:
+            logger.info("DK auto-ingest starting for sport=%s", sport)
+            result = await run_dk_auto_ingest(sport=sport)
+            logger.info("DK auto-ingest result for %s: %s", sport, result)
+    except Exception as e:
+        logger.exception("DK auto-ingest failed: %s", e)
+
+
+@asynccontextmanager
+async def scheduled_watcher():
+    """Start the scheduler, run jobs in-process, and shut down cleanly on exit."""
+    settings = get_settings()
+    scheduler = AsyncIOScheduler(timezone="UTC")
+
+    # SGO every 15 min
+    scheduler.add_job(
+        _sgo_job,
+        trigger=IntervalTrigger(minutes=15),
+        id="sgo_odds_tick",
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(timezone.utc),
     )
-    is_new_slate = not existing.data
-    if is_new_slate:
-        result = db.table("slates").insert(slate_row).execute()
-        slate_id = result.data[0]["id"]
-    else:
-        slate_id = existing.data[0]["id"]
-        db.table("slates").update(
-            {**slate_row, "last_synced_at": "now()"}
-        ).eq("id", slate_id).execute()
 
-    # ── 2. Resolve and upsert players ────────────────────────────────
-    # For showdown (tennis can have it), the same player appears multiple
-    # times with different roster_positions. Collapse to one slate_player
-    # row per (player, roster_position) but track all DK IDs + salaries.
-    canonical_map: dict[int, tuple[str, DKDraftable]] = {}
-    # dk_player_id → (canonical_id, draftable)
-    unmatched_pings: list[tuple[str, str, float]] = []
-    # (raw_name, best_guess, score)
+    # Kalshi every 10 min
+    scheduler.add_job(
+        _kalshi_job,
+        trigger=IntervalTrigger(minutes=10),
+        id="kalshi_tick",
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(timezone.utc),
+    )
 
-    for d in draftables:
-        match_ctx = {
-            "dk_player_id": d.dk_player_id,
-            "salary": d.salary,
-            "competition": d.competition_name,
-            "draft_group_id": draft_group.draft_group_id,
-        }
-        res = normalizer.resolve(d.display_name, source="dk", context=match_ctx)
-        if not res.canonical_id:
-            # Couldn't create or match — skip this draftable but note it
-            unmatched_pings.append((d.display_name, "", 0))
-            continue
-        canonical_map[d.dk_player_id] = (res.canonical_id, d)
-        if not res.auto_resolved:
-            unmatched_pings.append(
-                (d.display_name, res.display_name, res.score)
-            )
+    # DK auto-ingest daily at 11:00 UTC (~7am ET / 4am PT — well before any slate locks)
+    scheduler.add_job(
+        _dk_auto_ingest_job,
+        trigger=CronTrigger(hour=11, minute=0, timezone="UTC"),
+        id="dk_auto_ingest_daily",
+        max_instances=1,
+        coalesce=True,
+    )
 
-    # ── 3. Build matches from competition_id grouping ────────────────
-    comp_to_players: dict[int, list[tuple[str, DKDraftable]]] = {}
-    for _dkid, (cid, d) in canonical_map.items():
-        if d.competition_id is None:
-            continue
-        comp_to_players.setdefault(d.competition_id, []).append((cid, d))
+    scheduler.start()
+    logger.info(
+        "Scheduler started: SGO=15min, Kalshi=10min, DK auto-ingest=11:00 UTC daily (enabled=%s)",
+        settings.dk_auto_ingest_enabled,
+    )
 
-    # Dedupe: in showdown each player shows up 2-3 times per comp. One entry per canonical_id.
-    match_records: list[dict] = []
-    canonical_id_to_match_id: dict[str, str] = {}
-    for comp_id, entries in comp_to_players.items():
-        unique_by_cid: dict[str, DKDraftable] = {}
-        for cid, d in entries:
-            # keep the classic-position version if present, else whichever
-            if cid not in unique_by_cid or unique_by_cid[cid].roster_position == "CPT":
-                unique_by_cid[cid] = d
-        player_ids = list(unique_by_cid.keys())
-        if len(player_ids) != 2:
-            # Tennis matches are always 1v1; anything else is a data anomaly we skip
-            logger.warning(
-                "Skipping competition %s with %d players (expected 2)",
-                comp_id,
-                len(player_ids),
-            )
-            continue
-        a_cid, b_cid = player_ids
-        a_d, b_d = unique_by_cid[a_cid], unique_by_cid[b_cid]
-        match_row = {
-            "slate_id": slate_id,
-            "player_a_id": a_cid,
-            "player_b_id": b_cid,
-            "tournament": _extract_tournament(a_d.competition_name),
-            "start_time": a_d.start_time.isoformat() if a_d.start_time else None,
-            "dk_competition_id": comp_id,
-        }
-        # Upsert match on (slate_id, player_a_id, player_b_id)
-        existing_match = (
-            db.table("matches")
-            .select("id")
-            .eq("slate_id", slate_id)
-            .eq("player_a_id", a_cid)
-            .eq("player_b_id", b_cid)
-            .execute()
-        )
-        if existing_match.data:
-            match_id = existing_match.data[0]["id"]
-            db.table("matches").update(match_row).eq("id", match_id).execute()
-        else:
-            match_id = db.table("matches").insert(match_row).execute().data[0]["id"]
-        match_records.append({"id": match_id, **match_row})
-        canonical_id_to_match_id[a_cid] = match_id
-        canonical_id_to_match_id[b_cid] = match_id
+    # Fire-and-forget the first warmup tick so /health responds before
+    # the (potentially slow) external API calls finish.
+    asyncio.create_task(_tick_job())
 
-    # ── 4. Upsert slate_players ──────────────────────────────────────
-    # Build raw rows, then dedupe by the unique constraint key
-    # (slate_id, player_id, roster_position) BEFORE sending to Supabase.
-    # Two different dk_player_ids can collapse to the same canonical_id
-    # (alias collisions, qualifier promotions, late roster swaps), and
-    # if both share the same roster_position we'd hit Postgres 21000:
-    # "ON CONFLICT DO UPDATE command cannot affect row a second time".
-    raw_slate_player_rows: list[dict] = []
-    for _dkid, (cid, d) in canonical_map.items():
-        raw_slate_player_rows.append(
-            {
-                "slate_id": slate_id,
-                "player_id": cid,
-                "dk_player_id": d.dk_player_id,
-                "dk_display_name": d.display_name,
-                "salary": d.salary,
-                "avg_ppg": d.avg_ppg,
-                "roster_position": d.roster_position or "P",
-                "match_id": canonical_id_to_match_id.get(cid),
-            }
-        )
-
-    deduped_by_key: dict[tuple, dict] = {}
-    duplicates_dropped = 0
-    for row in raw_slate_player_rows:
-        key = (row["slate_id"], row["player_id"], row["roster_position"])
-        if key in deduped_by_key:
-            duplicates_dropped += 1
-            existing_row = deduped_by_key[key]
-            # Keep the row with the higher salary (proxy for the "real" listing
-            # over a stale duplicate). On a tie, keep the existing one.
-            if (row.get("salary") or 0) > (existing_row.get("salary") or 0):
-                logger.warning(
-                    "slate_players dedupe: replacing dk_id=%s sal=%s with dk_id=%s sal=%s for player_id=%s rp=%s",
-                    existing_row.get("dk_player_id"),
-                    existing_row.get("salary"),
-                    row.get("dk_player_id"),
-                    row.get("salary"),
-                    row["player_id"],
-                    row["roster_position"],
-                )
-                deduped_by_key[key] = row
-            else:
-                logger.warning(
-                    "slate_players dedupe: dropping dk_id=%s sal=%s (kept dk_id=%s sal=%s) for player_id=%s rp=%s",
-                    row.get("dk_player_id"),
-                    row.get("salary"),
-                    existing_row.get("dk_player_id"),
-                    existing_row.get("salary"),
-                    row["player_id"],
-                    row["roster_position"],
-                )
-        else:
-            deduped_by_key[key] = row
-
-    slate_player_rows = list(deduped_by_key.values())
-
-    if slate_player_rows:
-        db.table("slate_players").upsert(
-            slate_player_rows, on_conflict="slate_id,player_id,roster_position"
-        ).execute()
-
-    # ── 5. Notifications ─────────────────────────────────────────────
-    if is_new_slate:
-        await notifier.notify_new_slate(
-            sport=sport,
-            slate_date=slate_date.isoformat(),
-            slate_label=draft_group.slate_label,
-            draft_group_id=draft_group.draft_group_id,
-            player_count=len(slate_player_rows),
-            match_count=len(match_records),
-            lock_time=draft_group.lock_time.isoformat() if draft_group.lock_time else None,
-            slate_type=slate_type,
-            is_fallback=is_fallback,
-        )
-
-    for raw_name, best_guess, score in unmatched_pings[:5]:
-        # cap to avoid spam
-        await notifier.notify_unmatched(sport, "dk", raw_name, best_guess, score)
-
-    elapsed_ms = int((time.perf_counter() - t0) * 1000)
-    summary = {
-        "status": "ok",
-        "is_new_slate": is_new_slate,
-        "slate_id": slate_id,
-        "draft_group_id": draft_group.draft_group_id,
-        "players": len(slate_player_rows),
-        "duplicates_dropped": duplicates_dropped,
-        "matches": len(match_records),
-        "unmatched": len(unmatched_pings),
-        "duration_ms": elapsed_ms,
-    }
-    db.table("ingestion_log").insert(
-        {
-            "source": "dk_draftables",
-            "sport": sport,
-            "status": "ok",
-            "items_processed": len(slate_player_rows),
-            "duration_ms": elapsed_ms,
-            "context": summary,
-        }
-    ).execute()
-    return summary
-
-
-def _infer_slate_date(draftables: list[DKDraftable]) -> date:
-    """Use the earliest competition start_time as the slate date."""
-    times = [d.start_time for d in draftables if d.start_time]
-    if not times:
-        return date.today()
-    return min(times).date()
-
-
-def _extract_tournament(competition_name: Optional[str]) -> Optional[str]:
-    """DK's competition names are just 'Player A vs Player B'.
-    Tournament has to come from elsewhere eventually — for now we leave it null
-    and let the user / a future tournament-lookup service fill it in."""
-    return None
+    try:
+        yield
+    finally:
+        logger.info("Scheduler shutting down")
+        scheduler.shutdown(wait=False)
+        logger.info("Scheduler stopped")
