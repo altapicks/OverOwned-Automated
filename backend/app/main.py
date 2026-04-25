@@ -1,9 +1,8 @@
 """FastAPI application entrypoint.
 
 Runs as a single Railway service that does BOTH:
-
-1. Serves HTTP (uvicorn running this app)
-2. Runs the scheduled slate + odds watcher in-process via FastAPI lifespan
+  1. Serves HTTP (uvicorn running this app)
+  2. Runs the scheduled slate + odds watcher in-process via FastAPI lifespan
 
 The watcher uses APScheduler's AsyncIOScheduler, which shares the event loop
 with FastAPI. max_instances=1 + coalesce=True on each job prevents overlap.
@@ -12,6 +11,7 @@ If you ever split into separate services, set ENABLE_IN_PROCESS_WORKER=false
 on the api service and run `python -m app.workers.slate_watcher` as its own
 process.
 """
+
 from __future__ import annotations
 
 import logging
@@ -23,7 +23,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app.config import get_settings
-from app.routes import admin_slate, health, players, prizepicks, slates, tracker
+from app.routes import (
+    admin_dk,
+    admin_slate,
+    health,
+    players,
+    prizepicks,
+    slates,
+    tracker,
+)
 
 
 def _configure_logging(level: str):
@@ -40,7 +48,6 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Start the scheduled watcher alongside the HTTP server."""
     settings = get_settings()
-
     _log_provider_diagnostics(settings)
 
     if settings.enable_in_process_worker:
@@ -48,10 +55,11 @@ async def lifespan(app: FastAPI):
             from app.workers.slate_watcher import scheduled_watcher
 
             logger.info(
-                "Starting in-process slate watcher (sports=%s, types=%s, fallback=%s)",
+                "Starting in-process slate watcher (sports=%s, types=%s, fallback=%s, dk_auto_ingest=%s)",
                 settings.sports_list,
                 settings.slate_types_list,
                 settings.dk_fallback_to_showdown,
+                "ON" if settings.dk_auto_ingest_enabled else "OFF",
             )
             async with scheduled_watcher():
                 yield
@@ -67,6 +75,7 @@ async def lifespan(app: FastAPI):
 
 def _log_provider_diagnostics(settings):
     """Report provider config status at boot. Never crashes — purely informational."""
+
     # Supabase (critical — app won't function without)
     logger.info(
         "Supabase config: url=%s, service_key=%s",
@@ -101,7 +110,6 @@ def _log_provider_diagnostics(settings):
     if kk and kpk:
         try:
             from app.services.kalshi import _load_private_key
-
             key = _load_private_key()
             if key is None:
                 logger.warning(
@@ -110,6 +118,13 @@ def _log_provider_diagnostics(settings):
                 )
         except Exception as e:
             logger.warning("Kalshi eager-load raised: %s", e)
+
+    # DK auto-ingest (daily Featured-Classic pull)
+    logger.info(
+        "DK auto-ingest config: enabled=%s, sports=%s, schedule=11:00 UTC daily",
+        "true" if settings.dk_auto_ingest_enabled else "false (manual-only via /api/admin/dk/fetch-featured)",
+        settings.sports_list,
+    )
 
     # Discord webhooks (optional)
     logger.info(
@@ -152,6 +167,7 @@ def create_app() -> FastAPI:
     app.include_router(prizepicks.router)
     app.include_router(tracker.router)
     app.include_router(admin_slate.router)
+    app.include_router(admin_dk.router)
     return app
 
 
