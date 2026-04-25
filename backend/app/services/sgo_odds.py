@@ -23,8 +23,8 @@ Output shape on matches.odds.sgo (engine.js compatible flat keys):
 Top-level promoted keys (engine.js reads these without a source prefix):
     ml_a, ml_b, gw_a_line, gw_a_over, gw_b_line, gw_b_over
 
-Kalshi win-% fields (kalshi_prob_a / kalshi_prob_b) are NEVER touched by this
-service. Kalshi remains the sole source of win probability.
+Kalshi win-% fields (kalshi_prob_a / kalshi_prob_b) are NEVER touched by
+this service. Kalshi remains the sole source of win probability.
 """
 from __future__ import annotations
 
@@ -62,6 +62,7 @@ async def _sgo_breaker_opened(name: str):
 _breaker_sgo._on_open = _sgo_breaker_opened
 
 
+# ── Data shape ────────────────────────────────────────────────────────
 @dataclass
 class TennisOddsRow:
     player_a_name: str
@@ -78,7 +79,8 @@ class TennisOddsRow:
         return out
 
 
-def _american_to_int(am: Optional[str]) -> Optional[int]:
+# ── Utilities ─────────────────────────────────────────────────────────
+def _american_to_int(am) -> Optional[int]:
     if am is None:
         return None
     s = str(am).strip()
@@ -99,5 +101,333 @@ def _float_or_none(v) -> Optional[float]:
         return None
 
 
-def _odds_for(odd: dict) -> tuple[Optional[int], Optional[float]]:
-    """Return (american
+def _odds_for(odd: Optional[dict]) -> tuple[Optional[int], Optional[float]]:
+    """Return (american_odds, line) preferring Pinnacle, else consensus."""
+    if not odd:
+        return None, None
+    pin = (odd.get("byBookmaker") or {}).get(PREFERRED_BOOK)
+    if pin and pin.get("available"):
+        am = _american_to_int(pin.get("odds"))
+        line = _float_or_none(
+            pin.get("overUnder") or pin.get("spread") or pin.get("line")
+        )
+        if am is not None:
+            return am, line
+    am = _american_to_int(odd.get("bookOdds") or odd.get("fairOdds"))
+    line = _float_or_none(
+        odd.get("bookLine")
+        or odd.get("line")
+        or odd.get("overUnder")
+        or odd.get("spread")
+    )
+    return am, line
+
+
+def _parse_event(event: dict) -> Optional[TennisOddsRow]:
+    teams = event.get("teams") or {}
+    home = (teams.get("home") or {}).get("names", {}).get("long")
+    away = (teams.get("away") or {}).get("names", {}).get("long")
+    starts_at = (event.get("status") or {}).get("startsAt") or event.get("startsAt")
+    if not home or not away or not starts_at:
+        return None
+    try:
+        commence = datetime.fromisoformat(str(starts_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+    odds = event.get("odds") or {}
+    fields: dict = {}
+
+    # Moneyline (A=home, B=away by SGO convention; engine swaps if our match
+    # was stored opposite during ingestion).
+    ml_a, _ = _odds_for(odds.get("points-home-game-ml-home"))
+    ml_b, _ = _odds_for(odds.get("points-away-game-ml-away"))
+    if ml_a is not None:
+        fields["ml_a"] = ml_a
+    if ml_b is not None:
+        fields["ml_b"] = ml_b
+
+    # Total Sets (best-of-3 → line typically 2.5; engine derives p3set)
+    over_odds, sets_line = _odds_for(odds.get("points-all-game-ou-over"))
+    under_odds, sets_line2 = _odds_for(odds.get("points-all-game-ou-under"))
+    if sets_line is None:
+        sets_line = sets_line2
+    if sets_line is not None:
+        fields["sets_total_line"] = sets_line
+        if over_odds is not None:
+            fields["sets_total_over"] = over_odds
+        if under_odds is not None:
+            fields["sets_total_under"] = under_odds
+
+    # Set Spread (+/-1.5 sets)
+    a_odds, a_line = _odds_for(odds.get("points-home-game-sp-home"))
+    b_odds, b_line = _odds_for(odds.get("points-away-game-sp-away"))
+    if a_line is not None:
+        fields["set_spread_a_line"] = a_line
+        if a_odds is not None:
+            fields["set_spread_a_odds"] = a_odds
+    if b_line is not None:
+        fields["set_spread_b_line"] = b_line
+        if b_odds is not None:
+            fields["set_spread_b_odds"] = b_odds
+
+    # Total games (match-level)
+    g_over, g_line = _odds_for(odds.get("games-all-game-ou-over"))
+    g_under, g_line2 = _odds_for(odds.get("games-all-game-ou-under"))
+    if g_line is None:
+        g_line = g_line2
+    if g_line is not None:
+        fields["games_total_line"] = g_line
+        if g_over is not None:
+            fields["games_total_over"] = g_over
+        if g_under is not None:
+            fields["games_total_under"] = g_under
+
+    # Per-player Total Games O/U → engine's gw_*_line / gw_*_over / gw_*_under
+    for side, prefix in (("home", "a"), ("away", "b")):
+        over_o, over_line = _odds_for(odds.get(f"games-{side}-game-ou-over"))
+        under_o, under_line = _odds_for(odds.get(f"games-{side}-game-ou-under"))
+        line = over_line if over_line is not None else under_line
+        if line is not None:
+            fields[f"gw_{prefix}_line"] = line
+            if over_o is not None:
+                fields[f"gw_{prefix}_over"] = over_o
+            if under_o is not None:
+                fields[f"gw_{prefix}_under"] = under_o
+
+    # Per-player Game Spread
+    for side, prefix in (("home", "a"), ("away", "b")):
+        sp_o, sp_line = _odds_for(odds.get(f"games-{side}-game-sp-{side}"))
+        if sp_line is not None:
+            fields[f"game_spread_{prefix}_line"] = sp_line
+            if sp_o is not None:
+                fields[f"game_spread_{prefix}_odds"] = sp_o
+
+    if not fields:
+        return None
+
+    return TennisOddsRow(
+        player_a_name=home,
+        player_b_name=away,
+        commence_time=commence,
+        fields=fields,
+        raw={
+            "event_id": event.get("eventID"),
+            "league": event.get("leagueID"),
+            "book": PREFERRED_BOOK,
+        },
+    )
+
+
+# ── Schedule gate ─────────────────────────────────────────────────────
+async def _has_upcoming_matches(sport: str) -> bool:
+    db = get_client()
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    rows = (
+        db.table("matches")
+        .select(
+            "id, slate_id, slates!inner(sport, status, contest_type, is_fallback)"
+        )
+        .gte("start_time", datetime.now(timezone.utc).isoformat())
+        .lte("start_time", cutoff)
+        .eq("slates.sport", sport)
+        .eq("slates.status", "active")
+        .eq("slates.contest_type", "classic")
+        .eq("slates.is_fallback", False)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return len(rows) > 0
+
+
+# ── Main fetch ────────────────────────────────────────────────────────
+async def fetch_tick(sport_code: str = "TEN") -> dict:
+    s = get_settings()
+    if not s.sgo_api_key:
+        logger.info("SGO_API_KEY not set — skipping SGO odds fetch")
+        return {"skipped": "no_api_key"}
+
+    if sport_code != "TEN":
+        return {"skipped": "not_tennis"}
+
+    if not await _has_upcoming_matches("tennis"):
+        logger.info("SGO odds tick skipped: no matches within 24h")
+        return {"skipped": "no_upcoming_matches"}
+
+    fetched_total = 0
+    matched_total = 0
+
+    for league in (LEAGUE_ATP, LEAGUE_WTA):
+        try:
+            url = f"{API_BASE}/events"
+            params = {
+                "leagueID": league,
+                "type": "match",
+                "oddsAvailable": "true",
+                "limit": 50,
+            }
+            r = await request_with_retry(
+                "GET",
+                url,
+                params=params,
+                headers={"x-api-key": s.sgo_api_key},
+                breaker=_breaker_sgo,
+                max_retries=3,
+            )
+            payload = r.json()
+            events = payload.get("data") or []
+            _breaker_sgo.record_success()
+
+            rows = [row for row in (_parse_event(e) for e in events) if row]
+            fetched_total += len(rows)
+            matched_total += await _ingest_rows(rows, league)
+        except httpx.HTTPStatusError as e:
+            logger.error("SGO HTTP error for %s: %s", league, e)
+        except Exception as e:
+            logger.exception("SGO fetch failed for %s: %s", league, e)
+
+    return {"fetched": fetched_total, "matched": matched_total}
+
+
+# ── Ingest ────────────────────────────────────────────────────────────
+async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> int:
+    if not rows:
+        return 0
+    db = get_client()
+    normalizer = PlayerNormalizer(sport="tennis")
+
+    candidate_matches = (
+        db.table("matches")
+        .select(
+            "id, slate_id, player_a_id, player_b_id, start_time,"
+            " slates!inner(sport, status, contest_type, is_fallback)"
+        )
+        .gte(
+            "start_time",
+            (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+        )
+        .lte(
+            "start_time",
+            (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
+        )
+        .eq("slates.sport", "tennis")
+        .eq("slates.status", "active")
+        .eq("slates.contest_type", "classic")
+        .eq("slates.is_fallback", False)
+        .execute()
+        .data
+        or []
+    )
+
+    matched = 0
+    for row in rows:
+        a = normalizer.resolve(row.player_a_name, source="sgo", create_if_missing=False)
+        b = normalizer.resolve(row.player_b_name, source="sgo", create_if_missing=False)
+        if not a.canonical_id or not b.canonical_id:
+            continue
+
+        for m in candidate_matches:
+            m_start = m.get("start_time")
+            if m_start:
+                try:
+                    m_dt = datetime.fromisoformat(m_start.replace("Z", "+00:00"))
+                    if abs((m_dt - row.commence_time).total_seconds()) > 10800:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+
+            pa = m["player_a_id"]
+            pb = m["player_b_id"]
+            if {pa, pb} != {a.canonical_id, b.canonical_id}:
+                continue
+            swap = pa == b.canonical_id  # our A == their away → swap
+
+            eng_fields = row.to_engine_shape()
+            if swap:
+                eng_fields = _swap_ab_fields(eng_fields)
+
+            await _write_match_odds(
+                match_id=m["id"],
+                slate_id=m["slate_id"],
+                source="sgo",
+                engine_fields=eng_fields,
+                raw_market_payload={"league": league, "row": row.raw},
+            )
+            matched += 1
+            break
+    return matched
+
+
+def _swap_ab_fields(d: dict) -> dict:
+    out = {}
+    for k, v in d.items():
+        if k == "raw":
+            out[k] = v
+        elif k.endswith("_a"):
+            out[k[:-2] + "_b"] = v
+        elif k.endswith("_b"):
+            out[k[:-2] + "_a"] = v
+        elif "_a_" in k:
+            out[k.replace("_a_", "_b_")] = v
+        elif "_b_" in k:
+            out[k.replace("_b_", "_a_")] = v
+        else:
+            out[k] = v
+    return out
+
+
+async def _write_match_odds(
+    *,
+    match_id: str,
+    slate_id: str,
+    source: str,
+    engine_fields: dict,
+    raw_market_payload: dict,
+):
+    """Same shape as odds_api._write_match_odds — keeps opening_odds + history.
+
+    Touches only matches.odds[source] and the engine-flat keys promoted at the
+    top level. Never modifies matches.odds.kalshi or kalshi_prob_a/_b.
+    """
+    db = get_client()
+    row = (
+        db.table("matches")
+        .select("odds, opening_odds")
+        .eq("id", match_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        return
+    current = row.get("odds") or {}
+    if not isinstance(current, dict):
+        current = {}
+    current[source] = engine_fields
+
+    for k in ("ml_a", "ml_b", "gw_a_line", "gw_a_over", "gw_b_line", "gw_b_over"):
+        if k in engine_fields:
+            current[k] = engine_fields[k]
+
+    db.table("matches").update({"odds": current}).eq("id", match_id).execute()
+
+    opening = row.get("opening_odds") or {}
+    if not isinstance(opening, dict):
+        opening = {}
+    if source not in opening:
+        opening[source] = engine_fields
+        db.table("matches").update({"opening_odds": opening}).eq(
+            "id", match_id
+        ).execute()
+
+    db.table("odds_history").insert(
+        {
+            "match_id": match_id,
+            "slate_id": slate_id,
+            "source": source,
+            "market": "ml+totals+spreads+per_player_games",
+            "payload": {"engine_fields": engine_fields, "raw": raw_market_payload},
+        }
+    ).execute()
