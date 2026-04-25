@@ -85,11 +85,19 @@ class FrontendMatch(BaseModel):
     # Opening odds — frozen on first ingest, never updated. Used by the
     # archive view so the "moved from X to Y" delta is canonical across all
     # users (live view still uses per-user localStorage baselines).
-    opening_odds: FrontendMatchOdds = Field(default_factory=FrontendMatchOdds)
+    #
+    # v6.0d: Optional / None when no data. Previously defaulted to an empty
+    # FrontendMatchOdds() which serialized as {ml_a: null, ...} (26 null
+    # keys), which the frontend interpreted as "populated" via
+    # Object.keys().length > 0 — overriding live odds with all-null values.
+    opening_odds: Optional[FrontendMatchOdds] = None
     # Closing odds — snapshot taken at slate lock_time, frozen thereafter.
     # Frontend prefers this over `odds` everywhere except the Live Leverage
-    # Tracker (which always shows live odds). Empty for pre-v5.14 data.
-    closing_odds: FrontendMatchOdds = Field(default_factory=FrontendMatchOdds)
+    # Tracker (which always shows live odds). Empty for pre-v5.14 data and
+    # for slates that haven't yet locked.
+    #
+    # v6.0d: Same Optional / None treatment as opening_odds — see above.
+    closing_odds: Optional[FrontendMatchOdds] = None
     adj_a: float = 0
     adj_b: float = 0
 
