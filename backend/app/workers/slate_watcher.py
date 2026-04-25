@@ -1,11 +1,11 @@
 """Slate builder.
 
 Runs per draft group:
-  1. Fetch draftables from DK
-  2. Normalize each player name against the players master table
-  3. Group players into matches using DK's competition_id
-  4. Upsert slate, slate_players, and matches rows to Supabase
-  5. Emit Discord notifications for new slates and unmatched names
+1. Fetch draftables from DK
+2. Normalize each player name against the players master table
+3. Group players into matches using DK's competition_id
+4. Upsert slate, slate_players, and matches rows to Supabase
+5. Emit Discord notifications for new slates and unmatched names
 
 Idempotent: re-running on the same draft_group_id updates cleanly.
 """
@@ -42,8 +42,8 @@ async def ingest_draft_group(
         pre_fetched_draftables: if provided, skip the DK fetch (the watcher
             already fetched them for classification). Saves a redundant call.
         slate_type: 'classic' or 'showdown' — set by the classifier.
-        is_fallback: True when this is a Showdown ingested because no
-            Classic was available for the day.
+        is_fallback: True when this is a Showdown ingested because no Classic
+            was available for the day.
     """
     t0 = time.perf_counter()
     if pre_fetched_draftables is not None:
@@ -68,6 +68,7 @@ async def ingest_draft_group(
         "lock_time": draft_group.lock_time.isoformat() if draft_group.lock_time else None,
         "is_fallback": is_fallback,
     }
+
     existing = (
         db.table("slates")
         .select("id, first_seen_at")
@@ -92,6 +93,7 @@ async def ingest_draft_group(
     # dk_player_id → (canonical_id, draftable)
     unmatched_pings: list[tuple[str, str, float]] = []
     # (raw_name, best_guess, score)
+
     for d in draftables:
         match_ctx = {
             "dk_player_id": d.dk_player_id,
@@ -164,16 +166,13 @@ async def ingest_draft_group(
         canonical_id_to_match_id[b_cid] = match_id
 
     # ── 4. Upsert slate_players ──────────────────────────────────────
-    # Build raw rows from canonical_map. Two different dk_player_ids can map
-    # to the same canonical_id (normalizer fuzzy-collapse, or DK lists the
-    # same player twice — happens around qualifier promotions and late
-    # roster swaps). The slate_players table has a unique constraint on
-    # (slate_id, player_id, roster_position), so a single upsert that
-    # contains duplicates of that key triggers Postgres 21000:
-    #   "ON CONFLICT DO UPDATE command cannot affect row a second time".
-    # Dedupe here, keeping the entry with the highest salary (DK's
-    # "canonical" listing for that player on that slate).
-    raw_slate_player_rows = []
+    # Build raw rows, then dedupe by the unique constraint key
+    # (slate_id, player_id, roster_position) BEFORE sending to Supabase.
+    # Two different dk_player_ids can collapse to the same canonical_id
+    # (alias collisions, qualifier promotions, late roster swaps), and
+    # if both share the same roster_position we'd hit Postgres 21000:
+    # "ON CONFLICT DO UPDATE command cannot affect row a second time".
+    raw_slate_player_rows: list[dict] = []
     for _dkid, (cid, d) in canonical_map.items():
         raw_slate_player_rows.append(
             {
@@ -192,52 +191,40 @@ async def ingest_draft_group(
     duplicates_dropped = 0
     for row in raw_slate_player_rows:
         key = (row["slate_id"], row["player_id"], row["roster_position"])
-        existing_row = deduped_by_key.get(key)
-        if existing_row is None:
-            deduped_by_key[key] = row
-            continue
-        duplicates_dropped += 1
-        # Keep whichever has the higher salary; if tied, keep first-seen.
-        if (row.get("salary") or 0) > (existing_row.get("salary") or 0):
-            logger.info(
-                "Replacing duplicate slate_player (player_id=%s, pos=%s): "
-                "old dk_player_id=%s salary=%s → new dk_player_id=%s salary=%s",
-                row["player_id"],
-                row["roster_position"],
-                existing_row.get("dk_player_id"),
-                existing_row.get("salary"),
-                row.get("dk_player_id"),
-                row.get("salary"),
-            )
-            deduped_by_key[key] = row
+        if key in deduped_by_key:
+            duplicates_dropped += 1
+            existing_row = deduped_by_key[key]
+            # Keep the row with the higher salary (proxy for the "real" listing
+            # over a stale duplicate). On a tie, keep the existing one.
+            if (row.get("salary") or 0) > (existing_row.get("salary") or 0):
+                logger.warning(
+                    "slate_players dedupe: replacing dk_id=%s sal=%s with dk_id=%s sal=%s for player_id=%s rp=%s",
+                    existing_row.get("dk_player_id"),
+                    existing_row.get("salary"),
+                    row.get("dk_player_id"),
+                    row.get("salary"),
+                    row["player_id"],
+                    row["roster_position"],
+                )
+                deduped_by_key[key] = row
+            else:
+                logger.warning(
+                    "slate_players dedupe: dropping dk_id=%s sal=%s (kept dk_id=%s sal=%s) for player_id=%s rp=%s",
+                    row.get("dk_player_id"),
+                    row.get("salary"),
+                    existing_row.get("dk_player_id"),
+                    existing_row.get("salary"),
+                    row["player_id"],
+                    row["roster_position"],
+                )
         else:
-            logger.info(
-                "Dropping duplicate slate_player (player_id=%s, pos=%s): "
-                "kept dk_player_id=%s salary=%s, dropped dk_player_id=%s salary=%s",
-                row["player_id"],
-                row["roster_position"],
-                existing_row.get("dk_player_id"),
-                existing_row.get("salary"),
-                row.get("dk_player_id"),
-                row.get("salary"),
-            )
+            deduped_by_key[key] = row
 
     slate_player_rows = list(deduped_by_key.values())
 
-    if duplicates_dropped > 0:
-        logger.warning(
-            "slate_builder: deduped %d duplicate slate_player rows for slate_id=%s "
-            "(raw=%d → final=%d)",
-            duplicates_dropped,
-            slate_id,
-            len(raw_slate_player_rows),
-            len(slate_player_rows),
-        )
-
     if slate_player_rows:
         db.table("slate_players").upsert(
-            slate_player_rows,
-            on_conflict="slate_id,player_id,roster_position"
+            slate_player_rows, on_conflict="slate_id,player_id,roster_position"
         ).execute()
 
     # ── 5. Notifications ─────────────────────────────────────────────
@@ -247,13 +234,15 @@ async def ingest_draft_group(
             slate_date=slate_date.isoformat(),
             slate_label=draft_group.slate_label,
             draft_group_id=draft_group.draft_group_id,
-            player_count=len(canonical_map),
+            player_count=len(slate_player_rows),
             match_count=len(match_records),
             lock_time=draft_group.lock_time.isoformat() if draft_group.lock_time else None,
             slate_type=slate_type,
             is_fallback=is_fallback,
         )
-    for raw_name, best_guess, score in unmatched_pings[:5]:  # cap to avoid spam
+
+    for raw_name, best_guess, score in unmatched_pings[:5]:
+        # cap to avoid spam
         await notifier.notify_unmatched(sport, "dk", raw_name, best_guess, score)
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
@@ -290,7 +279,7 @@ def _infer_slate_date(draftables: list[DKDraftable]) -> date:
 
 
 def _extract_tournament(competition_name: Optional[str]) -> Optional[str]:
-    """DK's competition names are just 'Player A vs Player B'. Tournament
-    has to come from elsewhere eventually — for now we leave it null and
-    let the user / a future tournament-lookup service fill it in."""
+    """DK's competition names are just 'Player A vs Player B'.
+    Tournament has to come from elsewhere eventually — for now we leave it null
+    and let the user / a future tournament-lookup service fill it in."""
     return None
