@@ -1,19 +1,22 @@
-"""Slate watcher job — v6.1 (SGO).
+"""Slate watcher job — v6.2 (SGO + DK auto-ingest).
 
-Runs on a schedule (default 15min). Responsibilities:
+Two scheduler jobs run side by side:
 
-1. Tick SGO odds for tennis (Pinnacle ML, total sets, set spread,
-   per-player game O/U → matches.odds.sgo + promoted flat keys)
-2. Tick SGO PrizePicks props for tennis (Fantasy Score, Aces, Break Points
-   → prizepicks_lines via deactivate-then-insert)
-3. Tick Kalshi for tennis (live match-winner probabilities → matches.odds.kalshi
-   + kalshi_prob_a/_b — UNCHANGED, the source of truth for win %)
-4. Snapshot closing_odds for any slate past lock_time
+  A. 15-minute tick (interval, unchanged from v6.1)
+     1. SGO odds for tennis (Pinnacle ML, total sets, set spread, per-player game O/U)
+     2. SGO PrizePicks props for tennis (Fantasy Score, Aces, Break Points)
+     3. Kalshi for tennis (live match-winner probabilities — UNCHANGED, source of truth for win %)
+     4. Snapshot closing_odds for any slate past lock_time
 
-Manual CSV upload at POST /api/admin/slates/upload remains the slate-creation
-path AND the last-resort override layer — sync_slate_contents preserves all
-matches.odds.* market sources on re-upload, only replacing posted_lines.
+  B. Daily DK auto-ingest tick (cron 11:00 UTC, gated by DK_AUTO_INGEST_ENABLED)
+     - Pulls today's Featured Classic from DK lobby
+     - Hands off to slate_builder.ingest_draft_group
+     - Manual CSV upload at POST /api/admin/slates/upload remains the override layer
+
+11:00 UTC = 7:00 AM ET, well before tennis lock times (typical earliest match
+start is ~5 AM ET for European clay/grass and ~10 AM ET for North American).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -22,18 +25,19 @@ import signal
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import get_settings
 from app.db import get_client
-from app.services import kalshi, sgo_odds, sgo_prizepicks
+from app.services import dk_auto_ingest, kalshi, sgo_odds, sgo_prizepicks
 from app.services.dk_client import SPORT_CODE_MAP
 
 logger = logging.getLogger(__name__)
 
 
 async def run_slate_watcher_once() -> dict:
-    """One polling cycle. Safe to call from a cron, a scheduler, or manually."""
+    """One 15-min polling cycle. Safe to call from a cron, a scheduler, or manually."""
     s = get_settings()
     results: dict = {"sports": {}}
 
@@ -82,9 +86,24 @@ async def run_slate_watcher_once() -> dict:
     return results
 
 
+async def run_dk_auto_ingest_daily() -> dict:
+    """Daily DK auto-ingest. Skipped (no-op result) if flag is off."""
+    s = get_settings()
+    if not s.dk_auto_ingest_enabled:
+        logger.info("DK auto-ingest skipped: dk_auto_ingest_enabled=false")
+        return {"status": "disabled"}
+    try:
+        r = await dk_auto_ingest.run_dk_auto_ingest_tick()
+        logger.info("DK auto-ingest daily: %s", r)
+        return r
+    except Exception as e:
+        logger.exception("DK auto-ingest daily failed: %s", e)
+        return {"status": "error", "error": str(e)}
+
+
 async def _snapshot_closing_odds() -> dict:
-    """Snapshot matches.odds into matches.closing_odds for every match whose
-    slate has passed lock_time and whose closing_odds is still empty."""
+    """Snapshot matches.odds into matches.closing_odds for every match
+    whose slate has passed lock_time and whose closing_odds is still empty."""
     db = get_client()
     now_iso = _utc_now_iso()
     slates = (
@@ -118,7 +137,6 @@ async def _snapshot_closing_odds() -> dict:
                 continue
             db.table("matches").update({"closing_odds": odds}).eq("id", m["id"]).execute()
             total_snapped += 1
-
     return {"snapshotted": total_snapped, "slates_checked": len(slates)}
 
 
@@ -132,9 +150,11 @@ async def scheduled_watcher():
     """Long-running scheduler. Use this in the worker process entrypoint."""
     s = get_settings()
     scheduler = AsyncIOScheduler()
-    trigger = IntervalTrigger(minutes=s.dk_poll_interval_minutes)
 
-    async def _job():
+    # ── Job A: 15-min SGO/Kalshi/closing-odds tick ────────────────────
+    interval_trigger = IntervalTrigger(minutes=s.dk_poll_interval_minutes)
+
+    async def _tick_job():
         try:
             logger.info("Running slate watcher cycle")
             r = await run_slate_watcher_once()
@@ -142,41 +162,19 @@ async def scheduled_watcher():
         except Exception as e:
             logger.exception("Slate watcher cycle failed: %s", e)
 
-    scheduler.add_job(_job, trigger=trigger, id="slate_watcher", max_instances=1, coalesce=True)
-    scheduler.start()
-    logger.info(
-        "Slate watcher started (interval=%d min, sports=%s) — v6.1 (SGO)",
-        s.dk_poll_interval_minutes,
-        s.sports_list,
+    scheduler.add_job(
+        _tick_job,
+        trigger=interval_trigger,
+        id="slate_watcher",
+        max_instances=1,
+        coalesce=True,
     )
-    await _job()
-    try:
-        yield scheduler
-    finally:
-        scheduler.shutdown(wait=False)
 
+    # ── Job B: Daily DK auto-ingest at 11:00 UTC ──────────────────────
+    dk_trigger = CronTrigger(hour=11, minute=0)  # 11:00 UTC every day
 
-async def _main():
-    logging.basicConfig(
-        level=get_settings().log_level,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
-    stop = asyncio.Event()
-
-    def _handle_signal():
-        logger.info("Received shutdown signal")
-        stop.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    async def _dk_daily_job():
         try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            pass
-
-    async with scheduled_watcher():
-        await stop.wait()
-
-
-if __name__ == "__main__":
-    asyncio.run(_main())
+            logger.info("Running DK auto-ingest daily job")
+            r = await run_dk_auto_ingest_daily()
+            logger.info("DK auto-ingest daily done: %s", r
