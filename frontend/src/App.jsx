@@ -326,6 +326,7 @@ function OverOwnedHelpModal({ onClose }) {
           <RuleRow rule="10" target="Hidden Gem #3 (16+ only)" cap="min = max(18%, simOwn × 1.5)" />
           <RuleRow rule="11" target="Hidden Gem #4 (16+ only)" cap="min = max(15%, simOwn × 1.3)" />
           <RuleRow rule="12" target="Rest of field (non-signal players)" cap="max = simOwn × 1.6" />
+          <RuleRow rule="13" target="Global cap (all players)" cap="max 65%" />
           <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 10, lineHeight: 1.5 }}>
             Rule 12 is the baseline field cap. Every non-signal player gets a ceiling of simOwn × 1.6 at base strength (+60% leverage room). Keeps unflagged chalk from pushing past 60–70% exposure and eating slots reserved for Hidden Gems and Pivots. Scales tighter at higher strength, looser at lower.
           </div>
@@ -2950,7 +2951,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
 //   Biggest Trap #3        max 12%   (16+ only)
 //   Biggest Trap #4        max 14%   (16+ only)
 //   Primary Pivot          min = max(25%, simOwn × 2)
-//   Or Pivot               min = max(20%, simOwn × 1.8)  (16+ only)
+//   Or Pivot               min = max(20%, simOwn × 1.8)
 //   PP Fades (top 3)       each min = simOwn × 1.5
 //   Hidden Gem #1          min = max(25%, simOwn × 2)
 //   Hidden Gem #2          min = max(22%, simOwn × 1.8)
@@ -2959,6 +2960,9 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
 //   (Field cap)            all non-signal players: max = simOwn × 1.6
 //                          Keeps baseline chalk from overleveraging
 //                          into lineups. At 25% own → 40% max cap.
+//   (Global cap)           ALL players: max 65%. Safety ceiling that
+//                          binds when Hidden Gem floors or other rules
+//                          would otherwise push exposure higher.
 //
 // Strength scaling: factor = strength / 0.6.
 //   • Max caps divided by factor (higher strength = lower cap, more fade)
@@ -3149,6 +3153,24 @@ function computeOverOwnedCaps(rp, ownership, strength, matchCount) {
     const ownPct = own(p.name);
     if (ownPct <= 0) continue;
     setMax(p.name, roundInt(ownPct * fieldCapMult), 'field-cap');
+  }
+
+  // (13) Global max exposure cap — no player exceeds 65% at base strength.
+  // Applies to ALL players (signal and non-signal) as a safety ceiling.
+  // Stack-safe: only binds when it's lower than an existing max for that
+  // player. Hidden Gems with very high simOwn that would otherwise floor
+  // above 65% get clamped here (defensive clamp at the end will then drop
+  // their min to 65% as well).
+  //
+  // Scales with strength like other max caps: tighter at higher strength,
+  // looser at lower. At strength 0.6 (factor=1) → 65%. At strength 1.2
+  // (factor=2) → 32%. At strength 0.3 (factor=0.5) → clamped to 100%.
+  //
+  // Tagged 'global-cap'; labelFor returns null for it so the Top 5 Exposure
+  // Changes panel isn't flooded with global-cap entries (similar to field-cap).
+  const globalMaxCap = scaledMax(65);
+  for (const p of withSal) {
+    setMax(p.name, globalMaxCap, 'global-cap');
   }
 
   // Defensive clamp: ensure min ≤ max for any player with both
