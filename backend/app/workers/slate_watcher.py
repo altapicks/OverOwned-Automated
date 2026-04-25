@@ -1,16 +1,18 @@
-"""Slate watcher job.
+"""Slate watcher job — v6.0.
 
-Runs on a schedule (default 15min). For each configured sport:
-  1. Hit DK lobby for draft groups
-  2. Fetch draftables for each (needed for classification)
-  3. Classify each slate: Classic | Showdown | Other
-  4. Decide which to ingest per classifier rules + env config
-  5. Ingest via slate_builder, skip the rest (log to skipped_draft_groups)
-  6. Notify Discord with appropriate flavor
+Runs on a schedule (default 15min). Responsibilities (v6.0 simplified):
+  1. Tick The Odds API for tennis (fills moneylines + games-won lines as
+     fallback for slates that don't have those values from the manual upload)
+  2. Tick Kalshi for tennis (live market probabilities → live Leverage Tracker)
+  3. Snapshot closing_odds for any slate past lock_time
 
-Run this as a separate process from the API. On Railway we have two
-services: `api` (uvicorn) and `worker` (this script), both reading from
-the same Supabase.
+DK scraping, slate auto-creation, and slate classification have been
+REMOVED in v6.0. Slates are now created exclusively via the manual upload
+endpoint at POST /api/admin/slates/upload. This eliminates the UTC-rollover
+ghost-slate problem and ambiguity around "which slate is today".
+
+The watcher only ATTACHES odds to manually-created matches — it never
+creates slates or matches itself.
 """
 from __future__ import annotations
 
@@ -24,14 +26,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import get_settings
 from app.db import get_client
-from app.services import kalshi, notifier, odds_api
-from app.services.dk_client import DraftKingsClient, SPORT_CODE_MAP
-from app.services.slate_builder import ingest_draft_group
-from app.services.slate_classifier import (
-    SlateType,
-    classify_slate,
-    pick_slates_to_ingest,
-)
+from app.services import kalshi, odds_api
+from app.services.dk_client import SPORT_CODE_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -39,137 +35,33 @@ logger = logging.getLogger(__name__)
 async def run_slate_watcher_once() -> dict:
     """One polling cycle. Safe to call from a cron, a scheduler, or manually."""
     s = get_settings()
-    allowed_types = {
-        SlateType(t) for t in s.slate_types_list if t in {"classic", "showdown", "other"}
-    }
-    results = {"sports": {}}
+    results: dict = {"sports": {}}
 
-    async with DraftKingsClient() as dk:
-        for sport_code in s.sports_list:
-            sport_name = SPORT_CODE_MAP.get(sport_code, sport_code.lower())
-            try:
-                groups = await dk.list_draft_groups(sport_code)
-            except Exception as e:
-                logger.exception("Failed to list draft groups for %s", sport_code)
-                await notifier.notify_error(
-                    "slate_watcher",
-                    f"Lobby pull failed for {sport_code}: {e}",
-                    {"sport": sport_name},
-                )
-                _log_error("dk_lobby", sport_name, str(e), {"sport_code": sport_code})
-                continue
+    # ── Odds ingestion (per sport, gated to tennis with upcoming matches) ──
+    for sport_code in s.sports_list:
+        sport_name = SPORT_CODE_MAP.get(sport_code, sport_code.lower())
+        if sport_name != "tennis":
+            continue
+        try:
+            odds_summary = await odds_api.fetch_tick(sport_code)
+            logger.info("The Odds API tick: %s", odds_summary)
+            results["sports"].setdefault(sport_name, {})["odds_api"] = odds_summary
+        except Exception as e:
+            logger.exception("Odds API tick failed: %s", e)
+            results["sports"].setdefault(sport_name, {})["odds_api_error"] = str(e)
 
-            # Fetch draftables and classify each group
-            classified = []
-            for dg in groups:
-                try:
-                    draftables, _ = await dk.get_draftables(dg.draft_group_id)
-                except Exception as e:
-                    logger.exception(
-                        "Failed to fetch draftables for %s", dg.draft_group_id
-                    )
-                    _log_error(
-                        "dk_draftables",
-                        sport_name,
-                        str(e),
-                        {"dgid": dg.draft_group_id},
-                    )
-                    continue
-                slate_type = classify_slate(dg, draftables)
-                classified.append((dg, draftables, slate_type))
-                logger.info(
-                    "Classified dgid=%d contest_type=%r label=%r → %s",
-                    dg.draft_group_id,
-                    dg.contest_type,
-                    dg.slate_label,
-                    slate_type.value,
-                )
+        try:
+            kalshi_summary = await kalshi.fetch_tick()
+            logger.info("Kalshi tick: %s", kalshi_summary)
+            results["sports"].setdefault(sport_name, {})["kalshi"] = kalshi_summary
+        except Exception as e:
+            logger.exception("Kalshi tick failed: %s", e)
+            results["sports"].setdefault(sport_name, {})["kalshi_error"] = str(e)
 
-            # Decide which to ingest
-            to_ingest = pick_slates_to_ingest(
-                classified,
-                allowed_types=allowed_types,
-                fallback_to_showdown=s.dk_fallback_to_showdown,
-            )
-            ingested_dgids = {t[0].draft_group_id for t in to_ingest}
-
-            # Log the skipped ones
-            for dg, _draftables, slate_type in classified:
-                if dg.draft_group_id in ingested_dgids:
-                    continue
-                reason = (
-                    "classified_other"
-                    if slate_type == SlateType.OTHER
-                    else "showdown_without_fallback"
-                    if slate_type == SlateType.SHOWDOWN
-                    else "disallowed_type"
-                )
-                _log_skipped(dg, sport_name, slate_type.value, reason)
-
-            # Ingest
-            sport_summary = {
-                "draft_groups_found": len(groups),
-                "classified": [
-                    {"dgid": dg.draft_group_id, "type": t.value}
-                    for dg, _, t in classified
-                ],
-                "ingested": [],
-                "skipped": len(classified) - len(to_ingest),
-            }
-            for dg, draftables, slate_type, is_fallback in to_ingest:
-                try:
-                    summary = await ingest_draft_group(
-                        dk,
-                        dg,
-                        sport_name,
-                        pre_fetched_draftables=draftables,
-                        slate_type=slate_type.value,
-                        is_fallback=is_fallback,
-                    )
-                    sport_summary["ingested"].append(summary)
-                except Exception as e:
-                    logger.exception(
-                        "Failed to ingest draft group %s", dg.draft_group_id
-                    )
-                    await notifier.notify_error(
-                        "slate_watcher",
-                        f"Ingest failed dgid={dg.draft_group_id}: {e}",
-                        {"sport": sport_name, "dgid": dg.draft_group_id},
-                    )
-                    _log_error(
-                        "dk_ingest",
-                        sport_name,
-                        str(e),
-                        {"dgid": dg.draft_group_id},
-                    )
-
-            results["sports"][sport_name] = sport_summary
-
-        # ── Odds ingestion (post-DK) ──────────────────────────────
-        # Runs once per polling cycle per sport. Internally gated to tennis-with-upcoming-matches.
-        for sport_code in s.sports_list:
-            sport_name = SPORT_CODE_MAP.get(sport_code, sport_code.lower())
-            if sport_name != "tennis":
-                continue
-            try:
-                odds_summary = await odds_api.fetch_tick(sport_code)
-                logger.info("The Odds API tick: %s", odds_summary)
-                results["sports"].setdefault(sport_name, {})["odds_api"] = odds_summary
-            except Exception as e:
-                logger.exception("Odds API tick failed: %s", e)
-                results["sports"].setdefault(sport_name, {})["odds_api_error"] = str(e)
-
-            try:
-                kalshi_summary = await kalshi.fetch_tick()
-                logger.info("Kalshi tick: %s", kalshi_summary)
-                results["sports"].setdefault(sport_name, {})["kalshi"] = kalshi_summary
-            except Exception as e:
-                logger.exception("Kalshi tick failed: %s", e)
-                results["sports"].setdefault(sport_name, {})["kalshi_error"] = str(e)
-
-    # v5.14: snapshot closing_odds for any slate that has passed its lock_time.
-    # Idempotent — only writes when closing_odds is still empty. Runs after
-    # odds fetches so the snapshot captures the freshest possible values.
+    # ── Closing odds snapshot ──────────────────────────────────────────
+    # For any slate whose lock_time has passed, copy match.odds → match.closing_odds
+    # (one-time per match). Frontend reads closing_odds everywhere except the
+    # Live Leverage Tracker, which keeps using live odds.
     try:
         snap_summary = await _snapshot_closing_odds()
         logger.info("closing_odds snapshot: %s", snap_summary)
@@ -189,7 +81,6 @@ async def _snapshot_closing_odds() -> dict:
     non-empty so this is a no-op for those rows on subsequent cycles.
     """
     db = get_client()
-    # Find slates that have locked but whose matches may not yet have snapshots
     now_iso = _utc_now_iso()
     slates = (
         db.table("slates")
@@ -205,7 +96,6 @@ async def _snapshot_closing_odds() -> dict:
 
     total_snapped = 0
     for slate in slates:
-        # Pull matches for this slate with empty closing_odds
         matches = (
             db.table("matches")
             .select("id, odds, closing_odds")
@@ -217,10 +107,10 @@ async def _snapshot_closing_odds() -> dict:
         for m in matches:
             closing = m.get("closing_odds") or {}
             if closing and isinstance(closing, dict) and len(closing) > 0:
-                continue  # already snapshotted
+                continue
             odds = m.get("odds") or {}
             if not isinstance(odds, dict) or len(odds) == 0:
-                continue  # nothing to snapshot
+                continue
             db.table("matches").update({"closing_odds": odds}).eq("id", m["id"]).execute()
             total_snapped += 1
     return {"snapshotted": total_snapped, "slates_checked": len(slates)}
@@ -229,42 +119,6 @@ async def _snapshot_closing_odds() -> dict:
 def _utc_now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
-
-
-def _log_error(source: str, sport: str, msg: str, context: dict) -> None:
-    try:
-        get_client().table("ingestion_log").insert(
-            {
-                "source": source,
-                "sport": sport,
-                "status": "error",
-                "error_message": msg[:500],
-                "context": context,
-            }
-        ).execute()
-    except Exception as e:
-        logger.error("Failed to write ingestion_log error row: %s", e)
-
-
-def _log_skipped(dg, sport: str, classification: str, reason: str) -> None:
-    try:
-        get_client().table("skipped_draft_groups").upsert(
-            {
-                "dk_draft_group_id": dg.draft_group_id,
-                "sport": sport,
-                "contest_type": dg.contest_type,
-                "slate_label": dg.slate_label,
-                "classification": classification,
-                "reason": reason,
-                "context": {
-                    "lock_time": dg.lock_time.isoformat() if dg.lock_time else None,
-                    "salary_cap": dg.salary_cap,
-                },
-            },
-            on_conflict="dk_draft_group_id",
-        ).execute()
-    except Exception as e:
-        logger.error("Failed to write skipped_draft_groups row: %s", e)
 
 
 @asynccontextmanager
@@ -285,11 +139,9 @@ async def scheduled_watcher():
     scheduler.add_job(_job, trigger=trigger, id="slate_watcher", max_instances=1, coalesce=True)
     scheduler.start()
     logger.info(
-        "Slate watcher started (interval=%d min, sports=%s, types=%s, fallback=%s)",
+        "Slate watcher started (interval=%d min, sports=%s) — v6.0 (no DK scraping)",
         s.dk_poll_interval_minutes,
         s.sports_list,
-        s.slate_types_list,
-        s.dk_fallback_to_showdown,
     )
     await _job()
     try:
