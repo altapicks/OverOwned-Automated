@@ -1,4 +1,5 @@
 """Application settings loaded from environment variables."""
+
 from functools import lru_cache
 from typing import Literal
 
@@ -28,6 +29,11 @@ class Settings(BaseSettings):
     # Slate filtering
     dk_slate_types: str = "classic"  # comma list: classic,showdown,other
     dk_fallback_to_showdown: bool = True  # when no Classic found, ingest Showdown instead
+
+    # DK auto-ingest (daily Featured-Classic pull from DK lobby)
+    # Default OFF — flip to true in Railway only after a successful manual
+    # trigger via POST /api/admin/dk/fetch-featured.
+    dk_auto_ingest_enabled: bool = False
 
     # Discord
     discord_webhook_slates: str = ""
