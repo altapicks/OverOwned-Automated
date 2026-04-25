@@ -33,10 +33,10 @@ class Settings(BaseSettings):
     discord_webhook_slates: str = ""
     discord_webhook_errors: str = ""
 
-    # The Odds API (tennis h2h + totals)
+# The Odds API (tennis h2h + totals)
        odds_api_key: str = ""
 
-    # SportsGameOdds API (primary tennis odds + PrizePicks lines)
+       # SportsGameOdds API (primary tennis odds + PrizePicks lines)
        sgo_api_key: str = ""
 
     # Kalshi
