@@ -19,6 +19,7 @@ import { UserMenu } from './components/UserMenu';
 import { SignInPrompt } from './components/SignInPrompt';
 import { AccountPage } from './components/AccountPage';
 import { PrizePicksTab } from './components/PrizePicksTab';
+import { AdminSlateUpload } from './components/AdminSlateUpload';
 import { loadSlate, loadManifest, isSportEnabled, fetchContestOwnership, uploadContestOwnership, clearContestOwnership } from './lib/api';
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1779,6 +1780,7 @@ export default function App() {
   const isHash = (h) => (typeof window !== 'undefined' && window.location.hash === h);
   const [showSignIn, setShowSignIn] = useState(() => isHash('#signin'));
   const [showAccount, setShowAccount] = useState(() => isHash('#account'));
+  const [showAdminPanel, setShowAdminPanel] = useState(false);
   useEffect(() => {
     const sync = () => {
       setShowSignIn(window.location.hash === '#signin');
@@ -2387,7 +2389,8 @@ export default function App() {
       }
     `}</style>
     <div className="cursor-glow" aria-hidden="true" />
-    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} />
+    <Topbar sport={sport} onSportChange={setSport} data={data} slateDate={slateDate} onSlateDateChange={setSlateDate} manifestSlates={manifestSlates} onLogoClick={() => setTab('dk')} onOpenAdminPanel={() => setShowAdminPanel(true)} />
+    {showAdminPanel && <AdminSlateUpload onClose={() => setShowAdminPanel(false)} />}
     {missingPoolOwn.length > 0 && (
       <div style={{
         padding: '10px 24px', background: 'rgba(245, 158, 11, 0.09)',
@@ -2443,7 +2446,8 @@ export default function App() {
   </div>);
 }
 
-function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick }) {
+function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateChange, manifestSlates = [], onLogoClick, onOpenAdminPanel }) {
+  const { isAdmin } = useAuth();
   const hasArchive = manifestSlates && manifestSlates.length > 0;
   return (<div className="topbar">
     <div
@@ -2632,6 +2636,26 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
       <a href="https://x.com/OverOwnedDFS" target="_blank" rel="noopener noreferrer" className="twitter-btn" title="@OverOwnedDFS">
         <svg viewBox="0 0 24 24" width="14" height="14"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
       </a>
+      {isAdmin === true && onOpenAdminPanel && (
+        <button
+          onClick={onOpenAdminPanel}
+          className="admin-btn"
+          title="Admin — upload slate CSV"
+          style={{
+            background: 'transparent',
+            border: '1px solid var(--border-light)',
+            color: 'var(--text-muted)',
+            padding: '5px 10px',
+            borderRadius: 6,
+            cursor: 'pointer',
+            fontSize: 12,
+            fontWeight: 600,
+            marginRight: 4,
+          }}
+        >
+          ⚙ Admin
+        </button>
+      )}
       <UserMenu />
     </div>
     <svg className="mountain-watermark" viewBox="0 0 340 68" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMaxYMid slice" aria-hidden="true">
