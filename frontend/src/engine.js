@@ -54,6 +54,30 @@ function factorial(n) {
 // ============================================================
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
+// v6.0c: When the manual upload pipeline writes posted_lines (CSV-supplied
+// per-player stat values), prefer those over engine-computed defaults. The
+// posted_lines come from Underdog raw lines for aces/dfs/breaks/gw/gl, and
+// from Cloudbet correct-score devig for sw/sl. Either way they're more
+// market-informative than baseline-from-wp computations.
+//
+// Schema: match.odds.posted_lines.{a|b}.{aces, dfs, breaks, games_won,
+// games_lost, sets_won, sets_lost} — written by manual_slate_ingest.py.
+//
+// Applied AFTER the engine produces its own values, so anything the CSV
+// doesn't supply still falls back to the computed default.
+function applyPostedLineOverrides(playerStats, postedSide) {
+  if (!postedSide || typeof postedSide !== 'object') return playerStats;
+  const out = { ...playerStats };
+  if (postedSide.aces       != null) out.aces       = postedSide.aces;
+  if (postedSide.dfs        != null) out.dfs        = postedSide.dfs;
+  if (postedSide.breaks     != null) out.breaks     = postedSide.breaks;
+  if (postedSide.games_won  != null) out.gw         = postedSide.games_won;
+  if (postedSide.games_lost != null) out.gl         = postedSide.games_lost;
+  if (postedSide.sets_won   != null) out.setsWon    = postedSide.sets_won;
+  if (postedSide.sets_lost  != null) out.setsLost   = postedSide.sets_lost;
+  return out;
+}
+
 export function baselineStatsFromWp(wp_a, wp_b) {
   // Probability of straight-sets winners vs 3-set matches.
   // Sigmoid'd so:
@@ -229,9 +253,16 @@ export function processMatch(match) {
   // BASELINE MODE: no rich stat-prop data at all.
   if (!hasRichOdds(o)) {
     const base = baselineStatsFromWp(wp_a, wp_b);
+    const posted = o.posted_lines || {};
     return {
-      player_a: { ...base.player_a, adj: match.adj_a || 0 },
-      player_b: { ...base.player_b, adj: match.adj_b || 0 },
+      player_a: applyPostedLineOverrides(
+        { ...base.player_a, adj: match.adj_a || 0 },
+        posted.a
+      ),
+      player_b: applyPostedLineOverrides(
+        { ...base.player_b, adj: match.adj_b || 0 },
+        posted.b
+      ),
     };
   }
 
@@ -296,9 +327,16 @@ export function processMatch(match) {
   const pnodf_a = Math.max(0, 1 - americanToProb(o.df_a_2plus));
   const pnodf_b = Math.max(0, 1 - americanToProb(o.df_b_2plus));
 
+  const posted = o.posted_lines || {};
   return {
-    player_a: buildPlayerStats(wp_a, p_a20, p_b20, p_a21, p_b21, gw_a, gw_b, ace_a, df_a, brk_a, p10ace_a, pnodf_a, match.adj_a || 0),
-    player_b: buildPlayerStats(wp_b, p_b20, p_a20, p_b21, p_a21, gw_b, gw_a, ace_b, df_b, brk_b, p10ace_b, pnodf_b, match.adj_b || 0),
+    player_a: applyPostedLineOverrides(
+      buildPlayerStats(wp_a, p_a20, p_b20, p_a21, p_b21, gw_a, gw_b, ace_a, df_a, brk_a, p10ace_a, pnodf_a, match.adj_a || 0),
+      posted.a
+    ),
+    player_b: applyPostedLineOverrides(
+      buildPlayerStats(wp_b, p_b20, p_a20, p_b21, p_a21, gw_b, gw_a, ace_b, df_b, brk_b, p10ace_b, pnodf_b, match.adj_b || 0),
+      posted.b
+    ),
   };
 }
 
