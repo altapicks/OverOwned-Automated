@@ -1,8 +1,9 @@
 """FastAPI application entrypoint.
 
 Runs as a single Railway service that does BOTH:
-  1. Serves HTTP (uvicorn running this app)
-  2. Runs the scheduled slate + odds watcher in-process via FastAPI lifespan
+
+1. Serves HTTP (uvicorn running this app)
+2. Runs the scheduled slate + odds watcher in-process via FastAPI lifespan
 
 The watcher uses APScheduler's AsyncIOScheduler, which shares the event loop
 with FastAPI. max_instances=1 + coalesce=True on each job prevents overlap.
@@ -40,13 +41,12 @@ async def lifespan(app: FastAPI):
     """Start the scheduled watcher alongside the HTTP server."""
     settings = get_settings()
 
-    # Boot diagnostic — report each external provider's config status at startup
-    # so "why isn't X working?" is answerable from the first 20 log lines.
     _log_provider_diagnostics(settings)
 
     if settings.enable_in_process_worker:
         try:
             from app.workers.slate_watcher import scheduled_watcher
+
             logger.info(
                 "Starting in-process slate watcher (sports=%s, types=%s, fallback=%s)",
                 settings.sports_list,
@@ -74,11 +74,18 @@ def _log_provider_diagnostics(settings):
         "OK" if settings.supabase_service_key else "MISSING",
     )
 
-    # The Odds API
+    # SportsGameOdds (primary tennis odds + PrizePicks props)
+    sgo_key = settings.sgo_api_key or ""
+    logger.info(
+        "SportsGameOdds config: key=%s",
+        f"set (len={len(sgo_key)})" if sgo_key else "MISSING — SGO ticks will skip",
+    )
+
+    # The Odds API (legacy fallback)
     oa_key = settings.odds_api_key or ""
     logger.info(
-        "The Odds API config: key=%s",
-        f"set (len={len(oa_key)})" if oa_key else "MISSING — odds fetches will skip",
+        "The Odds API config (legacy): key=%s",
+        f"set (len={len(oa_key)})" if oa_key else "not set",
     )
 
     # Kalshi — eagerly try loading the key so PEM issues surface at boot
@@ -92,15 +99,14 @@ def _log_provider_diagnostics(settings):
         kb or "MISSING",
     )
     if kk and kpk:
-        # Trigger the eager load — logs success/failure from inside the loader
         try:
             from app.services.kalshi import _load_private_key
+
             key = _load_private_key()
             if key is None:
                 logger.warning(
                     "Kalshi private key failed to load at boot. "
-                    "Kalshi calls will return 401 until this is fixed. "
-                    "Check the Failed to parse KALSHI_PRIVATE_KEY error above for details."
+                    "Kalshi calls will return 401 until this is fixed."
                 )
         except Exception as e:
             logger.warning("Kalshi eager-load raised: %s", e)
@@ -146,7 +152,6 @@ def create_app() -> FastAPI:
     app.include_router(prizepicks.router)
     app.include_router(tracker.router)
     app.include_router(admin_slate.router)
-
     return app
 
 
