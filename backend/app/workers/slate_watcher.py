@@ -1,4 +1,4 @@
-"""Slate watcher job — v6.2 (SGO + DK auto-ingest).
+"""Slate watcher job — v6.2.1 (SGO + DK auto-ingest).
 
 Two scheduler jobs run side by side:
 
@@ -15,6 +15,12 @@ Two scheduler jobs run side by side:
 
 11:00 UTC = 7:00 AM ET, well before tennis lock times (typical earliest match
 start is ~5 AM ET for European clay/grass and ~10 AM ET for North American).
+
+v6.2.1 fix: the eager first-tick on startup was running SYNCHRONOUSLY before
+yielding to FastAPI, which delayed uvicorn from serving /health long enough
+for Railway's healthcheck to time out (02:22). We now schedule the first tick
+as a fire-and-forget asyncio task BEFORE yielding, so /health is available
+immediately while the first cycle runs in the background.
 """
 
 from __future__ import annotations
@@ -147,7 +153,12 @@ def _utc_now_iso() -> str:
 
 @asynccontextmanager
 async def scheduled_watcher():
-    """Long-running scheduler. Use this in the worker process entrypoint."""
+    """Long-running scheduler. Use this in the worker process entrypoint.
+
+    v6.2.1: the eager first-tick is now scheduled as a background task BEFORE
+    yielding, so the FastAPI lifespan returns control to uvicorn quickly and
+    /health stays responsive within Railway's healthcheck window.
+    """
     s = get_settings()
     scheduler = AsyncIOScheduler()
 
@@ -177,4 +188,65 @@ async def scheduled_watcher():
         try:
             logger.info("Running DK auto-ingest daily job")
             r = await run_dk_auto_ingest_daily()
-            logger.info("DK auto-ingest daily done: %s", r
+            logger.info("DK auto-ingest daily done: %s", r)
+        except Exception as e:
+            logger.exception("DK auto-ingest daily job failed: %s", e)
+
+    scheduler.add_job(
+        _dk_daily_job,
+        trigger=dk_trigger,
+        id="dk_auto_ingest_daily",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    scheduler.start()
+    logger.info(
+        "Slate watcher started (interval=%d min, sports=%s, dk_auto_ingest=%s) — v6.2.1",
+        s.dk_poll_interval_minutes,
+        s.sports_list,
+        "ON" if s.dk_auto_ingest_enabled else "OFF",
+    )
+
+    # Schedule the first tick as a fire-and-forget background task. Do NOT
+    # await it here — that would block lifespan from yielding, delay uvicorn
+    # from serving /health, and trip Railway's healthcheck timeout. The
+    # background task runs concurrently while the API is already up.
+    first_tick_task = asyncio.create_task(_tick_job())
+
+    try:
+        yield scheduler
+    finally:
+        if not first_tick_task.done():
+            first_tick_task.cancel()
+            try:
+                await first_tick_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        scheduler.shutdown(wait=False)
+
+
+async def _main():
+    logging.basicConfig(
+        level=get_settings().log_level,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+    stop = asyncio.Event()
+
+    def _handle_signal():
+        logger.info("Received shutdown signal")
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            pass
+
+    async with scheduled_watcher():
+        await stop.wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(_main())
