@@ -4169,6 +4169,40 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
     return [...rows].sort((a, b) => Math.abs(b.deltaOwn) - Math.abs(a.deltaOwn)).slice(0, 4);
   }, [rows, hasData]);
 
+  // v6.2: Top 3 matches by combined ownership — sums both players' actual
+  // contest ownership to identify which matches the field is most concentrated
+  // on. Symmetric (A→B and B→A produce the same match), so we de-dup by
+  // canonical match key. Useful for spotting full-match fades: when total
+  // ownership across both sides is e.g. 95%, both players are getting heavy
+  // play and missing this match entirely is the contrarian move.
+  const mostOwnedMatches = useMemo(() => {
+    if (!hasData) return [];
+    const seen = new Set();
+    const out = [];
+    for (const r of rows) {
+      if (!r.opponent) continue;
+      // Canonicalize: alphabetical ordering ensures A vs B === B vs A
+      const key = [r.name, r.opponent].sort().join('||');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const oppOwn = opponentOwn[r.opponent] || 0;
+      const total = r.actualOwn + oppOwn;
+      // Pick the higher-owned side as the "lead" name in the display
+      const lead = r.actualOwn >= oppOwn ? r : { name: r.opponent, opponent: r.name, actualOwn: oppOwn };
+      const trail = r.actualOwn >= oppOwn ? { name: r.opponent, actualOwn: oppOwn } : { name: r.name, actualOwn: r.actualOwn };
+      out.push({
+        key,
+        leadName: lead.name,
+        leadOwn: lead.actualOwn,
+        trailName: trail.name,
+        trailOwn: trail.actualOwn,
+        total,
+      });
+    }
+    out.sort((a, b) => b.total - a.total);
+    return out.slice(0, 3);
+  }, [rows, hasData, opponentOwn]);
+
   // Human-readable relative time for "uploaded X ago"
   const timeAgoLocal = (iso) => {
     if (!iso) return '';
@@ -4278,6 +4312,30 @@ function TrackerTab({ players: rp, ownership, slateId, missingPoolOwn = [] }) {
             ))}
           </div>
           <div className="metric-sub" style={{ marginTop: 6 }}>|Actual − Sim| (your leverage)</div>
+        </div>
+        {/* v6.2: Most-owned matches by combined player exposure. Identifies
+            full-match fades — when total ownership across both players is
+            very high (e.g. 95%+), the match is field-locked and skipping
+            both sides becomes a contrarian play. Symmetric, deduped. */}
+        <div className="metric" style={{ flex: 1 }}>
+          <div className="metric-label"><Icon name="swords" size={13}/> Most Owned Matches</div>
+          <div style={{ marginTop: 8 }}>
+            {mostOwnedMatches.map((m, i) => (
+              <div key={m.key} style={{ padding: '3px 0', fontSize: 13 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
+                    <span style={{ color: 'var(--text-dim)', marginRight: 6 }}>{i + 1}.</span>
+                    {m.leadName} <span style={{ color: 'var(--text-dim)' }}>vs</span> {m.trailName}
+                  </span>
+                  <span style={{ flexShrink: 0, color: '#EF4444', fontWeight: 600 }}>{m.total.toFixed(1)}%</span>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-dim)', marginLeft: 18, marginTop: 1 }}>
+                  {m.leadOwn.toFixed(1)}% · {m.trailOwn.toFixed(1)}%
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="metric-sub" style={{ marginTop: 6 }}>Total ownership both sides</div>
         </div>
       </div>
     )}
