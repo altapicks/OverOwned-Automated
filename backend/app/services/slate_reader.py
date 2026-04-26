@@ -581,6 +581,28 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     # ALL stat types via tabs, defaulting to Fantasy Score.
     pp_lines_out = _emit_pp_lines_all_variants(pp_rows)
 
+    # v6.7: Tournament CPI base data. Manually-maintained reference values from
+    # `tournament_cpi_base` table — small dim table (~20 rows). Pulled once per
+    # slate read and attached to meta so the homepage can render the CPI tile
+    # without a separate API call. Engine does NOT consume CPI yet — display
+    # only. If the table doesn't exist (migration not run), we just skip and
+    # the frontend shows "—" for CPI.
+    cpi_rows: list[dict] = []
+    try:
+        cpi_rows = (
+            db.table("tournament_cpi_base")
+            .select("tournament_key, display_name, base_cpi, surface, source, notes")
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        logger.info(
+            "tournament_cpi_base unavailable (likely migration not run): %s", e
+        )
+    meta = dict(meta) if meta else {}
+    meta["tournament_cpi_base"] = cpi_rows
+
     return FrontendSlate(
         date=slate["slate_date"],
         sport=slate["sport"],
