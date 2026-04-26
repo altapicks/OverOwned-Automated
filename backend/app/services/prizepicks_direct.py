@@ -7,8 +7,7 @@ Captures all 3 PP variants per (player, stat_type):
   - goblin (easier over, lower payout)
 
 Distinguished by `attributes.odds_type` on each PP projection.
-
-Stored in prizepicks_lines with new `odds_type` column.
+Stored in prizepicks_lines with `odds_type` column.
 Unique constraint scope: (slate_id, player_id, stat_type, odds_type) WHERE is_active=true.
 """
 
@@ -18,12 +17,12 @@ import logging
 import os
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from app.db.supabase_client import get_service_client
-from app.services.player_resolver import resolve_player_name
+from app.db import get_client
+from app.services.normalizer import PlayerNormalizer
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +46,23 @@ ALLOWED_STAT_TYPES = {
     "Total Sets",
     "Total Tie Breaks",
 }
+
+
+# ---------------------------------------------------------------------------
+# Player resolution wrapper (uses existing PlayerNormalizer)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
+    if not raw_name:
+        return None
+    try:
+        normalizer = PlayerNormalizer(sport=sport)
+        result = normalizer.resolve(raw_name, source="prizepicks", create_if_missing=False)
+        return result.canonical_id if result.auto_resolved else None
+    except Exception as e:
+        log.warning("resolve_player failed for %s: %s", raw_name, e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +160,6 @@ def get_tennis_league_ids() -> List[str]:
 
 
 def _normalize_odds_type(raw: Optional[str]) -> str:
-    """
-    PP `attributes.odds_type` values seen in the wild:
-      - "standard"
-      - "demon"
-      - "goblin"
-    Sometimes None / empty -> treat as standard.
-    """
     if not raw:
         return "standard"
     s = str(raw).strip().lower()
@@ -177,10 +186,6 @@ def _build_player_index(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 
 
 def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
-    """
-    Pull all tennis projections (excluding TENNIS LIVE), capture all
-    odds_type variants, write to prizepicks_lines.
-    """
     summary: Dict[str, Any] = {
         "slate_id": slate_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -201,7 +206,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         summary["errors"].append("no_tennis_leagues_resolved")
         return summary
 
-    sb = get_service_client()
+    db = get_client()
     overall_odds_hist: Counter = Counter()
     overall_stat_hist: Counter = Counter()
     total_wrote = 0
@@ -217,7 +222,6 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         included = body.get("included", []) or []
         player_idx = _build_player_index(included)
 
-        # Group projections by (stat_type, odds_type) per league for scoped deactivate+insert
         grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
 
         for proj in data:
@@ -240,7 +244,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             if not raw_name:
                 continue
 
-            resolved = resolve_player_name(raw_name, slate_id=slate_id)
+            resolved = _resolve_player(raw_name)
             if not resolved:
                 continue
 
@@ -262,16 +266,14 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         league_deact = 0
 
         for (stat_type, odds_type), rows in grouped.items():
-            # Defensive per-scope dedupe (keep last)
             seen: Dict[str, Dict[str, Any]] = {}
             for r in rows:
                 seen[r["player_id"]] = r
             deduped = list(seen.values())
 
-            # Deactivate existing active rows for this scope
             try:
                 resp = (
-                    sb.table("prizepicks_lines")
+                    db.table("prizepicks_lines")
                     .update({"is_active": False})
                     .eq("slate_id", slate_id)
                     .eq("stat_type", stat_type)
@@ -286,9 +288,8 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
                 )
                 continue
 
-            # Insert fresh rows
             try:
-                resp = sb.table("prizepicks_lines").insert(deduped).execute()
+                resp = db.table("prizepicks_lines").insert(deduped).execute()
                 league_wrote += len(resp.data or [])
             except Exception as e:
                 summary["errors"].append(
