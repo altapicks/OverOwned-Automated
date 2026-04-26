@@ -1608,13 +1608,70 @@ function pickPrimaryTournament(matches) {
 // exposes them; falls back to inspecting today's matches for a *different*
 // tournament that starts later than the primary's last match. Most slates
 // won't satisfy this, so the tile shows "—" gracefully when no signal.
-function detectNextTournamentChange(matches, currentTournamentName) {
+// v6.10: Calendar-driven next-tournament detection.
+//
+// Reads from meta.tournament_cpi_base (populated by slate_reader from the
+// tournament_cpi_base table). When a row has start_date / end_date set,
+// this picks "next" as the row whose start_date falls soonest after the
+// current tournament's end_date. Falls back to the old heuristic (scan
+// today's matches for a different tournament) when no calendar data is
+// available — useful if the migration hasn't run yet.
+//
+// Matching the current tournament against rows uses both tournament_key
+// substring (so "Madrid Open" matches "madrid") AND display_name substring
+// (so "Italian Open" matches the row whose display_name is "Italian Open"
+// even though its key is "rome"). Lowercased substring is the cheapest
+// reliable join.
+//
+// Same-day handoffs (e.g. Hamburg ends 2026-05-24, Roland Garros starts
+// 2026-05-24) are handled with `>=` rather than `>` — the moment current
+// ends, next is shown.
+function detectNextTournamentChange(matches, currentTournamentName, cpiRows) {
+  // Calendar path — preferred when migration has run and rows have dates.
+  if (Array.isArray(cpiRows) && cpiRows.length > 0 && currentTournamentName) {
+    const lc = currentTournamentName.toLowerCase();
+    const current = cpiRows.find(r => {
+      if (!r.tournament_key) return false;
+      // Match against either the key OR the display_name. Display name
+      // matters because some current-tournament strings are themselves
+      // already a display name (e.g. "Italian Open" is the display_name
+      // for the row keyed "rome").
+      if (lc.includes(r.tournament_key)) return true;
+      const dn = (r.display_name || '').toLowerCase();
+      if (dn && (lc.includes(dn) || dn.includes(lc))) return true;
+      return false;
+    });
+    if (current && current.end_date) {
+      const currentEnd = new Date(current.end_date + 'T00:00:00Z').getTime();
+      // Filter to dated rows whose start_date is on or after current.end_date.
+      // Use >= so same-day handoffs (e.g. Hamburg → Roland Garros 5/24) work.
+      const candidates = cpiRows
+        .filter(r => r.start_date && r.tournament_key !== current.tournament_key)
+        .map(r => ({
+          row: r,
+          startMs: new Date(r.start_date + 'T00:00:00Z').getTime(),
+        }))
+        .filter(x => isFinite(x.startMs) && x.startMs >= currentEnd)
+        .sort((a, b) => a.startMs - b.startMs);
+      if (candidates.length > 0) {
+        const next = candidates[0];
+        return {
+          name: next.row.display_name || next.row.tournament_key,
+          lockTime: next.row.start_date,
+          msUntil: next.startMs - Date.now(),
+          source: 'calendar',
+        };
+      }
+    }
+  }
+
+  // Heuristic fallback: scan today's matches for a 2nd tournament.
+  // Only useful for multi-tournament slates which we don't actually run
+  // — kept as graceful degradation if the calendar table is empty.
   if (!Array.isArray(matches) || matches.length === 0) return null;
-  // Find any match whose tournament differs from the primary.
   const others = matches.filter(m =>
     m.tournament && m.tournament.trim() !== currentTournamentName);
   if (others.length === 0) return null;
-  // Of those, pick the one starting soonest after the primary's last match.
   const sorted = [...others].sort((a, b) => {
     const ta = new Date(a.start_time || 0).getTime();
     const tb = new Date(b.start_time || 0).getTime();
@@ -1628,6 +1685,7 @@ function detectNextTournamentChange(matches, currentTournamentName) {
     name: next.tournament,
     lockTime: next.start_time,
     msUntil: startMs - Date.now(),
+    source: 'heuristic',
   };
 }
 
@@ -1658,11 +1716,15 @@ function SurfaceBadge({ surface }) {
 }
 
 // Tile 1: stacked Current Tournament + Next Tournament Change.
-function TournamentTile({ matches }) {
+function TournamentTile({ matches, meta }) {
   const primary = useMemo(() => pickPrimaryTournament(matches), [matches]);
+  // v6.10: pass meta.tournament_cpi_base into the detector so it uses the
+  // calendar instead of the today's-matches heuristic.
+  const cpiRows = (meta && Array.isArray(meta.tournament_cpi_base))
+    ? meta.tournament_cpi_base : [];
   const nextChange = useMemo(
-    () => primary ? detectNextTournamentChange(matches, primary.name) : null,
-    [matches, primary]
+    () => primary ? detectNextTournamentChange(matches, primary.name, cpiRows) : null,
+    [matches, primary, cpiRows]
   );
   // Re-render the countdown every minute. Cheap; no observable cost vs other state.
   const [tick, setTick] = useState(0);
@@ -3216,7 +3278,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
       {/* v6.7: Top Value tile replaced with stacked Current Tournament +
           Next Tournament Change. Top-value highlighting in the player table
           (trophy icon next to top-3 by val) is preserved unchanged. */}
-      <TournamentTile matches={matches} />
+      <TournamentTile matches={matches} meta={meta} />
       {/* v6.7: Pivots tile replaced with stacked Weather + CPI block.
           Pivot highlighting in the player table (gem icon for primary
           pivot) is preserved unchanged via the gemName / pivotName /
