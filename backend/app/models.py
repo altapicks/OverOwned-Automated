@@ -100,6 +100,7 @@ class FrontendMatch(BaseModel):
     closing_odds: Optional[FrontendMatchOdds] = None
     adj_a: float = 0
     adj_b: float = 0
+    weather: Optional[dict] = None
 
 
 class FrontendPlayer(BaseModel):
