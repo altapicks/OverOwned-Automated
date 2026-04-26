@@ -5,12 +5,12 @@ This service exists for admin entry of PrizePicks projections via the
 current lines into the admin UI and the service stores them.
 
 Schema:
-  prizepicks_lines — current state of every active line
-  line_movements   — append-only diff log (written by DB trigger on
-                     prizepicks_lines changes, no app code needed)
+  prizepicks_lines    — current state of every active line
+  line_movements      — append-only diff log (written by DB trigger
+                        on prizepicks_lines changes, no app code needed)
 
-Admin gate: admin_users table. User's auth UUID must exist there to
-write. All reads are public (anon via RLS).
+Admin gate: admin_users table. User's auth UUID must exist there to write.
+All reads are public (anon via RLS).
 """
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 def resolve_player(sport: str, raw_name: str) -> Optional[str]:
     """Best-effort resolve a raw PP player name to a canonical_id.
-    Returns None if no confident match — the line still gets stored
-    with raw_player_name intact; player_id just stays null."""
+    Returns None if no confident match — the line still gets stored with
+    raw_player_name intact; player_id just stays null."""
     if not raw_name:
         return None
     normalizer = PlayerNormalizer(sport=sport)
@@ -52,18 +52,27 @@ def is_admin_user(user_id: Optional[str]) -> bool:
     return bool(row)
 
 
-def list_lines_for_slate(slate_id: str) -> list[dict]:
+def list_lines_for_slate(slate_id: str, stat_type: Optional[str] = None) -> list[dict]:
+    """List active lines for a slate.
+
+    stat_type behavior:
+      None or omitted    → defaults to Fantasy Score only (PP tab default view)
+      "all"              → return every stat type
+      "<specific name>"  → filter to that stat type exactly
+    """
     db = get_client()
-    rows = (
+    q = (
         db.table("prizepicks_lines")
         .select("*")
         .eq("slate_id", slate_id)
         .eq("is_active", True)
-        .order("last_updated_at", desc=True)
-        .execute()
-        .data
-        or []
     )
+    if stat_type is None:
+        # Default: PP tab shows Fantasy Score only.
+        q = q.eq("stat_type", "Fantasy Score")
+    elif stat_type.lower() != "all":
+        q = q.eq("stat_type", stat_type)
+    rows = q.order("last_updated_at", desc=True).execute().data or []
     return rows
 
 
@@ -79,7 +88,6 @@ def upsert_line(
     sport: str = "tennis",
 ) -> dict:
     """Insert a new line, or reactivate/update an existing one.
-
     Uniqueness is on (slate_id, raw_player_name, stat_type) where is_active=true.
     If a matching active row exists: update current_line (trigger writes movement).
     Else: insert (trigger writes movement with direction='new').
@@ -168,7 +176,6 @@ def bulk_upsert(
     sport: str = "tennis",
 ) -> dict:
     """Bulk upsert from CSV-paste or similar. Each row: {raw_player_name, stat_type, current_line, notes?}.
-
     Returns summary: {inserted: N, updated: M, skipped: K}.
     """
     summary = {"inserted": 0, "updated": 0, "skipped": 0}
