@@ -1397,6 +1397,10 @@ const fmtTime = s => { if (!s) return '-'; const m = s.match(/(\d{1,2})\/(\d{1,2
 // Renders a compact icon + temperature next to the match time. Hover shows
 // full forecast (condition, feels-like, wind, humidity, precip, venue).
 // Display-only — engine projections do not consume weather.
+//
+// v6.7: Per-row weather pill removed from rendering — single weather tile
+// in the metrics block replaces it. Component retained in case we want
+// to re-enable per-row display later (e.g., for slates spanning 3+ tournaments).
 // ═══════════════════════════════════════════════════════════════════════
 function weatherIconFor(iconId) {
   // AccuWeather icon IDs map to a small set of single-char glyphs. See
@@ -1482,6 +1486,315 @@ function WeatherPill({ weather }) {
       {icon ? <span style={{ marginRight: 3 }}>{icon}</span> : null}
       {temp != null ? `${temp}\u00B0` : '\u2014'}
     </span>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// v6.7 TOURNAMENT METADATA HELPERS
+// Frontend mirror of the substring → surface map in tennis_venues.py.
+// Kept small (only fields we render) and updated alongside the backend file.
+// ═══════════════════════════════════════════════════════════════════════
+const FRONTEND_VENUE_META = {
+  // Grand Slams
+  'australian open':   { surface: 'hard',  elevation_m: 31 },
+  'roland garros':     { surface: 'clay',  elevation_m: 35 },
+  'french open':       { surface: 'clay',  elevation_m: 35 },
+  'wimbledon':         { surface: 'grass', elevation_m: 45 },
+  'us open':           { surface: 'hard',  elevation_m: 4  },
+  // Masters / 1000s
+  'indian wells':      { surface: 'hard',  elevation_m: 43 },
+  'miami open':        { surface: 'hard',  elevation_m: 3  },
+  'monte carlo':       { surface: 'clay',  elevation_m: 51 },
+  'madrid open':       { surface: 'clay',  elevation_m: 667 },
+  'mutua madrid':      { surface: 'clay',  elevation_m: 667 },
+  'italian open':      { surface: 'clay',  elevation_m: 21 },
+  'rome masters':      { surface: 'clay',  elevation_m: 21 },
+  'internazionali':    { surface: 'clay',  elevation_m: 21 },
+  'canadian open':     { surface: 'hard',  elevation_m: 76 },
+  'cincinnati':        { surface: 'hard',  elevation_m: 155 },
+  'shanghai':          { surface: 'hard',  elevation_m: 4  },
+  'paris masters':     { surface: 'hard',  elevation_m: 35 },
+  // 500s
+  'doha':              { surface: 'hard',  elevation_m: 10 },
+  'dubai':             { surface: 'hard',  elevation_m: 5  },
+  'china open':        { surface: 'hard',  elevation_m: 43 },
+  'wuhan':             { surface: 'hard',  elevation_m: 37 },
+  'rotterdam':         { surface: 'hard',  elevation_m: -2 },
+  'rio open':          { surface: 'clay',  elevation_m: 4  },
+  'acapulco':          { surface: 'hard',  elevation_m: 3  },
+  'mexican open':      { surface: 'hard',  elevation_m: 3  },
+  'barcelona':         { surface: 'clay',  elevation_m: 12 },
+  'queens':            { surface: 'grass', elevation_m: 15 },
+  'halle':             { surface: 'grass', elevation_m: 105 },
+  'hamburg':           { surface: 'clay',  elevation_m: 6  },
+  'washington':        { surface: 'hard',  elevation_m: 45 },
+  'tokyo':             { surface: 'hard',  elevation_m: 3  },
+  'vienna':            { surface: 'hard',  elevation_m: 171 },
+  'basel':             { surface: 'hard',  elevation_m: 260 },
+  // 250s (most common)
+  'adelaide':          { surface: 'hard',  elevation_m: 50 },
+  'auckland':          { surface: 'hard',  elevation_m: 24 },
+  'brisbane':          { surface: 'hard',  elevation_m: 28 },
+  'marseille':         { surface: 'hard',  elevation_m: 27 },
+  'buenos aires':      { surface: 'clay',  elevation_m: 25 },
+  'santiago':          { surface: 'clay',  elevation_m: 570 },
+  'delray beach':      { surface: 'hard',  elevation_m: 5 },
+  'estoril':           { surface: 'clay',  elevation_m: 50 },
+  'munich':            { surface: 'clay',  elevation_m: 520 },
+  'geneva':            { surface: 'clay',  elevation_m: 375 },
+  'lyon':              { surface: 'clay',  elevation_m: 170 },
+  'kitzbuhel':         { surface: 'clay',  elevation_m: 760 },
+  'bogota':            { surface: 'clay',  elevation_m: 2640 },
+  'eastbourne':        { surface: 'grass', elevation_m: 8  },
+  'newport':           { surface: 'grass', elevation_m: 15 },
+  'charleston':        { surface: 'clay',  elevation_m: 3  },
+  'credit one':        { surface: 'clay',  elevation_m: 3  },
+};
+
+function _findVenueMeta(tournamentName) {
+  if (!tournamentName) return null;
+  const lc = String(tournamentName).toLowerCase();
+  for (const key in FRONTEND_VENUE_META) {
+    if (lc.includes(key)) return { ...FRONTEND_VENUE_META[key], _key: key };
+  }
+  return null;
+}
+
+// Surface → color mapping for the surface badge.
+const SURFACE_COLORS = {
+  clay:   { bg: 'rgba(217, 119, 87, 0.15)',  border: 'rgba(217, 119, 87, 0.4)',  fg: '#D97757' },
+  hard:   { bg: 'rgba(96, 165, 250, 0.15)',  border: 'rgba(96, 165, 250, 0.4)',  fg: '#60A5FA' },
+  grass:  { bg: 'rgba(74, 222, 128, 0.15)',  border: 'rgba(74, 222, 128, 0.4)',  fg: '#4ADE80' },
+  carpet: { bg: 'rgba(139, 154, 186, 0.15)', border: 'rgba(139, 154, 186, 0.4)', fg: '#8B9ABA' },
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// v6.7 — TILE COMPONENTS for the tournament/weather/CPI block
+// ═══════════════════════════════════════════════════════════════════════
+
+// Pick the largest tournament (most matches) from the slate. Ties broken by
+// alphabetical order for stability. Returns { name, matchCount, surface,
+// elevationM, firstMatch, sampleMatch } or null if no matches.
+function pickPrimaryTournament(matches) {
+  if (!Array.isArray(matches) || matches.length === 0) return null;
+  const counts = {};
+  matches.forEach(m => {
+    const t = (m.tournament || '').trim();
+    if (!t) return;
+    counts[t] = (counts[t] || 0) + 1;
+  });
+  const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (sorted.length === 0) return null;
+  const [name, count] = sorted[0];
+  // Pick first match by start_time as the "sample" for weather lookup
+  const tournamentMatches = matches.filter(m => m.tournament === name);
+  const sample = [...tournamentMatches].sort((a, b) => {
+    const ta = a.start_time || '';
+    const tb = b.start_time || '';
+    return ta.localeCompare(tb);
+  })[0];
+  const meta = _findVenueMeta(name);
+  return {
+    name,
+    matchCount: count,
+    surface: meta?.surface || null,
+    elevationM: meta?.elevation_m ?? null,
+    sampleMatch: sample,
+  };
+}
+
+// Find the next tournament change. Returns { name, lockTime, msUntil } or
+// null. Best-effort heuristic: scans data.upcoming_slates if the backend
+// exposes them; falls back to inspecting today's matches for a *different*
+// tournament that starts later than the primary's last match. Most slates
+// won't satisfy this, so the tile shows "—" gracefully when no signal.
+function detectNextTournamentChange(matches, currentTournamentName) {
+  if (!Array.isArray(matches) || matches.length === 0) return null;
+  // Find any match whose tournament differs from the primary.
+  const others = matches.filter(m =>
+    m.tournament && m.tournament.trim() !== currentTournamentName);
+  if (others.length === 0) return null;
+  // Of those, pick the one starting soonest after the primary's last match.
+  const sorted = [...others].sort((a, b) => {
+    const ta = new Date(a.start_time || 0).getTime();
+    const tb = new Date(b.start_time || 0).getTime();
+    return ta - tb;
+  });
+  const next = sorted[0];
+  if (!next || !next.start_time) return null;
+  const startMs = new Date(next.start_time).getTime();
+  if (!isFinite(startMs)) return null;
+  return {
+    name: next.tournament,
+    lockTime: next.start_time,
+    msUntil: startMs - Date.now(),
+  };
+}
+
+function fmtCountdown(ms) {
+  if (ms == null || !isFinite(ms)) return '—';
+  if (ms <= 0) return 'Live';
+  const totalMin = Math.floor(ms / 60000);
+  const days = Math.floor(totalMin / (60 * 24));
+  const hours = Math.floor((totalMin % (60 * 24)) / 60);
+  const mins = totalMin % 60;
+  if (days >= 1) return `${days}d ${hours}h`;
+  if (hours >= 1) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
+
+function SurfaceBadge({ surface }) {
+  if (!surface) return null;
+  const s = SURFACE_COLORS[surface] || SURFACE_COLORS.carpet;
+  return (
+    <span style={{
+      display: 'inline-block', marginLeft: 6, padding: '1px 6px', fontSize: 10,
+      background: s.bg, border: `1px solid ${s.border}`, borderRadius: 3,
+      color: s.fg, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.4,
+    }}>
+      {surface}
+    </span>
+  );
+}
+
+// Tile 1: stacked Current Tournament + Next Tournament Change.
+function TournamentTile({ matches }) {
+  const primary = useMemo(() => pickPrimaryTournament(matches), [matches]);
+  const nextChange = useMemo(
+    () => primary ? detectNextTournamentChange(matches, primary.name) : null,
+    [matches, primary]
+  );
+  // Re-render the countdown every minute. Cheap; no observable cost vs other state.
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!nextChange) return;
+    const id = setInterval(() => setTick(x => x + 1), 60000);
+    return () => clearInterval(id);
+  }, [nextChange]);
+  void tick;  // referenced for the effect's dependency intent
+
+  return (
+    <div className="metric" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div>
+        <div className="metric-label"><Icon name="trophy" size={13}/> Current Tournament</div>
+        <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text)', marginTop: 2 }}>
+          {primary?.name || '—'}
+          {primary?.surface && <SurfaceBadge surface={primary.surface} />}
+        </div>
+        <div className="metric-sub">
+          {primary
+            ? `${primary.matchCount} match${primary.matchCount === 1 ? '' : 'es'}`
+              + (primary.elevationM != null ? ` · ${primary.elevationM}m elevation` : '')
+            : 'No tournament data'}
+        </div>
+      </div>
+      <div style={{ paddingTop: 6, borderTop: '1px dashed var(--border)' }}>
+        <div className="metric-label" style={{ fontSize: 10 }}>
+          <Icon name="clock" size={11}/> Next Tournament
+        </div>
+        {nextChange ? (
+          <>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', marginTop: 2 }}>
+              {nextChange.name}
+            </div>
+            <div className="metric-sub">in {fmtCountdown(nextChange.msUntil)}</div>
+          </>
+        ) : (
+          <div className="metric-sub" style={{ marginTop: 2 }}>—</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Tile: Weather + CPI for the primary tournament.
+function WeatherCPITile({ matches, meta }) {
+  const primary = useMemo(() => pickPrimaryTournament(matches), [matches]);
+  const weather = primary?.sampleMatch?.weather || null;
+  const cpiRows = (meta && Array.isArray(meta.tournament_cpi_base)) ? meta.tournament_cpi_base : [];
+  const cpiBase = useMemo(() => {
+    if (!primary?.name) return null;
+    const lc = primary.name.toLowerCase();
+    // Substring match — same heuristic as the venue lookup.
+    return cpiRows.find(r => r.tournament_key && lc.includes(r.tournament_key)) || null;
+  }, [cpiRows, primary]);
+
+  const f = weather?.forecast;
+  const isIndoor = weather?.is_indoor === true;
+
+  // Format temp with hot/cold tint.
+  const temp = (f && typeof f.temperature_f === 'number') ? Math.round(f.temperature_f) : null;
+  let tempColor = 'var(--text)';
+  if (temp != null) {
+    if (temp >= 85) tempColor = '#F59E0B';
+    else if (temp <= 50) tempColor = '#60A5FA';
+  }
+  const icon = f ? weatherIconFor(f.icon_id) : '';
+
+  return (
+    <div className="metric" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div>
+        <div className="metric-label"><Icon name="cloud" size={13}/> Weather</div>
+        {!primary && (
+          <div className="metric-sub" style={{ marginTop: 2 }}>—</div>
+        )}
+        {primary && isIndoor && (
+          <>
+            <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>Indoor</div>
+            <div className="metric-sub">{weather?.venue_name || primary.name}</div>
+          </>
+        )}
+        {primary && !isIndoor && f && (
+          <>
+            <div style={{ fontSize: 16, fontWeight: 700, color: tempColor, marginTop: 2 }}>
+              {icon && <span style={{ marginRight: 6 }}>{icon}</span>}
+              {temp != null ? `${temp}\u00B0F` : '—'}
+              {f.condition && (
+                <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 6, fontWeight: 400 }}>
+                  {f.condition}
+                </span>
+              )}
+            </div>
+            <div className="metric-sub" style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              {typeof f.wind_speed_mph === 'number' && (
+                <span>Wind {Math.round(f.wind_speed_mph)} mph{f.wind_direction ? ` ${f.wind_direction}` : ''}</span>
+              )}
+              {typeof f.humidity_pct === 'number' && <span>Humidity {f.humidity_pct}%</span>}
+              {typeof f.precipitation_pct === 'number' && f.precipitation_pct > 0 && (
+                <span>Precip {f.precipitation_pct}%</span>
+              )}
+            </div>
+          </>
+        )}
+        {primary && !isIndoor && !f && (
+          <div className="metric-sub" style={{ marginTop: 2 }}>Not yet fetched</div>
+        )}
+      </div>
+      <div style={{ paddingTop: 6, borderTop: '1px dashed var(--border)' }}>
+        <div className="metric-label" style={{ fontSize: 10 }}>
+          <Icon name="zap" size={11}/> CPI
+        </div>
+        {cpiBase ? (
+          <>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginTop: 2 }}>
+              {Number(cpiBase.base_cpi).toFixed(1)}
+              <span style={{ fontSize: 10, color: 'var(--text-dim)', marginLeft: 6, fontWeight: 400 }}>
+                base
+              </span>
+            </div>
+            <div className="metric-sub">
+              {cpiBase.notes || `Court Pace Index · ${cpiBase.surface || 'court'}`}
+            </div>
+          </>
+        ) : (
+          <div className="metric-sub" style={{ marginTop: 2 }}>
+            {primary
+              ? <span title={`No base CPI configured for "${primary.name}". Add one via tournament_cpi_base table.`}>—</span>
+              : '—'}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -2515,7 +2828,7 @@ export default function App() {
       </div>}
       {!buildError && <ErrorBoundary>
       {sport === 'tennis' && (<>
-        {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} missingPoolOwn={missingPoolOwn} />}
+        {tab === 'dk' && <DKTab players={dkPlayers} mc={data.matches?.length || 0} own={ownership} onOverride={onOverrideProj} overrides={projOverrides} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} missingPoolOwn={missingPoolOwn} matches={data.matches || []} meta={data.meta || {}} />}
         {tab === 'pplines' && <PrizePicksTab slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} players={dkPlayers} />}
         {tab === 'build' && <BuilderTab players={dkPlayers} ownership={ownership} lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} mc={data.matches?.length || 0} onGoToProjections={() => setTab('dk')} />}
         {tab === 'tracker' && <TrackerTab players={dkPlayers} ownership={ownership} slateId={data?.meta?.id || data?.id || data?.meta?.slate_id} missingPoolOwn={missingPoolOwn} />}
@@ -2764,7 +3077,7 @@ function Topbar({ sport, onSportChange, data, slateDate = 'live', onSlateDateCha
 // ═══════════════════════════════════════════════════════════════════════
 // TENNIS COMPONENTS — UNCHANGED from v5 except BuilderTab gets contrarian
 // ═══════════════════════════════════════════════════════════════════════
-function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], excludedPlayers = [], onToggleLock, onToggleExclude, onClearLocks, onClearExcludes, slateId, missingPoolOwn = [] }) {
+function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], excludedPlayers = [], onToggleLock, onToggleExclude, onClearLocks, onClearExcludes, slateId, missingPoolOwn = [], matches = [], meta = {} }) {
   const [q, setQ] = useState('');
   // Set of player names without imported sim own — render as N/A instead of
   // a percentage. Cheap Set for O(1) lookup inside the hot render loop.
@@ -2900,31 +3213,15 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
   const S = p => <SH {...p} sortKey={sortKey} sortDir={sortDir} onSort={toggleSort} />;
   return (<>
     <div className="metrics">
-      <div className="metric"><div className="metric-label"><Icon name="trophy" size={13}/> Top Value</div><div className="metric-value">{t3v.map((n, i) => { const p = players.find(x => x.name === n); return <div key={i} style={{ fontSize: i === 0 ? '16px' : '13px', color: i === 0 ? undefined : 'var(--text-muted)' }}>{i + 1}. {n} <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{fmt(p?.val, 2)}</span></div>; })}</div></div>
-      {/* Pivots box — trap-opponent-based picks. Primary = first trap opp
-          with val ≥ 5.5 scanning down the trap list; Or = second qualifying
-          trap opp. Plus PP Fades row. v6.1.1: engine still applies these on
-          ≤15 slates (in OverOwned mode), but display is gated to 16+ to keep
-          the small-slate dashboard uncluttered. */}
-      <div className="metric">
-        <div className="metric-label"><Icon name="swords" size={13}/> Pivots</div>
-        <div className="metric-value" style={{ color: 'var(--green-text)' }}>{gem.primary?.name || '-'}</div>
-        <div className="metric-sub">
-          {gem.primary
-            ? `Trap #${gem.primary.fromTrap} opp · ${fmtPct(gem.primary.wp)} win prob`
-            : 'No pivot identified'}
-        </div>
-        {(mc || 0) >= 16 && gem.pivot && (
-          <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px dashed var(--border)', fontSize: 11, color: 'var(--text-dim)' }}>
-            or Pivot: <span style={{ color: 'var(--green-text)' }}>{gem.pivot.name}</span> <span style={{ fontSize: 10, color: 'var(--text-dim)' }}>(Trap #{gem.pivot.fromTrap} opp)</span>
-          </div>
-        )}
-        {(mc || 0) >= 16 && topPpFades.length > 0 && (
-          <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-dim)' }}>
-            PP Fade: <span style={{ color: 'var(--text-muted)' }}>{topPpFades.join(', ')}</span>
-          </div>
-        )}
-      </div>
+      {/* v6.7: Top Value tile replaced with stacked Current Tournament +
+          Next Tournament Change. Top-value highlighting in the player table
+          (trophy icon next to top-3 by val) is preserved unchanged. */}
+      <TournamentTile matches={matches} />
+      {/* v6.7: Pivots tile replaced with stacked Weather + CPI block.
+          Pivot highlighting in the player table (gem icon for primary
+          pivot) is preserved unchanged via the gemName / pivotName /
+          pivotBadgeNames machinery below. */}
+      <WeatherCPITile matches={matches} meta={meta} />
       {/* Hidden Gems box — tier-based: sort by val desc, split into N tiers
           of 5, pick lowest-owned in each tier. True under-owned value plays. */}
       <div className="metric">
@@ -3009,7 +3306,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
         <td className="num"><span className={is ? 'cell-top3' : ''}>{fmtPct(p.pStraight)}</span></td>
         <td className="num">{fmt(p.gw)}</td><td className="num muted">{fmt(p.gl)}</td><td className="num">{fmt(p.sw)}</td><td className="num muted">{fmt(p.sl)}</td>
         <td className="num">{fmt(p.aces)}</td><td className="num muted">{fmt(p.dfs)}</td><td className="num">{fmt(p.breaks)}</td>
-        <td className="muted">{fmtTime(p.startTime)}<WeatherPill weather={p.weather} /></td>
+        <td className="muted">{fmtTime(p.startTime)}</td>
         <td style={{ textAlign: 'right', paddingRight: 10 }}><LockExcludeButtons name={p.name} isLocked={lockedPlayers.includes(p.name)} isExcluded={excludedPlayers.includes(p.name)} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} /></td>
       </tr>; })}</tbody></table></div>
   </>);
