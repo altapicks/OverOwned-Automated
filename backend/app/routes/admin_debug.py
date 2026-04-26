@@ -6,8 +6,10 @@ import os
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, Query
 
+from app.config import get_settings
 from app.db import get_client
 from app.services import prizepicks_direct as pp_direct
 
@@ -22,17 +24,12 @@ def watcher_status() -> Dict[str, Any]:
     except Exception as e:
         return {"error": f"watcher import failed: {e}"}
 
-    # The actual module-level global in slate_watcher.py is `_scheduler`
-    # (lowercase). Older builds used `_SCHEDULER` / `scheduler` — keep those
-    # as fallbacks so this endpoint stays useful across rolling deploys.
     sched = (
         getattr(sw, "_scheduler", None)
         or getattr(sw, "_SCHEDULER", None)
         or getattr(sw, "scheduler", None)
     )
     if sched is None:
-        # Surface which attribute names we looked at so we can spot future renames
-        # without having to redeploy this endpoint.
         sw_attrs = sorted(a for a in dir(sw) if "sched" in a.lower())
         return {
             "alive": False,
@@ -61,6 +58,87 @@ def watcher_status() -> Dict[str, Any]:
         "job_count": len(jobs),
         "jobs": jobs,
     }
+
+
+@router.get("/sgo/probe")
+def sgo_probe(
+    league: str = Query("ATP", description="ATP or WTA"),
+    limit: int = Query(2, ge=1, le=10),
+) -> Dict[str, Any]:
+    """Server-side probe of SportsGameOdds /v2/events for tennis.
+
+    Returns the raw first event(s) so we can see the actual payload shape
+    (teams vs players vs eventName, which odds keys are present, what the
+    Pinnacle byBookmaker entries look like, etc.). Read-only.
+    """
+    s = get_settings()
+    if not s.sgo_api_key:
+        return {"error": "SGO_API_KEY not configured"}
+
+    url = "https://api.sportsgameodds.com/v2/events"
+    params = {
+        "leagueID": league,
+        "type": "match",
+        "oddsAvailable": "true",
+        "limit": limit,
+    }
+    headers = {"x-api-key": s.sgo_api_key}
+
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            r = client.get(url, params=params, headers=headers)
+            status = r.status_code
+            try:
+                body = r.json()
+            except Exception:
+                return {"http": status, "non_json_body": r.text[:2000]}
+    except Exception as e:
+        return {"error": f"sgo_request_failed: {e}"}
+
+    if status != 200:
+        return {"http": status, "body": body}
+
+    events = body.get("data") or []
+    summary = {
+        "http": status,
+        "league": league,
+        "event_count": len(events),
+        "top_level_keys": sorted(list(body.keys())),
+    }
+    if not events:
+        summary["raw"] = body
+        return summary
+
+    first = events[0]
+    summary["first_event_top_keys"] = sorted(list(first.keys()))
+    summary["first_event_teams"] = first.get("teams")
+    summary["first_event_players"] = first.get("players")
+    summary["first_event_eventName"] = first.get("eventName") or first.get("name")
+    summary["first_event_status"] = first.get("status")
+    summary["first_event_startsAt"] = first.get("startsAt") or (first.get("status") or {}).get("startsAt")
+    odds = first.get("odds") or {}
+    summary["first_event_odds_key_count"] = len(odds)
+    summary["first_event_odds_keys_sample"] = sorted(list(odds.keys()))[:60]
+
+    # Show full body for one odds entry so we can see byBookmaker shape
+    if odds:
+        sample_key = next(iter(odds.keys()))
+        summary["first_event_odds_sample_entry"] = {sample_key: odds[sample_key]}
+
+    # Full first event (capped) so I can see anything I missed
+    summary["first_event_full"] = first
+
+    if len(events) > 1:
+        second = events[1]
+        summary["second_event_summary"] = {
+            "top_keys": sorted(list(second.keys())),
+            "teams": second.get("teams"),
+            "players": second.get("players"),
+            "eventName": second.get("eventName") or second.get("name"),
+            "odds_key_count": len(second.get("odds") or {}),
+        }
+
+    return summary
 
 
 @router.get("/pp/probe")
