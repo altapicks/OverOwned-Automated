@@ -60,6 +60,24 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
+# v6.6: weather support is gated on FrontendMatch having a `weather` field.
+# Detected at module import; pass weather through if the model declares it,
+# silently skip if not. This lets slate_reader.py and models.py be deployed
+# independently — neither breaks the other.
+_FRONTEND_MATCH_HAS_WEATHER = (
+    (hasattr(FrontendMatch, "model_fields")
+        and "weather" in getattr(FrontendMatch, "model_fields", {}))
+    or
+    (hasattr(FrontendMatch, "__fields__")
+        and "weather" in getattr(FrontendMatch, "__fields__", {}))
+)
+if not _FRONTEND_MATCH_HAS_WEATHER:
+    logger.warning(
+        "slate_reader: FrontendMatch model has no `weather` field. "
+        "Weather data will be ingested but not exposed to the frontend until "
+        "models.py is updated to include `weather: Optional[dict]`."
+    )
+
 # PP stat_type → canonical name used by frontend pp_lines display.
 PP_STAT_TO_ENGINE = {
     "Aces": "Aces",
@@ -496,20 +514,24 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         if projected:
             odds = {**odds, "posted_lines": projected}
 
-        frontend_matches.append(
-            FrontendMatch(
-                player_a=pa_name,
-                player_b=pb_name,
-                start_time=m.get("start_time"),
-                tournament=m.get("tournament") or "",
-                surface=m.get("surface"),
-                odds=FrontendMatchOdds(**odds),
-                opening_odds=_build_opening_odds_model(m.get("opening_odds")),
-                closing_odds=_build_opening_odds_model(m.get("closing_odds")),
-                adj_a=0,
-                adj_b=0,
-            )
-        )
+        match_kwargs = {
+            "player_a": pa_name,
+            "player_b": pb_name,
+            "start_time": m.get("start_time"),
+            "tournament": m.get("tournament") or "",
+            "surface": m.get("surface"),
+            "odds": FrontendMatchOdds(**odds),
+            "opening_odds": _build_opening_odds_model(m.get("opening_odds")),
+            "closing_odds": _build_opening_odds_model(m.get("closing_odds")),
+            "adj_a": 0,
+            "adj_b": 0,
+        }
+        # v6.6: pass weather through if the model accepts it. Detected
+        # once at module import (see _FRONTEND_MATCH_HAS_WEATHER above).
+        if _FRONTEND_MATCH_HAS_WEATHER:
+            match_kwargs["weather"] = m.get("weather")
+
+        frontend_matches.append(FrontendMatch(**match_kwargs))
 
     by_canonical: dict[str, dict] = {}
     for sp in players:
