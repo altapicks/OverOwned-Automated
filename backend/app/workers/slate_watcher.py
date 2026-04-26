@@ -1,5 +1,8 @@
 """Watcher: schedules SGO odds, PrizePicks (direct), Kalshi, and DK auto-ingest.
 
+Exports both `scheduled_watcher` (the name main.py imports) and
+`watcher_lifespan` (alias) so the lifespan integration works either way.
+
 4 jobs:
   - sgo_odds_tick       (every 15 min) — Pinnacle ML/games-won/spreads
   - prizepicks_direct   (every 15 min) — Aces/DFs/Breaks/Games/Sets/Fantasy Score
@@ -7,10 +10,6 @@
   - kalshi_tick         (every 10 min) — kalshi_prob_a/_b (sole win-% source)
   - dk_auto_ingest      (cron 11:00 UTC daily) — Featured slate only,
                           gated by DK_AUTO_INGEST_ENABLED env var
-
-Pattern (proven): module-level imports (no `from x import y`), no
-`next_run_time=now` in scheduler.add_job (avoids healthcheck timeout),
-boot warmup via asyncio.create_task BEFORE FastAPI yield.
 """
 from __future__ import annotations
 
@@ -33,8 +32,7 @@ _scheduler: AsyncIOScheduler | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Per-job wrappers (always async, swallow exceptions so APScheduler
-# doesn't kill the job on transient errors).
+# Per-job wrappers
 # ─────────────────────────────────────────────────────────────────────
 
 async def _sgo_odds_tick():
@@ -73,27 +71,28 @@ async def _dk_auto_ingest_tick():
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Boot warmup — runs each job once on startup (in background) so the
-# UI populates within ~30s of redeploy instead of waiting for the
-# first scheduled tick.
+# Boot warmup — sequential to avoid Supabase pool pressure
 # ─────────────────────────────────────────────────────────────────────
 
 async def _warmup():
     logger.info("watcher warmup: starting initial tick of each job")
-    # Run in sequence (not parallel) to avoid Supabase connection pressure on boot
     await _sgo_odds_tick()
     await _prizepicks_tick()
     await _kalshi_tick()
-    # DK auto-ingest is intentionally NOT run on warmup — it's a daily cron only.
     logger.info("watcher warmup: complete")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Lifespan integration (called from main.py)
+# Lifespan integration — exposed as both `scheduled_watcher`
+# (what main.py imports) and `watcher_lifespan` (alias for back-compat).
 # ─────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
-async def watcher_lifespan(app):
+async def scheduled_watcher(app=None):
+    """Start the in-process scheduler. Safe to use as a FastAPI lifespan
+    or as a standalone async context manager (the `app` argument is
+    optional so callers can do `async with scheduled_watcher():`).
+    """
     global _scheduler
     _scheduler = AsyncIOScheduler(timezone="UTC")
 
@@ -135,8 +134,6 @@ async def watcher_lifespan(app):
         "kalshi(10m), dk_auto_ingest(cron 11:00 UTC)"
     )
 
-    # Boot warmup AFTER scheduler is running, BEFORE yield, but as a
-    # background task so /health responds immediately for Railway probe.
     asyncio.create_task(_warmup())
 
     try:
@@ -148,14 +145,15 @@ async def watcher_lifespan(app):
             logger.info("watcher stopped")
 
 
+# Back-compat alias (some routes / scripts import this name)
+watcher_lifespan = scheduled_watcher
+
+
 # ─────────────────────────────────────────────────────────────────────
-# Manual one-shot — used by /api/slates/refresh route.
+# Manual one-shot — used by /api/slates/refresh
 # ─────────────────────────────────────────────────────────────────────
 
 async def run_slate_watcher_once() -> dict:
-    """Run all three live-data tasks once on demand. DK auto-ingest is NOT
-    included here — it's a daily cron and the admin endpoint is the manual
-    trigger for it. Returns per-job status."""
     out: dict = {}
     try:
         await sgo_svc.fetch_tick("TEN")
@@ -165,7 +163,7 @@ async def run_slate_watcher_once() -> dict:
         out["sgo"] = f"error: {e!r}"
     try:
         await pp_direct_svc.fetch_tick("TEN")
-        out["sgo_pp"] = "ok"  # keep key name for backward compat with current /refresh response
+        out["sgo_pp"] = "ok"
     except Exception as e:
         logger.exception("on-demand pp_direct failed: %s", e)
         out["sgo_pp"] = f"error: {e!r}"
