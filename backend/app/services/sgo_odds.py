@@ -1,40 +1,28 @@
 """SportsGameOdds (SGO) v2 integration for tennis odds.
 
-Replaces the legacy odds_api.py role for ML and games-won lines, and adds
-markets the Odds API never carried: total sets O/U (for p3set derivation),
-per-player set spread (+/-1.5 sets), and per-player game spread.
+Pulls Pinnacle odds for the markets the engine actually consumes:
+    games-{home,away}-game-ou        → gw_*_line / gw_*_over / gw_*_under
+    games-all-game-ou                → games_total_line / *_over / *_under
+    points-all-game-ou               → sets_total_line + p3set derivation
+    points-{home,away}-game-sp       → set_spread_*_line / *_odds
+    games-{home,away}-game-sp        → game_spread_*_line / *_odds
 
-Pinnacle is the priority book (sharpest tennis lines on the market). When
-Pinnacle has not posted a given market for an event yet, the consensus
-bookOdds field is used as a fallback so the slate is never empty.
+Moneyline (points-*-game-ml-*) is intentionally NOT pulled — Kalshi is the
+sole source of win probability (kalshi_prob_a / kalshi_prob_b). Reading SGO
+moneyline would give us a second, conflicting win-% signal.
 
-Output shape on matches.odds.sgo (engine.js compatible flat keys):
-    ml_a, ml_b
-    gw_a_line, gw_a_over, gw_a_under
-    gw_b_line, gw_b_over, gw_b_under
-    games_total_line, games_total_over, games_total_under
-    sets_total_line, sets_total_over, sets_total_under
-    set_spread_a_line, set_spread_a_odds
-    set_spread_b_line, set_spread_b_odds
-    game_spread_a_line, game_spread_a_odds
-    game_spread_b_line, game_spread_b_odds
-    set_a_20, set_a_21, set_b_20, set_b_21   ← engine direct keys
-    p3set                                     ← engine direct key
-    raw
+set_a_20 / set_a_21 / set_b_20 / set_b_21 are derived from the existing
+matches.odds.kalshi_prob_a + p3set during ingest, so the engine has the
+four set-score American odds hasRichOdds() expects without needing SGO ML.
 
 Top-level promoted keys (engine.js reads these without a source prefix):
-    ml_a, ml_b,
     gw_a_line, gw_a_over, gw_b_line, gw_b_over,
     set_a_20, set_a_21, set_b_20, set_b_21,
     p3set
-
-Kalshi win-% fields (kalshi_prob_a / kalshi_prob_b) are NEVER touched by
-this service. Kalshi remains the sole source of win probability.
 """
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -163,6 +151,13 @@ def _odds_for(odd: Optional[dict]) -> tuple[Optional[int], Optional[float]]:
 
 
 def _parse_event(event: dict) -> Optional[TennisOddsRow]:
+    """Parse one SGO event into a TennisOddsRow.
+
+    Set-score derivation (set_a_20 / set_a_21 / set_b_20 / set_b_21) is
+    done later in _ingest_rows once we've matched the SGO event to one
+    of our slate matches and can read kalshi_prob_a from matches.odds.
+    Doing it here would require SGO moneyline, which we no longer pull.
+    """
     teams = event.get("teams") or {}
     home = (teams.get("home") or {}).get("names", {}).get("long")
     away = (teams.get("away") or {}).get("names", {}).get("long")
@@ -177,15 +172,6 @@ def _parse_event(event: dict) -> Optional[TennisOddsRow]:
     odds = event.get("odds") or {}
     fields: dict = {}
 
-    # Moneyline (A=home, B=away by SGO convention; engine swaps if our match
-    # was stored opposite during ingestion).
-    ml_a, _ = _odds_for(odds.get("points-home-game-ml-home"))
-    ml_b, _ = _odds_for(odds.get("points-away-game-ml-away"))
-    if ml_a is not None:
-        fields["ml_a"] = ml_a
-    if ml_b is not None:
-        fields["ml_b"] = ml_b
-
     # Total Sets (best-of-3 → line typically 2.5; engine derives p3set)
     over_odds, sets_line = _odds_for(odds.get("points-all-game-ou-over"))
     under_odds, sets_line2 = _odds_for(odds.get("points-all-game-ou-under"))
@@ -199,18 +185,13 @@ def _parse_event(event: dict) -> Optional[TennisOddsRow]:
         fields["sets_total_under"] = under_odds
 
     # Engine direct: p3set = P(match goes to 3 sets) on a best-of-3.
-    # When the total-sets O/U line is 2.5, "Over 2.5" implies the 3rd-set
-    # path. Use the de-vigged probability of Over.
-    p3set: Optional[float] = None
     if sets_line is not None and abs(float(sets_line) - 2.5) < 0.01:
         p_over = _american_to_prob(over_odds)
         p_under = _american_to_prob(under_odds)
         if p_over is not None and p_under is not None and (p_over + p_under) > 0:
-            p3set = round(p_over / (p_over + p_under), 4)
+            fields["p3set"] = round(p_over / (p_over + p_under), 4)
         elif p_over is not None:
-            p3set = round(p_over, 4)
-        if p3set is not None:
-            fields["p3set"] = p3set
+            fields["p3set"] = round(p_over, 4)
 
     # Set Spread (+/-1.5 sets) — SGO native
     a_odds, a_line = _odds_for(odds.get("points-home-game-sp-home"))
@@ -223,37 +204,6 @@ def _parse_event(event: dict) -> Optional[TennisOddsRow]:
         fields["set_spread_b_line"] = b_line
     if b_odds is not None:
         fields["set_spread_b_odds"] = b_odds
-
-    # Engine direct: set_{a,b}_{20,21}
-    #
-    # Derived from de-vigged ML + p3set:
-    #   wp_a = de-vig(ml_a, ml_b)
-    #   P(a wins 2-0) = wp_a * (1 - p3set)
-    #   P(a wins 2-1) = wp_a * p3set
-    # Convert each back to American odds for the engine.
-    p_a = _american_to_prob(ml_a)
-    p_b = _american_to_prob(ml_b)
-    if p_a is not None and p_b is not None and p3set is not None:
-        s = p_a + p_b
-        if s > 0:
-            wp_a = p_a / s
-            wp_b = p_b / s
-            p_a_20 = wp_a * (1.0 - p3set)
-            p_a_21 = wp_a * p3set
-            p_b_20 = wp_b * (1.0 - p3set)
-            p_b_21 = wp_b * p3set
-            am_a_20 = _prob_to_american(p_a_20)
-            am_a_21 = _prob_to_american(p_a_21)
-            am_b_20 = _prob_to_american(p_b_20)
-            am_b_21 = _prob_to_american(p_b_21)
-            if am_a_20 is not None:
-                fields["set_a_20"] = am_a_20
-            if am_a_21 is not None:
-                fields["set_a_21"] = am_a_21
-            if am_b_20 is not None:
-                fields["set_b_20"] = am_b_20
-            if am_b_21 is not None:
-                fields["set_b_21"] = am_b_21
 
     # Total games (match-level)
     g_over, g_line = _odds_for(odds.get("games-all-game-ou-over"))
@@ -301,6 +251,41 @@ def _parse_event(event: dict) -> Optional[TennisOddsRow]:
             "book": PREFERRED_BOOK,
         },
     )
+
+
+def _augment_set_scores_from_kalshi(eng_fields: dict, kalshi_wp_a: Optional[float]) -> None:
+    """Mutate eng_fields in place to add set_a_20 / set_a_21 / set_b_20 /
+    set_b_21 derived from Kalshi win probability and our p3set.
+
+        P(a wins 2-0) = wp_a * (1 - p3set)
+        P(a wins 2-1) = wp_a * p3set
+        P(b wins 2-0) = (1 - wp_a) * (1 - p3set)
+        P(b wins 2-1) = (1 - wp_a) * p3set
+
+    Each is then converted back to American odds for the engine.
+    No-op if wp_a or p3set is missing.
+    """
+    p3set = eng_fields.get("p3set")
+    if kalshi_wp_a is None or p3set is None:
+        return
+    try:
+        wp_a = float(kalshi_wp_a)
+        p3 = float(p3set)
+    except (TypeError, ValueError):
+        return
+    if not (0.0 < wp_a < 1.0) or not (0.0 <= p3 <= 1.0):
+        return
+    wp_b = 1.0 - wp_a
+    pairs = {
+        "set_a_20": wp_a * (1.0 - p3),
+        "set_a_21": wp_a * p3,
+        "set_b_20": wp_b * (1.0 - p3),
+        "set_b_21": wp_b * p3,
+    }
+    for k, prob in pairs.items():
+        am = _prob_to_american(prob)
+        if am is not None:
+            eng_fields[k] = am
 
 
 # ── Schedule gate ─────────────────────────────────────────────────────
@@ -381,7 +366,7 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> int:
     candidate_matches = (
         db.table("matches")
         .select(
-            "id, slate_id, player_a_id, player_b_id, start_time,"
+            "id, slate_id, player_a_id, player_b_id, start_time, odds,"
             " slates!inner(sport, status, contest_type, is_fallback)"
         )
         .gte(
@@ -407,6 +392,12 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> int:
         b = normalizer.resolve(row.player_b_name, source="sgo", create_if_missing=False)
         if not a.canonical_id or not b.canonical_id:
             continue
+        # SGO is also strict — refuse to attach odds based on a low-confidence
+        # fuzzy guess. (Same defensive guard as PP.)
+        if not (a.auto_resolved or a.was_new):
+            continue
+        if not (b.auto_resolved or b.was_new):
+            continue
         for m in candidate_matches:
             m_start = m.get("start_time")
             if m_start:
@@ -424,6 +415,14 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> int:
             eng_fields = row.to_engine_shape()
             if swap:
                 eng_fields = _swap_ab_fields(eng_fields)
+
+            # Now that we know which side of the match we're on, use the
+            # match's existing kalshi_prob_a (if present) to derive the
+            # four set-score American odds the engine reads directly.
+            existing_odds = m.get("odds") or {}
+            wp_a = existing_odds.get("kalshi_prob_a") if isinstance(existing_odds, dict) else None
+            _augment_set_scores_from_kalshi(eng_fields, wp_a)
+
             await _write_match_odds(
                 match_id=m["id"],
                 slate_id=m["slate_id"],
@@ -464,8 +463,10 @@ async def _write_match_odds(
 ):
     """Same shape as odds_api._write_match_odds — keeps opening_odds + history.
 
-    Touches only matches.odds[source] and the engine-flat keys promoted at the
-    top level. Never modifies matches.odds.kalshi or kalshi_prob_a/_b.
+    Touches only matches.odds[source] and the engine-flat keys promoted at
+    the top level. NEVER modifies matches.odds.kalshi or kalshi_prob_a/_b.
+    Moneyline keys (ml_a / ml_b) are intentionally NOT promoted — Kalshi
+    is the sole source of win probability.
     """
     db = get_client()
     row = (
@@ -483,12 +484,11 @@ async def _write_match_odds(
     if not isinstance(current, dict):
         current = {}
     current[source] = engine_fields
+
     # Engine-flat top-level promotion. Engine.js reads these without a
     # source prefix; hasRichOdds() in particular gates on set_a_20 +
-    # gw_a_line being non-null.
+    # gw_a_line being non-null. ml_a / ml_b are deliberately excluded.
     promoted_keys = (
-        "ml_a",
-        "ml_b",
         "gw_a_line",
         "gw_a_over",
         "gw_a_under",
@@ -504,6 +504,12 @@ async def _write_match_odds(
     for k in promoted_keys:
         if k in engine_fields and engine_fields[k] is not None:
             current[k] = engine_fields[k]
+
+    # Defensive: if a previous deploy promoted ml_a / ml_b at top level,
+    # strip them now so they can't conflict with kalshi_prob_a/_b.
+    for stale_key in ("ml_a", "ml_b"):
+        if stale_key in current:
+            current.pop(stale_key, None)
 
     db.table("matches").update({"odds": current}).eq("id", match_id).execute()
 
@@ -521,7 +527,7 @@ async def _write_match_odds(
             "match_id": match_id,
             "slate_id": slate_id,
             "source": source,
-            "market": "ml+totals+spreads+per_player_games+set_score",
+            "market": "totals+spreads+per_player_games+set_score",
             "payload": {"engine_fields": engine_fields, "raw": raw_market_payload},
         }
     ).execute()
