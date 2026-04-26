@@ -1,15 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════════
 // PrizePicks tab — admin entry + realtime display
 //
-// v6.5.1 — two targeted changes on top of v6.5:
+// v6.5.4 — collapse Mult + Type into a single column with color-coded
+// multiplier. Goblin shows in green (lower-payout, easier-over), demon
+// in red (higher-payout, harder-over), standard neutral. Saves a column
+// of horizontal space and makes scanning faster — the color IS the type.
+// The OddsTypePill component is retained but unused (kept around in case
+// of revert).
+//
+// v6.5.1 — two changes on top of v6.5:
 //   1. Player search bar above the table — filters rows in real time by
 //      raw_player_name (case/punctuation-insensitive). Plays well with
 //      the stat-category tabs: search narrows the active tab.
 //   2. Projections + Edge are now ONLY computed for Fantasy Score per
 //      the user's spec. Other tabs (Aces, DFs, Breakpoints, Games Won,
 //      Total Sets, etc.) display the line + multiplier + odds_type as
-//      browse-only — Proj and Edge columns show "—". This stops misleading
-//      stat-by-stat edge signals from competing with the sharp FS edge.
+//      browse-only — Proj and Edge columns show "—".
 //
 // v6.5 — stat-category tab bar at top. Default tab is Fantasy Score.
 // Backend default also changed: /api/prizepicks/lines now returns every
@@ -251,7 +257,7 @@ export function PrizePicksTab({ slateId, players = [] }) {
 
   const toggleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    else { setSortKey(key); setSortDir(key === 'player' || key === 'stat' || key === 'odds_type' ? 'asc' : 'desc'); }
+    else { setSortKey(key); setSortDir(key === 'player' || key === 'stat' ? 'asc' : 'desc'); }
   };
 
   const SortHeader = ({ label, col, num }) => {
@@ -348,7 +354,6 @@ export function PrizePicksTab({ slateId, players = [] }) {
                 <SortHeader label="Stat" col="stat" />
                 <SortHeader label="Line" col="line" num />
                 <SortHeader label="Mult" col="mult" num />
-                <SortHeader label="Type" col="odds_type" />
                 <SortHeader label="Proj" col="projected" num />
                 <SortHeader label="Edge" col="edge" num />
                 <th className="muted">Updated</th>
@@ -357,7 +362,7 @@ export function PrizePicksTab({ slateId, players = [] }) {
             </thead>
             <tbody>
               {sortedLines.length === 0 && (
-                <tr><td colSpan={isAdmin ? 10 : 9} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>
+                <tr><td colSpan={isAdmin ? 9 : 8} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>
                   {searchQ
                     ? <>No {activeStat} lines match "<strong>{searchQ}</strong>".</>
                     : <>No PrizePicks lines for {activeStat} on this slate.</>}
@@ -373,9 +378,6 @@ export function PrizePicksTab({ slateId, players = [] }) {
                     ? 'rgba(74,222,128,0.10)'
                     : 'transparent';
                 const cellStyle = { background: cellBg, transition: 'background 0.3s' };
-                const multStr = line.multiplier != null
-                  ? Number(line.multiplier).toFixed(2)
-                  : '—';
                 return (
                 <tr key={line.id}>
                   <td style={{ ...cellStyle, textAlign: 'center', padding: '6px 4px' }}>
@@ -401,8 +403,7 @@ export function PrizePicksTab({ slateId, players = [] }) {
                       <span className="cell-proj">{line.current_line}</span>
                     )}
                   </td>
-                  <td className="num muted" style={cellStyle}>{multStr}</td>
-                  <td style={cellStyle}><OddsTypePill type={line.odds_type} /></td>
+                  <td className="num" style={cellStyle}><MultCell multiplier={line.multiplier} oddsType={line.odds_type} /></td>
                   <td className="num muted" style={cellStyle}>{line.projected != null ? (Math.round(line.projected * 100) / 100).toFixed(2) : '—'}</td>
                   <td className="num" style={cellStyle}><EdgeCell edge={line.edge} direction={line.direction} /></td>
                   <td className="muted" style={{ ...cellStyle, fontSize: 11 }}>{timeAgo(line.last_updated_at)}</td>
@@ -593,6 +594,38 @@ function OddsTypePill({ type }) {
       borderRadius: 4,
       color: s.color,
     }}>{s.label}</span>
+  );
+}
+
+// v6.5.4: Multiplier text colored by variant. Replaces the separate
+// Mult + Type columns. Goblin (easier-over, lower payout) → green;
+// demon (harder-over, higher payout) → red; standard → neutral text.
+// The color encodes the variant so we don't need a second column for it.
+//
+// Rendered as the bare number with an "x" suffix (e.g. "1.50x", "3.00x")
+// — keeps the number tabular for easy column scanning.
+function MultCell({ multiplier, oddsType }) {
+  if (multiplier == null) {
+    return <span style={{ color: 'var(--text-dim)' }}>—</span>;
+  }
+  const t = (oddsType || 'standard').toLowerCase();
+  const color =
+    t === 'goblin' ? '#4ADE80' :
+    t === 'demon'  ? '#EF4444' :
+    'var(--text)';
+  let mNum;
+  try { mNum = Number(multiplier); } catch (_) { mNum = NaN; }
+  if (!isFinite(mNum)) {
+    return <span style={{ color: 'var(--text-dim)' }}>—</span>;
+  }
+  return (
+    <span style={{
+      color,
+      fontWeight: 600,
+      fontVariantNumeric: 'tabular-nums',
+    }}>
+      {mNum.toFixed(2)}x
+    </span>
   );
 }
 
