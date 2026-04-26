@@ -2869,7 +2869,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
     <SearchBar value={q} onChange={setQ} placeholder="Search players, opponents" total={pw.length} filtered={pwFiltered.length} />
     <LockBar lockedPlayers={lockedPlayers} excludedPlayers={excludedPlayers} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} onClearLocks={onClearLocks} onClearExcludes={onClearExcludes} />
     <div className="table-wrap"><table><thead><tr>
-      <th>#</th><th></th><S label="Player" colKey="name" /><th>Opp</th><S label="Sal" colKey="salary" num /><S label="Sim Own" colKey="simOwn" num tip="Projected field ownership (imported from Pool Own, or simulated if unavailable)" /><S label="Kalshi" colKey="oddsProb" ctr tip="Kalshi prediction market implied probability. Color-coded by win probability — green above 50%, red below 50%, more saturated at the extremes. Matches without an active Kalshi market show 'Not Live'." /><S label="Proj" colKey="proj" num /><S label="Val" colKey="val" num /><S label="P(2-0)" colKey="pStraight" num /><S label="GW" colKey="gw" num /><S label="GL" colKey="gl" num /><S label="SW" colKey="sw" num /><S label="Aces" colKey="aces" num /><S label="DFs" colKey="dfs" num /><S label="Breaks" colKey="breaks" num /><th>Time</th><th></th>
+      <th>#</th><th></th><S label="Player" colKey="name" /><th>Opp</th><S label="Sal" colKey="salary" num /><S label="Sim Own" colKey="simOwn" num tip="Projected field ownership (imported from Pool Own, or simulated if unavailable)" /><S label="Kalshi" colKey="oddsProb" ctr tip="Kalshi prediction market implied probability. Color-coded by win probability — green above 50%, red below 50%, more saturated at the extremes. Matches without an active Kalshi market show 'Not Live'." /><S label="Proj" colKey="proj" num /><S label="Val" colKey="val" num /><S label="P(2-0)" colKey="pStraight" num /><S label="GW" colKey="gw" num /><S label="GL" colKey="gl" num /><S label="SW" colKey="sw" num /><S label="SL" colKey="sl" num /><S label="Aces" colKey="aces" num /><S label="DFs" colKey="dfs" num /><S label="Breaks" colKey="breaks" num /><th>Time</th><th></th>
     </tr></thead>
     <tbody>{sorted.map((p, i) => {
       const iv = t3v.includes(p.name), is = t3s.includes(p.name);
@@ -2914,7 +2914,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
         </td>
         <td className="num"><span className={iv ? 'cell-top3' : ''}>{fmt(p.val, 2)}</span></td>
         <td className="num"><span className={is ? 'cell-top3' : ''}>{fmtPct(p.pStraight)}</span></td>
-        <td className="num">{fmt(p.gw)}</td><td className="num muted">{fmt(p.gl)}</td><td className="num">{fmt(p.sw)}</td>
+        <td className="num">{fmt(p.gw)}</td><td className="num muted">{fmt(p.gl)}</td><td className="num">{fmt(p.sw)}</td><td className="num muted">{fmt(p.sl)}</td>
         <td className="num">{fmt(p.aces)}</td><td className="num muted">{fmt(p.dfs)}</td><td className="num">{fmt(p.breaks)}</td>
         <td className="muted">{fmtTime(p.startTime)}</td>
         <td style={{ textAlign: 'right', paddingRight: 10 }}><LockExcludeButtons name={p.name} isLocked={lockedPlayers.includes(p.name)} isExcluded={excludedPlayers.includes(p.name)} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} /></td>
@@ -3349,7 +3349,7 @@ function BuilderTab({ players: rp, ownership, lockedPlayers = [], excludedPlayer
     res.lineups.forEach((lu, i) => { const ps = lu.players.map(j => res.pData[j]).sort((a, b) => b.salary - a.salary); c += `${i + 1},${lu.proj},${lu.sal},${ps.map(p => p.name).join(',')}\n`; });
     dl(c, 'lineups.csv');
   };
-  const exportProjections = () => { let c = 'Player,Salary,Win%,Proj,Value,GW,GL,SW,Aces,DFs,Breaks,P(2-0),Opp\n'; sp.forEach(p => { c += `${p.name},${p.salary},${(p.wp * 100).toFixed(0)}%,${p.proj},${p.val},${fmt(p.gw)},${fmt(p.gl)},${fmt(p.sw)},${fmt(p.aces)},${fmt(p.dfs)},${fmt(p.breaks)},${fmtPct(p.pStraight)},${p.opponent}\n`; }); dl(c, 'projections.csv'); };
+  const exportProjections = () => { let c = 'Player,Salary,Win%,Proj,Value,GW,GL,SW,SL,Aces,DFs,Breaks,P(2-0),Opp\n'; sp.forEach(p => { c += `${p.name},${p.salary},${(p.wp * 100).toFixed(0)}%,${p.proj},${p.val},${fmt(p.gw)},${fmt(p.gl)},${fmt(p.sw)},${fmt(p.sl)},${fmt(p.aces)},${fmt(p.dfs)},${fmt(p.breaks)},${fmtPct(p.pStraight)},${p.opponent}\n`; }); dl(c, 'projections.csv'); };
   const overrideCount = useMemo(() => rp.filter(p => p._overridden).length, [rp]);
   const canBuild = true;  // v5.8: compliance gate retired; 1% variance floor handles CSV differentiation
   useBuilderShortcuts({ run, canBuild, isBuilding }); // v3.24.14: B/R to build/rebuild
