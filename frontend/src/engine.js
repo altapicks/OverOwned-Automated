@@ -181,6 +181,48 @@ function poissonTail(lambda, k) {
   return clamp(1 - cdf, 0.01, 0.95);
 }
 
+// v6.2: Per-player breaks count derived from the two Pinnacle Games-Won
+// lines. Used as the third-tier fallback in sharp mode when NEITHER
+// the sportsbook nor PP posts a per-player Break Points Won line for
+// this match. Sharper than the wp-only sigmoid baseline because it
+// consumes the actual Pinnacle gw market (which the engine already
+// trusts everywhere else in sharp mode).
+//
+// Math: in tennis, total games won = holds + breaks. Since players
+// alternate serve roughly evenly, gw_a − gw_b ≈ 2·(breaks_a − breaks_b).
+// That gives the break differential. For total breaks, we use the tour-
+// average rate of ~22% of games being breaks, scaled up slightly in
+// tighter matches (more break-back exchanges per game).
+//
+// Worked example — Sinner vs Moller, gw_a=12.5, gw_b=5.5:
+//   T          = 18
+//   tightness  = 1 − 7/18 = 0.61
+//   total_brk  = 18 × (0.20 + 0.05 × 0.61) ≈ 4.15
+//   diff       = 7/2 = 3.5
+//   breaks_a   = (4.15 + 3.5) / 2 = 3.83
+//   breaks_b   = (4.15 − 3.5) / 2 = 0.33
+//
+// Vs. the wp-only fallback which would give Sinner 2.53 and Moller 1.59
+// (badly underweighting the favorite's break dominance against an
+// underdog who can't realistically break a 97% favorite 1.6 times).
+//
+// Returns null on bad inputs so the caller can fall back further down
+// the tier chain. Clamped at 0 — never returns negative breaks even if
+// the line differential is so wide it implies negative break counts
+// for the underdog.
+function breaksFromGames(gw_a, gw_b) {
+  if (gw_a == null || gw_b == null) return null;
+  const T = gw_a + gw_b;
+  if (T <= 0) return null;
+  const diff = gw_a - gw_b;
+  const tightness = clamp(1 - Math.abs(diff) / T, 0, 1);
+  const totalBreaks = T * (0.20 + 0.05 * tightness);
+  const breaksDiff = diff / 2;
+  const breaks_a = Math.max(0, (totalBreaks + breaksDiff) / 2);
+  const breaks_b = Math.max(0, (totalBreaks - breaksDiff) / 2);
+  return { breaks_a, breaks_b };
+}
+
 // Derive match win probabilities from the two Games Won lines.
 // Tennis game-share → match-win-prob is non-linear: games compound through
 // sets, and small edges in games-won correspond to larger edges in match-win
@@ -315,11 +357,22 @@ export function processMatch(match) {
   const gw_a = adjustLine(o.gw_a_line, o.gw_a_over);
   const gw_b = adjustLine(o.gw_b_line, o.gw_b_over);
 
+  // v6.2: Derive a games-won-based breaks fallback up front so both sides
+  // can use it. Only consulted when neither sportsbook nor PP has a per-
+  // player breaks line for the match (e.g. Sinner-tier favorites where
+  // PP routinely omits the BP prop). See breaksFromGames() for the math.
+  const gwDerivedBreaks = breaksFromGames(gw_a, gw_b);
+
   // v6.1: Per-stat three-tier fallback chain (sharp prop → posted_line →
   // wp-derived baseline). Was two-tier before, which meant Pinnacle-only
   // matches without sportsbook ace/DF/break props bottomed out to 0.0 and
   // broke every break-related gem/fade signal. Posted_lines come from the
   // PrizePicks/Underdog ingest and reflect the real market when available.
+  //
+  // v6.2: Breaks specifically gets a NEW third tier — gw-derived breaks
+  // from breaksFromGames() — slotted between posted_lines and the
+  // wp-baseline. Aces and DFs keep their original 3-tier chain (no
+  // games-margin analog for serve stats).
 
   // Breaks
   let brk_a, brk_b;
@@ -327,6 +380,8 @@ export function processMatch(match) {
     brk_a = poissonEV(o.brk_a_over, Math.ceil(o.brk_a_line));
   } else if (o.posted_lines?.a?.breaks != null) {
     brk_a = o.posted_lines.a.breaks;
+  } else if (gwDerivedBreaks) {
+    brk_a = gwDerivedBreaks.breaks_a;
   } else {
     brk_a = sharpBaseline.player_a.breaks;
   }
@@ -334,6 +389,8 @@ export function processMatch(match) {
     brk_b = poissonEV(o.brk_b_over, Math.ceil(o.brk_b_line));
   } else if (o.posted_lines?.b?.breaks != null) {
     brk_b = o.posted_lines.b.breaks;
+  } else if (gwDerivedBreaks) {
+    brk_b = gwDerivedBreaks.breaks_b;
   } else {
     brk_b = sharpBaseline.player_b.breaks;
   }
