@@ -14,21 +14,37 @@ PP integration model (the part that runs the show):
         slate.pp_lines                       match.odds.posted_lines
         (PP tab UI) — every variant          — engine.js posted_lines
         emitted as a separate row            override path → DK/PP proj.
-        (player, stat, line, mult,           Uses median across variants
-        odds_type). Fantasy Score is         when standard is absent so
-        what the PP TAB actually displays    the engine still gets a single
-        per the user's spec; other stats     projection center per stat.
-        are exposed for edge calcs.
+        (player, stat, line, mult,           Uses MULTIPLIER-AWARE Poisson
+        odds_type). Fantasy Score is         fit (v6.5) to convert (line,mult)
+        what the PP tab displays per the     pairs into a projection center,
+        user's spec; other stats are         instead of taking the line
+        exposed for edge calcs.              value verbatim.
 
 v6.4 — pp_lines now emits one row per (player, stat, odds_type) instead of
 collapsing to one row per (player, stat). Multiplier is included so the PP
 tab UI can render goblin/demon variants alongside standard with their
-correct payouts. The engine's posted_lines projection logic is unchanged.
+correct payouts.
+
+v6.5 — engine-side aggregation now uses a multiplier-aware Poisson fit for
+Aces / Double Faults / Break Points Won / Total Games Won. Each variant
+(line, mult) implies a Poisson λ via P(X ≥ ⌈line⌉) ≈ 1/mult; we fit each
+and average. This is sharper than the previous "use standard if present
+else median of lines" because (a) most stat-prop rows have no standard
+variant, (b) the median of {goblin 4.5, demon 6.5} is just 5.5 regardless
+of the multipliers, which throws away the price information.
+
+v6.5 — also: posted_lines.{a,b}.games_won / games_lost are now SUPPRESSED
+when matches.odds.gw_a_line / gw_b_line are present. Per spec, GW/GL must
+come from Pinnacle (SGO) not PP. The engine reads the Pinnacle gw_*_line
+fields directly in sharp mode, so dropping them from posted_lines lets the
+engine consume them. PP games_won is still kept as a fallback when SGO
+hasn't posted the games-O/U markets yet.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from statistics import median
 from typing import Optional
@@ -73,6 +89,89 @@ PP_STAT_TO_POSTED_LINE_KEY = {
     "Total Games Won": "games_won",
 }
 
+# v6.5: stat types we treat as Poisson-distributed (count of discrete events).
+# Multiplier-aware λ-fit is applied to these. Fantasy Score is excluded —
+# it's a continuous-ish weighted score, Poisson doesn't fit.
+POISSON_PP_STATS = frozenset({
+    "Aces",
+    "Double Faults",
+    "Break Points Won",
+    "Total Games Won",
+})
+
+
+# ── Multiplier-aware Poisson fit (v6.5) ──────────────────────────────
+
+
+def _fit_poisson_lambda_from_pp(line: float, multiplier: float) -> Optional[float]:
+    """Solve for the Poisson λ implied by a single PP (line, multiplier) pair.
+
+    PP "more" pays `multiplier`, so the implied probability of the over is
+    approximately 1/multiplier (PP juice is small and built into the mult).
+
+    We interpret "over line" as P(X >= ceil(line)) for half-integer lines
+    (the typical case — e.g. 5.5 means X >= 6) and as P(X >= line+1) for
+    whole-integer lines.
+
+    Returns None if inputs are unusable (mult <= 1, line <= 0, or implied
+    prob outside (0.05, 0.95) where Newton's method becomes unreliable).
+    """
+    try:
+        line_f = float(line)
+        mult_f = float(multiplier)
+    except (TypeError, ValueError):
+        return None
+
+    if mult_f <= 1.0 or line_f <= 0.0:
+        return None
+
+    p_over = 1.0 / mult_f
+    if not (0.05 < p_over < 0.95):
+        return None
+
+    # Determine k such that "over line" means X >= k.
+    if abs(line_f - round(line_f)) < 1e-9:
+        # Whole integer line (rare on PP for these stats, but possible)
+        k = int(round(line_f)) + 1
+    else:
+        k = math.ceil(line_f)
+    if k <= 0:
+        return None
+
+    # Newton iteration on f(λ) = P(X >= k, λ) - p_over = 0.
+    # df/dλ = P(X = k-1, λ) (telescoping derivative of Poisson tail).
+    lam = max(line_f, 0.5)
+    for _ in range(60):
+        # P(X >= k, λ) = 1 - sum_{i=0..k-1} e^-λ λ^i / i!
+        s = 0.0
+        # Compute the sum in log-stable order; for the small λ ranges
+        # we hit (typically 1-15 for tennis), direct compute is fine.
+        for i in range(k):
+            try:
+                s += math.exp(-lam) * (lam ** i) / math.factorial(i)
+            except OverflowError:
+                return None
+        p_cur = 1.0 - s
+        err = p_cur - p_over
+        if abs(err) < 5e-4:
+            return max(0.05, lam)
+        try:
+            deriv = math.exp(-lam) * (lam ** (k - 1)) / math.factorial(k - 1)
+        except OverflowError:
+            return None
+        if deriv < 1e-9:
+            break
+        # f(λ) decreases as λ rises (more mass above k, no — wait, P(X>=k)
+        # INCREASES as λ rises). df/dλ = +P(X=k-1, λ). So Newton step:
+        #   λ_new = λ - err / deriv
+        lam -= err / deriv
+        lam = max(0.05, min(lam, 50.0))
+
+    # Didn't converge to tolerance; return last iterate if it's in range.
+    if 0.05 <= lam <= 50.0:
+        return lam
+    return None
+
 
 def _build_opening_odds_model(raw: Optional[dict]) -> Optional[FrontendMatchOdds]:
     """Flatten stored opening_odds (source-keyed) into FrontendMatchOdds."""
@@ -96,52 +195,83 @@ def _build_opening_odds_model(raw: Optional[dict]) -> Optional[FrontendMatchOdds
 
 
 def _aggregate_pp_lines_for_engine(rows: list[dict]) -> dict[tuple[str, str], dict]:
-    """Median across standard/demon/goblin per (canonical_id, stat_type).
+    """Aggregate PP variants into a single projection center per (player, stat).
 
-    Used ONLY to drive match.odds.posted_lines for the engine. The engine
-    needs ONE projection center per stat — the median (or standard if it
-    exists) is the right choice. The PP tab UI uses
-    _emit_pp_lines_all_variants() instead which keeps every row separate.
+    v6.5 — for Poisson stats (Aces / Double Faults / Break Points Won /
+    Total Games Won), fit a Poisson λ from each variant's (line, multiplier)
+    and average. This is sharper than median(lines) because it uses the
+    multiplier signal, which encodes how aggressively PP shifted that
+    variant's line off the fair value.
 
-    PP runs each prop in three flavors:
-      standard  — closest to the "true" line, but only ~15% of props publish it
-      demon     — line shifted UP (harder over, boosted multiplier)
-      goblin    — line shifted DOWN (easier over, reduced multiplier)
-    Median across all three approximates the unobserved true line and keeps
-    Aces/DF/Sets/Games Won props (which are almost exclusively demon/goblin)
-    usable as projection inputs.
+    For Fantasy Score (and any other non-Poisson stat that ever lands here),
+    fall back to the previous logic: standard line if present, else median
+    across variants.
 
-    Falls back to the standard line alone if it exists, otherwise the median,
-    ensuring single-variant rows still pass through.
+    The return value is what writes into match.odds.posted_lines, so the
+    "line" field below is treated by engine.js as the projection center
+    (lambda for Poisson stats).
 
     Key: (player_id, stat_type) → {"line": float, "raw_player_name": str}
     """
-    bucket: dict[tuple[str, str], list[tuple[str, float, str]]] = {}
+    bucket: dict[tuple[str, str], list[tuple[str, float, Optional[float], str]]] = {}
     for r in rows:
         pid = r.get("player_id")
         stat = r.get("stat_type")
         line = r.get("current_line")
         odds_type = r.get("odds_type") or "standard"
         raw_name = r.get("raw_player_name") or ""
+        mult_raw = r.get("multiplier")
         if not pid or not stat or line is None:
             continue
         try:
             ln = float(line)
         except (TypeError, ValueError):
             continue
-        bucket.setdefault((pid, stat), []).append((odds_type, ln, raw_name))
+        try:
+            mult_f = float(mult_raw) if mult_raw is not None else None
+        except (TypeError, ValueError):
+            mult_f = None
+        bucket.setdefault((pid, stat), []).append((odds_type, ln, mult_f, raw_name))
 
     out: dict[tuple[str, str], dict] = {}
-    for key, variants in bucket.items():
-        std = [v for v in variants if v[0] == "standard"]
-        if std:
-            chosen_line = std[0][1]
-            chosen_name = std[0][2]
-        else:
-            lines = [v[1] for v in variants]
-            chosen_line = float(median(lines))
-            chosen_name = variants[0][2]
-        out[key] = {"line": chosen_line, "raw_player_name": chosen_name}
+    for (pid, stat), variants in bucket.items():
+        chosen_name = variants[0][3]
+        chosen_line: Optional[float] = None
+        method = ""
+
+        # ── Poisson-fit path (v6.5) ────────────────────────────────────
+        if stat in POISSON_PP_STATS:
+            lambdas: list[float] = []
+            for odds_type, ln, mult_f, _ in variants:
+                if mult_f is None:
+                    # No multiplier → can't fit. Skip, fall through to
+                    # line-based fallback at the bottom.
+                    continue
+                lam = _fit_poisson_lambda_from_pp(ln, mult_f)
+                if lam is not None:
+                    lambdas.append(lam)
+            if lambdas:
+                chosen_line = sum(lambdas) / len(lambdas)
+                method = "poisson_fit"
+
+        # ── Standard-or-median fallback ────────────────────────────────
+        if chosen_line is None:
+            std = [v for v in variants if v[0] == "standard"]
+            if std:
+                chosen_line = std[0][1]
+                chosen_name = std[0][3]
+                method = "standard_line"
+            else:
+                lines = [v[1] for v in variants]
+                chosen_line = float(median(lines))
+                method = "line_median"
+
+        out[(pid, stat)] = {
+            "line": chosen_line,
+            "raw_player_name": chosen_name,
+            "method": method,
+            "n_variants": len(variants),
+        }
     return out
 
 
@@ -224,19 +354,28 @@ def _project_posted_lines_for_match(
     pp_agg: dict[tuple[str, str], dict],
     wp_a: Optional[float],
     existing_posted: Optional[dict],
+    sgo_has_gw_lines: bool = False,
 ) -> Optional[dict]:
-    """Build match.odds.posted_lines.{a,b} from per-player PP medians.
+    """Build match.odds.posted_lines.{a,b} from per-player PP aggregations.
 
     engine.js applyPostedLineOverrides reads:
         aces, dfs, breaks, games_won, games_lost, sets_won, sets_lost
 
-    PP gives us aces, dfs, breaks (= Break Points Won), and games_won
-    (= Total Games Won) directly per player. We derive games_lost cross-side
-    (a.games_lost = b.games_won) since a's games_lost are the games b
-    actually wins. sets_won / sets_lost are intentionally NOT derived —
-    engine baseline math handles them from Kalshi wp, which is far more
-    reliable than trying to back them out of the match-level Total Sets line
-    PP publishes.
+    Source-of-truth policy (per spec, v6.5):
+        aces / dfs / breaks  → PP (this is the only source for these in
+                                tennis; Pinnacle does not post serve props)
+        games_won/_lost      → Pinnacle (SGO gw_a_line / gw_b_line) when
+                                SGO has them; PP as fallback otherwise
+        sets_won/_lost       → engine baseline math from Kalshi wp + p3set
+                                (NOT projected here at all)
+
+    When sgo_has_gw_lines is True, we suppress games_won/games_lost from
+    posted_lines so the engine consumes the Pinnacle line in sharp mode
+    instead of having it overridden post-hoc by PP.
+
+    Cross-side derivation: when only one side has a games_won line (and
+    SGO hasn't posted gw lines), set the other side's games_lost from it
+    — a's games_lost = b's games_won by definition.
 
     If existing_posted (from manual CSV upload) has any keys, those win on
     collision — manual override is sacred.
@@ -246,6 +385,11 @@ def _project_posted_lines_for_match(
     for side_key, pid in [("a", pa_id), ("b", pb_id)]:
         side_dict: dict = {}
         for pp_stat, posted_key in PP_STAT_TO_POSTED_LINE_KEY.items():
+            # v6.5: when SGO has Pinnacle gw lines, do NOT propagate PP's
+            # games_won line into posted_lines. Engine reads gw_a_line /
+            # gw_b_line directly in sharp mode and that's the path we want.
+            if posted_key == "games_won" and sgo_has_gw_lines:
+                continue
             agg = pp_agg.get((pid, pp_stat))
             if agg is not None:
                 side_dict[posted_key] = float(agg["line"])
@@ -254,6 +398,8 @@ def _project_posted_lines_for_match(
 
     a_side = sides.get("a", {})
     b_side = sides.get("b", {})
+    # Cross-side games_lost derivation only kicks in when games_won was
+    # actually written above (i.e., SGO didn't suppress it).
     if "games_lost" not in a_side and "games_won" in b_side:
         a_side["games_lost"] = b_side["games_won"]
     if "games_lost" not in b_side and "games_won" in a_side:
@@ -320,7 +466,8 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         or []
     )
 
-    # Engine-side projection center: one median line per (player, stat).
+    # Engine-side projection center: multiplier-aware Poisson fit per
+    # (player, stat). v6.5.
     pp_agg = _aggregate_pp_lines_for_engine(pp_rows)
 
     frontend_matches: list[FrontendMatch] = []
@@ -333,9 +480,18 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         odds = m.get("odds") or {}
         wp_a = odds.get("kalshi_prob_a")
         existing_posted = odds.get("posted_lines")
+        # v6.5: if SGO has posted Pinnacle games-won lines, the engine
+        # should consume those directly. Suppress PP games_won from
+        # posted_lines so applyPostedLineOverrides doesn't clobber the
+        # Pinnacle-derived gw_a / gw_b in buildPlayerStats output.
+        sgo_has_gw_lines = (
+            odds.get("gw_a_line") is not None
+            and odds.get("gw_b_line") is not None
+        )
 
         projected = _project_posted_lines_for_match(
-            pa_id, pb_id, pp_agg, wp_a, existing_posted
+            pa_id, pb_id, pp_agg, wp_a, existing_posted,
+            sgo_has_gw_lines=sgo_has_gw_lines,
         )
         if projected:
             odds = {**odds, "posted_lines": projected}
@@ -399,10 +555,8 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     }
 
     # PP tab UI feed: every variant per (player, stat) emitted as a separate
-    # row with its line and multiplier. The PP TAB display filters to Fantasy
-    # Score by default per the user's spec — the other stats are exposed here
-    # so any PP-tab edge calc that wants them can read them without an extra
-    # fetch, and so the user can see goblin/demon line-up / line-down splits.
+    # row with its line and multiplier. The PP tab now (v6.5 frontend) shows
+    # ALL stat types via tabs, defaulting to Fantasy Score.
     pp_lines_out = _emit_pp_lines_all_variants(pp_rows)
 
     return FrontendSlate(
