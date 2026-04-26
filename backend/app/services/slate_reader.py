@@ -1,23 +1,23 @@
 """Read-side service: builds the frontend-facing FrontendSlate from DB rows.
 
-This is what the API returns to the React app. The shape matches the
-existing slate.json schema exactly so no UI changes are needed.
+This is what the API returns to the React app. The shape matches the existing
+slate.json schema exactly so no UI changes are needed.
 
 PP integration model (the part that runs the show):
 
-  prizepicks_lines (raw, all 3 variants per stat) ──┐
-                                                    │
-                                                    ▼
-                         per-(canonical_id, stat) MEDIAN line
-                                                    │
-                                  ┌─────────────────┴─────────────────┐
-                                  ▼                                   ▼
-                      slate.pp_lines (PP tab UI)          match.odds.posted_lines
-                      — Fantasy Score only, used          — projected per-side, used
-                        for over/under edge display         by engine.js posted_lines
-                                                            override path → DK proj
+    prizepicks_lines (raw, all 3 variants per stat)
+        ──┐
+          │
+          ▼
+    per-(canonical_id, stat) MEDIAN line
+          │
+          ┌─────────────────┴─────────────────┐
+          ▼                                   ▼
+    slate.pp_lines                  match.odds.posted_lines
+    (PP tab UI)                     — projected per-side, used
+    — Fantasy Score only, used      for engine.js posted_lines
+    for over/under edge display     override path → DK proj
 """
-
 from __future__ import annotations
 
 import logging
@@ -36,6 +36,7 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
+
 # PP stat_type → canonical name used by frontend pp_lines display.
 PP_STAT_TO_ENGINE = {
     "Aces": "Aces",
@@ -48,16 +49,22 @@ PP_STAT_TO_ENGINE = {
     "Total Tie Breaks": "Total Tie Breaks",
 }
 
+
 # PP stat_type → posted_lines key used by engine.js applyPostedLineOverrides().
-# These are the keys the DK projection function actually reads. Keep aligned
-# with the reader in frontend/src/engine.js (search applyPostedLineOverrides).
+#
+# IMPORTANT: only stat types that PP genuinely publishes per-player are
+# mapped here. PP's "Total Games" and "Total Sets" are MATCH-LEVEL totals
+# (e.g. 24.5 games / 2.5 sets played) — they are NOT a per-player line and
+# must not be projected onto posted_lines as games_lost / sets_won.
+#
+# games_lost is derived cross-side below (a.games_lost = b.games_won).
+# sets_won / sets_lost are intentionally left to engine baseline math
+# from the Kalshi win probability — the engine handles that correctly.
 PP_STAT_TO_POSTED_LINE_KEY = {
     "Aces": "aces",
     "Double Faults": "dfs",
     "Break Points Won": "breaks",
     "Total Games Won": "games_won",
-    # The engine separately consumes games_lost and sets_won/sets_lost
-    # — those are derived below from Total Games and Total Sets.
 }
 
 
@@ -86,12 +93,13 @@ def _aggregate_pp_lines(rows: list[dict]) -> dict[tuple[str, str], dict]:
     """Median across standard/demon/goblin per (canonical_id, stat_type).
 
     PP runs each prop in three flavors:
-      standard — closest to the "true" line, but only ~15% of props publish it
-      demon    — line shifted UP (harder over, boosted multiplier)
-      goblin   — line shifted DOWN (easier over, reduced multiplier)
-    Median across all three approximates the unobserved true line and keeps
-    Aces/DF/Sets/Games Won props (which are almost exclusively demon/goblin)
-    usable as projection inputs.
+        standard — closest to the "true" line, but only ~15% of props publish it
+        demon    — line shifted UP (harder over, boosted multiplier)
+        goblin   — line shifted DOWN (easier over, reduced multiplier)
+
+    Median across all three approximates the unobserved true line and
+    keeps Aces/DF/Sets/Games Won props (which are almost exclusively
+    demon/goblin) usable as projection inputs.
 
     Falls back to the standard line alone if it exists, otherwise the
     median, ensuring single-variant rows still pass through.
@@ -137,52 +145,43 @@ def _project_posted_lines_for_match(
     """Build match.odds.posted_lines.{a,b} from per-player PP medians.
 
     engine.js applyPostedLineOverrides reads:
-      aces, dfs, breaks, games_won, games_lost, sets_won, sets_lost
+        aces, dfs, breaks, games_won, games_lost, sets_won, sets_lost
 
-    PP gives us aces, dfs, breaks (= Break Points Won), games_won
-    (= Total Games Won) directly. We derive games_lost from Total Games
-    when present, and sets_won/sets_lost from Total Sets + Kalshi wp
-    when present.
+    PP gives us aces, dfs, breaks (= Break Points Won), and games_won
+    (= Total Games Won) directly per player. We derive games_lost
+    cross-side (a.games_lost = b.games_won) since a's games_lost are
+    the games b actually wins. sets_won / sets_lost are intentionally
+    NOT derived — engine baseline math handles them from Kalshi wp,
+    which is far more reliable than trying to back them out of the
+    match-level Total Sets line PP publishes.
 
-    If existing_posted (from manual CSV upload, preserved as override)
-    has any keys, those win — manual override is sacred.
+    If existing_posted (from manual CSV upload) has any keys, those win
+    on collision — manual override is sacred.
     """
     sides: dict[str, dict] = {}
+
+    # First pass: aces / dfs / breaks / games_won per side from PP medians.
     for side_key, pid in [("a", pa_id), ("b", pb_id)]:
         side_dict: dict = {}
         for pp_stat, posted_key in PP_STAT_TO_POSTED_LINE_KEY.items():
             agg = pp_agg.get((pid, pp_stat))
             if agg is not None:
                 side_dict[posted_key] = float(agg["line"])
-
-        # Derive games_lost from Total Games when both halves are known.
-        # On PP tennis singles, Total Games is the player's own line
-        # (their team's total games in the match). games_lost = total - won.
-        tg = pp_agg.get((pid, "Total Games"))
-        gw = side_dict.get("games_won")
-        if tg is not None and gw is not None:
-            side_dict["games_lost"] = max(0.0, float(tg["line"]) - gw)
-
-        # Derive sets_won from Total Sets when present.
-        # PP Total Sets on a singles player is sets-won by that player.
-        ts = pp_agg.get((pid, "Total Sets"))
-        if ts is not None:
-            side_dict["sets_won"] = float(ts["line"])
-            # Best-of-3 expected sets-played by side ≈ 2 + p3set.
-            # Without p3set we approximate from wp distance to 0.5.
-            if wp_a is not None:
-                this_side_wp = wp_a if side_key == "a" else 1 - wp_a
-                exp_sets_played = 2.0 + 0.3 + 0.4 * (
-                    1 - abs(this_side_wp - 0.5) * 2
-                )
-            else:
-                exp_sets_played = 2.4
-            side_dict["sets_lost"] = max(
-                0.0, exp_sets_played - side_dict["sets_won"]
-            )
-
         if side_dict:
             sides[side_key] = side_dict
+
+    # Second pass: cross-side games_lost derivation.
+    # a's games_lost ≡ games b wins, and vice versa.
+    a_side = sides.get("a", {})
+    b_side = sides.get("b", {})
+    if "games_lost" not in a_side and "games_won" in b_side:
+        a_side["games_lost"] = b_side["games_won"]
+    if "games_lost" not in b_side and "games_won" in a_side:
+        b_side["games_lost"] = a_side["games_won"]
+    if a_side:
+        sides["a"] = a_side
+    if b_side:
+        sides["b"] = b_side
 
     # Merge with existing manual override (manual wins on collision).
     if existing_posted and isinstance(existing_posted, dict):
@@ -246,7 +245,6 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         pb_id = m["player_b_id"]
         pa_name = (m.get("player_a") or {}).get("display_name") or pa_id
         pb_name = (m.get("player_b") or {}).get("display_name") or pb_id
-
         odds = m.get("odds") or {}
         wp_a = odds.get("kalshi_prob_a")
         existing_posted = odds.get("posted_lines")
@@ -299,7 +297,6 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         elif rp == "ACPT":
             entry["acpt_id"] = effective_dk_id
             entry["acpt_salary"] = sp["salary"]
-
         val = sp.get("ss_pool_own")
         if val is not None and entry.get("ss_pool_own") is None:
             try:
