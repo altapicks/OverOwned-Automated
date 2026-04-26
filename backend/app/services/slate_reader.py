@@ -203,6 +203,92 @@ def _fit_poisson_lambda_from_pp(line: float, multiplier: float) -> Optional[floa
     return None
 
 
+def _filter_expired_pp_lines(
+    pp_lines: list[dict],
+    frontend_matches: list[FrontendMatch],
+    *,
+    grace_minutes: int = 15,
+) -> list[dict]:
+    """v6.11: drop PP lines whose player's match started >grace_minutes ago.
+
+    Buffer prevents flicker on matches running long (rolling court schedules
+    in tennis routinely push start times by 20+ minutes). PrizePicks locks
+    a player's lines at their actual on-court start, so this is a lower
+    bound — better to occasionally show a line briefly post-lock than to
+    hide active lines for a match that hasn't started yet.
+
+    No-op when frontend_matches is empty or no start_times are parseable.
+    """
+    if not pp_lines or not frontend_matches:
+        return list(pp_lines)
+
+    now = datetime.now(timezone.utc)
+    cutoff_seconds = grace_minutes * 60
+
+    # Build lookup: lowercased player name → start_time datetime.
+    # Many DK feeds store start_time as ISO8601; some (DK featured) use
+    # "MM/DD/YYYY HH:MMam/pm ET" — we accept either.
+    player_start: dict[str, datetime] = {}
+
+    def _try_parse(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            # ISO first
+            dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (TypeError, ValueError):
+            pass
+        # DK-style fallback: "04/26/2026 10:00AM ET"
+        import re as _re
+        m = _re.match(
+            r"(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})(am|pm)\s*(\w+)?",
+            str(s).strip(),
+            _re.IGNORECASE,
+        )
+        if m:
+            mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            h = int(m.group(4))
+            mn = int(m.group(5))
+            ap = m.group(6).lower()
+            if ap == "pm" and h != 12:
+                h += 12
+            if ap == "am" and h == 12:
+                h = 0
+            # Treat as UTC since we don't know the venue tz here. ±4hr drift
+            # is acceptable for a 15-minute grace window.
+            return datetime(y, mo, d, h, mn, tzinfo=timezone.utc)
+        return None
+
+    for fm in frontend_matches:
+        start = _try_parse(getattr(fm, "start_time", None))
+        if not start:
+            continue
+        for name in (getattr(fm, "player_a", None), getattr(fm, "player_b", None)):
+            if name:
+                player_start[str(name).lower().strip()] = start
+
+    if not player_start:
+        return list(pp_lines)
+
+    out: list[dict] = []
+    for line in pp_lines:
+        name = (line.get("player") or "").lower().strip()
+        start = player_start.get(name)
+        if start is None:
+            # Unknown player — don't drop; safer to show.
+            out.append(line)
+            continue
+        elapsed = (now - start).total_seconds()
+        if elapsed > cutoff_seconds:
+            continue  # match started >15min ago → hide
+        out.append(line)
+
+    return out
+
+
 def _compute_next_tournament(
     cpi_rows: list[dict],
     frontend_matches: list[FrontendMatch],
@@ -746,6 +832,17 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     # row with its line and multiplier. The PP tab now (v6.5 frontend) shows
     # ALL stat types via tabs, defaulting to Fantasy Score.
     pp_lines_out = _emit_pp_lines_all_variants(pp_rows)
+
+    # v6.11: Buffered post-start filter. PrizePicks locks each line at the
+    # match's start time, but the scraper's circuit breaker can leave stale
+    # rows in our DB when a fetch is partial. Drop any line whose player's
+    # match started more than 15 minutes ago — strictly hiding at start_time
+    # would cause flicker for matches running over (5–30 min late is common
+    # in tennis with rolling court schedules).
+    #
+    # Build a lookup of player_name → match_start_ms from frontend_matches.
+    # Both player_a and player_b on a match share the same start_time.
+    pp_lines_out = _filter_expired_pp_lines(pp_lines_out, frontend_matches)
 
     # v6.7: Tournament CPI base data. Manually-maintained reference values from
     # `tournament_cpi_base` table — small dim table (~20 rows). Pulled once per
