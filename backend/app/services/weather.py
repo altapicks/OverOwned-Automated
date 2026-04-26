@@ -41,7 +41,14 @@ from app.services.tennis_venues import lookup_venue
 log = logging.getLogger(__name__)
 
 ACCU_API_KEY = os.getenv("ACCUWEATHER_API_KEY", "")
-ACCU_BASE = "http://dataservice.accuweather.com"
+# v6.9: Must be https://. AccuWeather has been HTTPS-only since 2020 and
+# returns 301 Moved Permanently to any plain-http request. The previous
+# http:// caused every request to fail at the redirect step because httpx
+# doesn't auto-follow by default — the fetcher saw an empty body + 301
+# and treated it as an HTTP failure. We also pass follow_redirects=True
+# below as a belt-and-braces safety net in case AccuWeather ever changes
+# their host structure (e.g. dataservice → api.accuweather.com).
+ACCU_BASE = "https://dataservice.accuweather.com"
 
 # Forecast freshness: refuse to refresh a match's weather more often than
 # this. Prevents accidental burning of API budget on rapid-fire calls.
@@ -143,7 +150,7 @@ def _fetch_location_key_via_geoposition(
     url = f"{ACCU_BASE}/locations/v1/cities/geoposition/search"
     params = {"apikey": ACCU_API_KEY, "q": f"{lat},{lon}"}
     try:
-        with httpx.Client(timeout=timeout) as client:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             r = client.get(url, params=params)
         if r.status_code != 200:
             log.warning(
@@ -217,7 +224,7 @@ def _fetch_hourly_12h_forecast(
     url = f"{ACCU_BASE}/forecasts/v1/hourly/12hour/{location_key}"
     params = {"apikey": ACCU_API_KEY, "details": "true", "metric": "false"}
     try:
-        with httpx.Client(timeout=timeout) as client:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             r = client.get(url, params=params)
         if r.status_code == 401:
             log.error("AccuWeather 401: API key invalid or expired.")
@@ -313,6 +320,7 @@ def _compact_forecast(raw: Dict[str, Any]) -> Dict[str, Any]:
 def fetch_weather_for_match(
     match_row: Dict[str, Any], force: bool = False,
     slate_label: Optional[str] = None,
+    errors_out: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Resolve venue → location_key → forecast → persist on matches.weather.
 
@@ -320,11 +328,19 @@ def fetch_weather_for_match(
     `slate_label` is an optional fallback used when match.tournament is null
     or doesn't match any venue (see _resolve_venue_with_fallback).
     `force=True` bypasses the MIN_REFRESH_MINUTES freshness check.
+    `errors_out` is an optional list — if provided, this function appends a
+    short human-readable failure reason on every error path. v6.9: lets
+    refresh_weather_for_slate surface failures in its API response without
+    requiring callers to read Railway logs.
 
     Returns the persisted weather dict on success, None if the match couldn't
     be resolved (unknown venue, API failure, missing data) — in which case
     matches.weather is left unchanged.
     """
+    def _record(msg: str) -> None:
+        if errors_out is not None and len(errors_out) < 30:
+            errors_out.append(msg)
+
     match_id = match_row.get("id")
     tournament = match_row.get("tournament")
     start_time = match_row.get("start_time")
@@ -335,6 +351,7 @@ def fetch_weather_for_match(
             "weather: no venue match for tournament=%r slate_label=%r match=%s — skip",
             tournament, slate_label, match_id,
         )
+        _record(f"match={match_id}: no venue match (tournament={tournament!r}, slate_label={slate_label!r})")
         return None
 
     if venue_source == "slate_label":
@@ -379,6 +396,7 @@ def fetch_weather_for_match(
             "weather: location_key resolution failed for match=%s venue=%s",
             match_id, venue.get("name"),
         )
+        _record(f"match={match_id}: location_key lookup failed for {venue.get('name')!r} (check ACCUWEATHER_API_KEY env var)")
         return None
 
     forecasts = _fetch_hourly_12h_forecast(loc["location_key"])
@@ -387,11 +405,13 @@ def fetch_weather_for_match(
             "weather: forecast fetch failed for match=%s loc_key=%s",
             match_id, loc["location_key"],
         )
+        _record(f"match={match_id}: forecast fetch failed for location_key={loc['location_key']}")
         return None
 
     chosen = _pick_forecast_nearest(forecasts, start_time)
     if not chosen:
         log.warning("weather: no usable forecast hour for match=%s", match_id)
+        _record(f"match={match_id}: no usable forecast hour returned")
         return None
 
     out = {
@@ -511,7 +531,13 @@ def refresh_weather_for_slate(slate_id: str, force: bool = False) -> Dict[str, A
 
         # v6.8: pass slate_label through so fetch_weather_for_match
         # uses the same fallback if called directly elsewhere.
-        result = fetch_weather_for_match(m, force=force, slate_label=slate_label)
+        # v6.9: pass the summary errors list so failures get reported in
+        # the API response instead of being silent (was making debugging
+        # require Railway log access).
+        result = fetch_weather_for_match(
+            m, force=force, slate_label=slate_label,
+            errors_out=summary["errors"],
+        )
         if result is None:
             summary["failed"] += 1
         elif result.get("is_indoor"):
