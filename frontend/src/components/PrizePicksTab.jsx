@@ -1,13 +1,20 @@
 // ═══════════════════════════════════════════════════════════════════════
 // PrizePicks tab — admin entry + realtime display
 //
+// v6.5 — stat-category tab bar at top. Default tab is Fantasy Score (the
+// only stat where the engine produces a meaningful per-player projection
+// to compare against). Other tabs (Aces, Double Faults, Breakpoints Won,
+// Total Games Won, Total Sets, Total Games, Total Tie Breaks) are still
+// projected via player.aces / .dfs / .breaks etc. but are exposed for
+// browsing PP lines + line movements without leaving the tab.
+//
+// Backend default also changed (v6.5): /api/prizepicks/lines now returns
+// every stat type by default. The client filters to the selected tab.
+// One fetch covers every tab → instant tab switching.
+//
 // Wire into App.jsx by:
 //   1. import { PrizePicksTab } from './components/PrizePicksTab';
-//   2. Add a tab button next to existing ones: { key: 'pp', label: 'PrizePicks' }
-//   3. Render <PrizePicksTab slateId={data?.meta?.slate_id || ...} /> when tab === 'pp'
-//
-// Public reads go directly to Supabase (fast, RLS-enforced).
-// Writes go through the backend API with admin JWT verification.
+//   2. Render <PrizePicksTab slateId={...} players={dkPlayers} /> when tab === 'pplines'
 // ═══════════════════════════════════════════════════════════════════════
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
@@ -15,6 +22,22 @@ import {
   createLine, updateLine, deleteLine, bulkUpsertLines,
   checkIsAdmin, subscribeToLines, subscribeToMovements, parseCsvLines,
 } from '../lib/prizepicks-api';
+
+// Tab order = display order. Fantasy Score first because it's the default
+// and the only stat with a sharp model-vs-line edge signal. The rest are
+// browse-only (projections show but edge magnitude is less reliable per
+// the user's spec).
+const STAT_TABS = [
+  { key: 'Fantasy Score',     label: 'Fantasy Score' },
+  { key: 'Aces',              label: 'Aces' },
+  { key: 'Double Faults',     label: 'Double Faults' },
+  { key: 'Break Points Won',  label: 'Breakpoints' },
+  { key: 'Total Games Won',   label: 'Games Won' },
+  { key: 'Total Games',       label: 'Total Games' },
+  { key: 'Total Sets',        label: 'Total Sets' },
+  { key: 'Total Tie Breaks',  label: 'Tiebreakers' },
+];
+const DEFAULT_TAB = 'Fantasy Score';
 
 export function PrizePicksTab({ slateId, players = [] }) {
   const [lines, setLines] = useState([]);
@@ -27,14 +50,17 @@ export function PrizePicksTab({ slateId, players = [] }) {
   const [error, setError] = useState(null);
   const [sortKey, setSortKey] = useState('edge');
   const [sortDir, setSortDir] = useState('desc');
+  const [activeStat, setActiveStat] = useState(DEFAULT_TAB);
 
-  // Initial load + admin check
+  // Initial load + admin check.
+  // v6.5: pass 'all' so the API returns every stat_type. Client-side tab
+  // filtering takes it from there.
   useEffect(() => {
     if (!slateId) return;
     let cancelled = false;
     setLoading(true);
     Promise.all([
-      fetchLines(slateId),
+      fetchLines(slateId, 'all'),
       fetchRecentMovements(slateId, 50),
       checkIsAdmin(),
     ]).then(([ls, ms, admin]) => {
@@ -96,15 +122,18 @@ export function PrizePicksTab({ slateId, players = [] }) {
     } catch (e) { setError(e.message); }
   }, [slateId]);
 
-  // Build a lookup of projected values per (player, stat) for edge computation.
-  // Lines are compared against our model's projection to produce edge signals.
-  // Color coding: green = MORE (project over line), red = LESS (project under).
-  // Edge drives Hidden Gem + PP Fade signals in the DK tab.
-  //
-  // RULES-OF-HOOKS: all useMemo/useCallback MUST be above the early-return
-  // guards below. React tracks hooks by call order — returning early before
-  // calling these hooks on the first render and then calling them on the
-  // second render produces error #310.
+  // Per-stat row counts so the tab badges can show "Aces (24)" etc.
+  // Computed from raw lines BEFORE filtering so badge counts stay stable
+  // when tabs are switched.
+  const tabCounts = useMemo(() => {
+    const counts = {};
+    (lines || []).forEach(l => {
+      const k = l.stat_type;
+      if (k) counts[k] = (counts[k] || 0) + 1;
+    });
+    return counts;
+  }, [lines]);
+
   // Player lookup with multiple fallback strategies. PP/UD feeds often drop
   // middle particles ("Alex Minaur" vs DK's "Alex de Minaur") or use
   // different case/punctuation. We try strategies in descending specificity:
@@ -181,24 +210,37 @@ export function PrizePicksTab({ slateId, players = [] }) {
   const getProjectedForStat = useCallback((playerName, stat) => {
     const p = lookupPlayer(playerName);
     if (!p) return null;
-    // Stat label → projected field on player object
+    // Stat label → projected field on player object.
+    // PP returns the original API stat_type name (e.g. "Break Points Won",
+    // "Total Games Won"); we accept both that AND the engine-canonical
+    // alias the slate_reader emits in pp_lines (e.g. "Breakpoints Won",
+    // "Games Won") so the lookup works whether the row came via
+    // /api/prizepicks/lines or via slate.pp_lines.
     switch (stat) {
-      case 'Fantasy Score': return p.ppProj;
-      case 'Games Won': return p.gw;
-      case 'Games Played': return (p.gw || 0) + (p.gl || 0);
-      case 'Aces': return p.aces;
-      case 'Double Faults': return p.dfs;
-      case 'Breakpoints Won': return p.breaks;
-      case 'Sets Won': return p.sw;
-      case 'Sets Played': return (p.sw || 0) + (p.sl || 0);
-      case '1st Set Games Won': return p.stats?.firstSetGamesWon;  // may be undefined
-      case '1st Set Games Played': return p.stats?.firstSetGamesPlayed;
-      case 'Tiebreakers Played': return p.stats?.tiebreakersPlayed;
+      case 'Fantasy Score':       return p.ppProj;
+      case 'Total Games Won':
+      case 'Games Won':           return p.gw;
+      case 'Total Games':
+      case 'Games Played':        return (p.gw || 0) + (p.gl || 0);
+      case 'Aces':                return p.aces;
+      case 'Double Faults':       return p.dfs;
+      case 'Break Points Won':
+      case 'Breakpoints Won':     return p.breaks;
+      case 'Total Sets':
+      case 'Sets Won':            return p.sw;
+      case 'Sets Played':         return (p.sw || 0) + (p.sl || 0);
+      case 'Total Tie Breaks':    return p.stats?.tiebreakersPlayed;
+      case '1st Set Games Won':   return p.stats?.firstSetGamesWon;
+      case '1st Set Games Played':return p.stats?.firstSetGamesPlayed;
       default: return null;
     }
   }, [lookupPlayer]);
 
   // Enrich each line with projected + edge + direction, ready for display/sort.
+  // v6.5: edge is computed for every stat that maps to a player projection,
+  // not just Fantasy Score. Per spec, edge color/magnitude is most reliable
+  // on Fantasy Score (it integrates the full stat distribution), so the
+  // other tabs are exposed primarily as a browse-and-line-movement view.
   const enrichedLines = useMemo(() => {
     return (lines || []).map(line => {
       const projected = getProjectedForStat(line.raw_player_name, line.stat_type);
@@ -208,20 +250,23 @@ export function PrizePicksTab({ slateId, players = [] }) {
     });
   }, [lines, getProjectedForStat]);
 
-  // Top 3 PP fades — the three rows with the most negative edges (biggest
-  // "we project WAY under the posted line"). These get visually flagged
-  // in the table with a gem icon + subtle green row highlight, same
-  // semantic as the DK tab's Hidden Gem markers. Exposed as a Set of
-  // row ids for O(1) lookup during render.
+  // Filter by active stat tab. Done client-side off the full result set,
+  // so tab switches are instant and don't trigger a refetch.
+  const filteredLines = useMemo(() => {
+    return enrichedLines.filter(l => l.stat_type === activeStat);
+  }, [enrichedLines, activeStat]);
+
+  // Top 3 PP fades — within the active tab only. Same gem+green treatment
+  // as before, just scoped to whichever stat the user is looking at.
   const topFadeIds = useMemo(() => {
-    const withEdge = enrichedLines.filter(l => l.edge != null && l.edge < -0.5);
-    withEdge.sort((a, b) => a.edge - b.edge);  // most negative first
+    const withEdge = filteredLines.filter(l => l.edge != null && l.edge < -0.5);
+    withEdge.sort((a, b) => a.edge - b.edge);
     return new Set(withEdge.slice(0, 3).map(l => l.id));
-  }, [enrichedLines]);
+  }, [filteredLines]);
 
   // Sort — edge desc by default, but clicking a header cycles the sort.
   const sortedLines = useMemo(() => {
-    const arr = [...enrichedLines];
+    const arr = [...filteredLines];
     arr.sort((a, b) => {
       let va, vb;
       switch (sortKey) {
@@ -238,7 +283,7 @@ export function PrizePicksTab({ slateId, players = [] }) {
       return sortDir === 'asc' ? cmp : -cmp;
     });
     return arr;
-  }, [enrichedLines, sortKey, sortDir]);
+  }, [filteredLines, sortKey, sortDir]);
 
   const toggleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -286,6 +331,16 @@ export function PrizePicksTab({ slateId, players = [] }) {
           )}
         </div>
 
+        {/* Stat-category tab bar (v6.5). Horizontal scroll on narrow
+            screens, stays single-line on desktop. Each tab shows its
+            row count badge (computed from the unfiltered line set). */}
+        <StatTabs
+          tabs={STAT_TABS}
+          counts={tabCounts}
+          active={activeStat}
+          onChange={setActiveStat}
+        />
+
         {/* Hint strip: amber-accented contextual guidance. Style matches the
             error banner below (same padding/radius/font) but uses amber
             instead of red so users distinguish "tip" from "problem". */}
@@ -303,13 +358,15 @@ export function PrizePicksTab({ slateId, players = [] }) {
                stroke="#F5C518" strokeWidth="2"
                strokeLinecap="round" strokeLinejoin="round"
                style={{ flexShrink: 0 }}>
-            {/* Up-then-down line: rises from bottom-left, peaks, falls to
-                bottom-right. Conveys the "reversion after a spike" idea the
-                hint is warning about. */}
             <polyline points="3 17 9 11 13 14 21 6"/>
             <polyline points="15 6 21 6 21 12"/>
           </svg>
-          <span><strong style={{ color: '#F5C518', fontWeight: 600 }}>Hint:</strong> PrizePicks bad value will typically reverse</span>
+          <span>
+            <strong style={{ color: '#F5C518', fontWeight: 600 }}>Hint:</strong>{' '}
+            {activeStat === 'Fantasy Score'
+              ? 'PrizePicks bad value will typically reverse'
+              : 'Edge column shows projection − line for browsing; Fantasy Score is the sharpest signal'}
+          </span>
         </div>
 
         {error && <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#EF4444', padding: 10, borderRadius: 6, marginBottom: 12, fontSize: 12 }}>{error} <span style={{ cursor: 'pointer', marginLeft: 10 }} onClick={() => setError(null)}>✕</span></div>}
@@ -322,6 +379,8 @@ export function PrizePicksTab({ slateId, players = [] }) {
                 <SortHeader label="Player" col="player" />
                 <SortHeader label="Stat" col="stat" />
                 <SortHeader label="Line" col="line" num />
+                <SortHeader label="Mult" col="mult" num />
+                <SortHeader label="Type" col="odds_type" />
                 <SortHeader label="Proj" col="projected" num />
                 <SortHeader label="Edge" col="edge" num />
                 <th className="muted">Updated</th>
@@ -330,25 +389,12 @@ export function PrizePicksTab({ slateId, players = [] }) {
             </thead>
             <tbody>
               {sortedLines.length === 0 && (
-                <tr><td colSpan={isAdmin ? 8 : 7} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>
-                  No PrizePicks lines for this slate yet.
-                  {isAdmin && <> Click "Add Line" or "Paste CSV" to get started.</>}
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8, fontFamily: 'monospace' }}>
-                    slate_id: {slateId || '(none)'}
-                  </div>
+                <tr><td colSpan={isAdmin ? 10 : 9} style={{ textAlign: 'center', padding: 30, color: 'var(--text-dim)' }}>
+                  No PrizePicks lines for {activeStat} on this slate.
+                  {isAdmin && <> Click "Add Line" or "Paste CSV" to add some.</>}
                 </td></tr>
               )}
               {sortedLines.map(line => {
-                // Top 3 PP fades get the gem+green treatment — same visual
-                // semantic as Hidden Gems on the DK tab. Flash state (yellow
-                // highlight after admin edit) takes precedence so the user
-                // sees their edit confirmation.
-                //
-                // Apply the tint at cell-level rather than row-level so the
-                // .name column (which has font-weight: 600) renders the
-                // identical green to the other cells. Row-level tint was
-                // creating a subtle color mismatch because bold text on a
-                // tinted background perceptually shifts hue.
                 const isFade = topFadeIds.has(line.id);
                 const isFlash = flashId === line.id;
                 const cellBg = isFlash
@@ -357,6 +403,9 @@ export function PrizePicksTab({ slateId, players = [] }) {
                     ? 'rgba(74,222,128,0.10)'
                     : 'transparent';
                 const cellStyle = { background: cellBg, transition: 'background 0.3s' };
+                const multStr = line.multiplier != null
+                  ? Number(line.multiplier).toFixed(2)
+                  : '—';
                 return (
                 <tr key={line.id}>
                   <td style={{ ...cellStyle, textAlign: 'center', padding: '6px 4px' }}>
@@ -382,6 +431,8 @@ export function PrizePicksTab({ slateId, players = [] }) {
                       <span className="cell-proj">{line.current_line}</span>
                     )}
                   </td>
+                  <td className="num muted" style={cellStyle}>{multStr}</td>
+                  <td style={cellStyle}><OddsTypePill type={line.odds_type} /></td>
                   <td className="num muted" style={cellStyle}>{line.projected != null ? (Math.round(line.projected * 100) / 100).toFixed(2) : '—'}</td>
                   <td className="num" style={cellStyle}><EdgeCell edge={line.edge} direction={line.direction} /></td>
                   <td className="muted" style={{ ...cellStyle, fontSize: 11 }}>{timeAgo(line.last_updated_at)}</td>
@@ -411,6 +462,67 @@ export function PrizePicksTab({ slateId, players = [] }) {
   );
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Stat-category tab bar (v6.5)
+// Horizontal pill bar; active tab is gold-bordered, inactive tabs are
+// muted. Count badge per tab is the unfiltered row count for that stat.
+// ────────────────────────────────────────────────────────────────────
+function StatTabs({ tabs, counts, active, onChange }) {
+  return (
+    <div style={{
+      display: 'flex',
+      gap: 6,
+      marginBottom: 12,
+      overflowX: 'auto',
+      paddingBottom: 4,
+      borderBottom: '1px solid var(--border)',
+    }}>
+      {tabs.map(t => {
+        const isActive = t.key === active;
+        const count = counts[t.key] || 0;
+        return (
+          <button
+            key={t.key}
+            onClick={() => onChange(t.key)}
+            style={{
+              flexShrink: 0,
+              padding: '7px 12px',
+              border: `1px solid ${isActive ? '#F5C518' : 'var(--border-light)'}`,
+              borderRadius: 6,
+              background: isActive ? 'rgba(245,197,24,0.08)' : 'transparent',
+              color: isActive ? '#F5C518' : 'var(--text-muted)',
+              fontSize: 12,
+              fontWeight: isActive ? 600 : 500,
+              cursor: 'pointer',
+              transition: 'border-color 0.15s, color 0.15s, background 0.15s',
+              whiteSpace: 'nowrap',
+              fontFamily: 'inherit',
+            }}
+            onMouseEnter={(e) => {
+              if (!isActive) e.currentTarget.style.color = 'var(--text)';
+            }}
+            onMouseLeave={(e) => {
+              if (!isActive) e.currentTarget.style.color = 'var(--text-muted)';
+            }}
+          >
+            {t.label}
+            {count > 0 && (
+              <span style={{
+                marginLeft: 6,
+                fontSize: 10,
+                opacity: 0.7,
+                fontWeight: 500,
+              }}>
+                {count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // Edge cell: projected − line. Green = MORE (we project over), red = LESS
 // (we project under), muted em-dash when we don't have a projection for
 // that stat (e.g., engine doesn't model 1st-set breakdowns yet). Magnitude
@@ -422,6 +534,33 @@ function EdgeCell({ edge, direction }) {
               : 'var(--text-muted)';
   const sign = edge > 0 ? '+' : '';
   return <span style={{ color, fontWeight: 600 }}>{sign}{edge.toFixed(2)}</span>;
+}
+
+// Goblin / standard / demon label pill. Color-coded so the user can scan
+// which variant a row is at a glance — important on Aces/DFs/Breaks where
+// PP rarely posts standard and the variant matters for payout.
+function OddsTypePill({ type }) {
+  const t = (type || 'standard').toLowerCase();
+  const styles = {
+    goblin:   { bg: 'rgba(74,222,128,0.12)',  border: 'rgba(74,222,128,0.4)',  color: '#4ADE80', label: 'Gob' },
+    standard: { bg: 'rgba(139,154,186,0.10)', border: 'rgba(139,154,186,0.3)', color: '#8B9ABA', label: 'Std' },
+    demon:    { bg: 'rgba(239,68,68,0.10)',   border: 'rgba(239,68,68,0.35)',  color: '#EF4444', label: 'Dem' },
+  };
+  const s = styles[t] || styles.standard;
+  return (
+    <span style={{
+      display: 'inline-block',
+      padding: '2px 6px',
+      fontSize: 10,
+      fontWeight: 600,
+      letterSpacing: '0.04em',
+      textTransform: 'uppercase',
+      background: s.bg,
+      border: `1px solid ${s.border}`,
+      borderRadius: 4,
+      color: s.color,
+    }}>{s.label}</span>
+  );
 }
 
 function InlineLineEdit({ value, onSave }) {
@@ -471,7 +610,7 @@ function AddLineModal({ onSave, onClose }) {
       <form onSubmit={submit}>
         <Field label="Player name"><input autoFocus value={rawPlayerName} onChange={e => setName(e.target.value)} placeholder="e.g. Jannik Sinner" style={INPUT} /></Field>
         <Field label="Stat type"><select value={statType} onChange={e => setStat(e.target.value)} style={INPUT}>
-          {['Fantasy Score', 'Total Games Won', 'Total Games', 'Aces', 'Double Faults', 'Total Sets', 'Breaks', 'Sets Won'].map(s => <option key={s}>{s}</option>)}
+          {STAT_TABS.map(t => <option key={t.key} value={t.key}>{t.key}</option>)}
         </select></Field>
         <Field label="Line"><input type="number" step="0.5" value={currentLine} onChange={e => setLine(e.target.value)} placeholder="e.g. 22.5" style={INPUT} /></Field>
         <button className="btn btn-primary" type="submit" style={{ marginTop: 16 }}>Save</button>
