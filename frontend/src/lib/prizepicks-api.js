@@ -35,13 +35,21 @@ async function authedFetch(path, opts = {}) {
 }
 
 // ── Reads (public via Supabase, RLS-enforced) ─────────────────────
-export async function fetchLines(slateId) {
-  const { data, error } = await supabase
+export async function fetchLines(slateId, statType = 'Fantasy Score') {
+  // PP tab board displays Fantasy Score only by default. Other stat types
+  // (Aces, Break Points Won, Double Faults, etc.) are still ingested into
+  // prizepicks_lines and consumed by the DK engine via slate.pp_lines for
+  // True Fantasy Score projection — but they don't belong in the PP table.
+  // Pass statType='all' to get every stat type, or a specific stat name.
+  let q = supabase
     .from('prizepicks_lines')
     .select('*')
     .eq('slate_id', slateId)
-    .eq('is_active', true)
-    .order('last_updated_at', { ascending: false });
+    .eq('is_active', true);
+  if (statType && statType !== 'all') {
+    q = q.eq('stat_type', statType);
+  }
+  const { data, error } = await q.order('last_updated_at', { ascending: false });
   if (error) throw error;
   return data || [];
 }
