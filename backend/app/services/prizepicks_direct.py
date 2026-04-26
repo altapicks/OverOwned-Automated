@@ -1,383 +1,320 @@
-"""Direct PrizePicks projections ingest via Oxylabs Web Scraper API.
-
-PrizePicks' Cloudflare CDN blocks any direct request — including curl_cffi
-TLS impersonation — by serving a JS challenge page. We route through
-Oxylabs Web Scraper API which solves the challenge transparently and
-returns the raw JSON.
-
-Required env vars:
-  OXYLABS_USERNAME
-  OXYLABS_PASSWORD
-
-Schema: writes to prizepicks_lines using deactivate-then-insert per
-(slate_id, stat_type), preserving the manual CSV override path.
-
-Kalshi win-% is NEVER touched here.
 """
+PrizePicks direct ingest via Oxylabs Web Scraper API.
+
+Captures all 3 PP variants per (player, stat_type):
+  - standard
+  - demon (harder over, higher payout)
+  - goblin (easier over, lower payout)
+
+Distinguished by `attributes.odds_type` on each PP projection.
+
+Stored in prizepicks_lines with new `odds_type` column.
+Unique constraint scope: (slate_id, player_id, stat_type, odds_type) WHERE is_active=true.
+"""
+
 from __future__ import annotations
 
-import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 
-from app.db import get_client
-from app.services.normalizer import PlayerNormalizer
+from app.db.supabase_client import get_service_client
+from app.services.player_resolver import resolve_player_name
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-PP_BASE = "https://api.prizepicks.com"
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+OXY_USER = os.getenv("OXYLABS_USERNAME", "")
+OXY_PASS = os.getenv("OXYLABS_PASSWORD", "")
 OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
 
-# Real PrizePicks tennis stat_type labels (verified via diagnose endpoint).
-# Map raw PP labels → normalized labels we store in prizepicks_lines.stat_type.
-# Frontend Pivots tab + future PP board both filter on these strings, so
-# keep them consistent.
-STAT_TYPE_WHITELIST = {
-    "Fantasy Score": "Fantasy Score",
-    "Aces": "Aces",
-    "Double Faults": "Double Faults",
-    "Break Points Won": "Break Points Won",
-    "Total Games": "Total Games",         # match-level games o/u
-    "Total Games Won": "Total Games Won", # per-player games
-    "Total Sets": "Total Sets",
-    "Total Tie Breaks": "Total Tie Breaks",
-    # Legacy / alternate spellings just in case PP changes labels mid-season
-    "Breaks": "Break Points Won",
-    "Games Won": "Total Games Won",
-    "Sets Won": "Total Sets",
+PP_BASE = "https://api.prizepicks.com"
+TENNIS_LEAGUE_NAME_ALLOW = {"TENNIS"}  # exclude TENNIS LIVE
+ALLOWED_STAT_TYPES = {
+    "Aces",
+    "Break Points Won",
+    "Double Faults",
+    "Fantasy Score",
+    "Total Games",
+    "Total Games Won",
+    "Total Sets",
+    "Total Tie Breaks",
 }
 
 
-def _oxy_creds() -> tuple[str, str] | None:
-    user = os.getenv("OXYLABS_USERNAME")
-    pw = os.getenv("OXYLABS_PASSWORD")
-    if not user or not pw:
-        return None
-    return user, pw
+# ---------------------------------------------------------------------------
+# Oxylabs fetch helpers
+# ---------------------------------------------------------------------------
 
 
-async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dict]:
-    """GET a JSON URL through Oxylabs Web Scraper API."""
-    creds = _oxy_creds()
-    if not creds:
-        logger.error("OXYLABS_USERNAME/PASSWORD not set")
-        return 0, {}
-
-    user, pw = creds
-
-    if params:
-        from urllib.parse import urlencode
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}{urlencode(params)}"
-
-    body = {
+def _oxy_payload(url: str) -> Dict[str, Any]:
+    return {
         "source": "universal",
         "url": url,
         "geo_location": "United States",
+        "render": "html",
+        "user_agent_type": "desktop",
     }
 
+
+def _oxy_fetch_json(url: str, timeout: float = 60.0) -> Tuple[int, Dict[str, Any]]:
+    if not (OXY_USER and OXY_PASS):
+        log.error("Oxylabs creds missing")
+        return 0, {}
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(
                 OXY_ENDPOINT,
-                json=body,
-                auth=(user, pw),
-                headers={"Content-Type": "application/json"},
+                auth=(OXY_USER, OXY_PASS),
+                json=_oxy_payload(url),
             )
-    except Exception as e:
-        logger.exception("Oxylabs request failed: %s", e)
-        return 0, {}
-
-    if r.status_code != 200:
-        logger.error("Oxylabs HTTP %d: %s", r.status_code, r.text[:500])
-        return r.status_code, {}
-
-    try:
+        if r.status_code != 200:
+            log.error("Oxylabs envelope HTTP %s for %s", r.status_code, url)
+            return r.status_code, {}
         env = r.json()
-    except Exception:
-        logger.error("Oxylabs returned non-JSON envelope: %s", r.text[:500])
-        return 0, {}
-
-    results = env.get("results") or []
-    if not results:
-        logger.error("Oxylabs envelope had no results: %s", str(env)[:500])
-        return 0, {}
-
-    first = results[0]
-    target_status = first.get("status_code") or 0
-    raw_content = first.get("content") or ""
-
-    if target_status != 200:
-        logger.error("Target HTTP %d via Oxylabs (url=%s)", target_status, url)
-        return target_status, {}
-
-    if isinstance(raw_content, dict):
-        return target_status, raw_content
-    try:
-        return target_status, json.loads(raw_content)
-    except (TypeError, json.JSONDecodeError):
-        logger.error(
-            "Target returned 200 but content not JSON-parseable. First 200 chars: %s",
-            str(raw_content)[:200],
-        )
-        return target_status, {}
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Schedule gate
-# ─────────────────────────────────────────────────────────────────────
-
-async def _has_upcoming_matches() -> bool:
-    db = get_client()
-    cutoff = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
-    rows = (
-        db.table("matches")
-        .select(
-            "id, slate_id, slates!inner(sport, status, contest_type, is_fallback)"
-        )
-        .gte("start_time", datetime.now(timezone.utc).isoformat())
-        .lte("start_time", cutoff)
-        .eq("slates.sport", "tennis")
-        .eq("slates.status", "active")
-        .eq("slates.contest_type", "classic")
-        .eq("slates.is_fallback", False)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    return len(rows) > 0
-
-
-# ─────────────────────────────────────────────────────────────────────
-# League discovery
-# ─────────────────────────────────────────────────────────────────────
-
-async def _discover_tennis_league_ids() -> list[int]:
-    try:
-        status, payload = await _http_get_json(f"{PP_BASE}/leagues")
+        results = env.get("results", []) or []
+        if not results:
+            log.error("Oxylabs returned 0 results for %s", url)
+            return 0, {}
+        first = results[0]
+        inner_status = first.get("status_code", 0)
+        content = first.get("content")
+        if inner_status != 200:
+            log.error("PP returned HTTP %s via oxy for %s", inner_status, url)
+            return inner_status, {}
+        if isinstance(content, str):
+            import json as _json
+            try:
+                content = _json.loads(content)
+            except Exception as e:
+                log.error("Failed to parse PP body for %s: %s", url, e)
+                return 0, {}
+        if not isinstance(content, dict):
+            log.error("Unexpected PP body type for %s: %s", url, type(content))
+            return 0, {}
+        return 200, content
     except Exception as e:
-        logger.exception("PP /leagues fetch failed: %s", e)
-        return []
+        log.exception("Oxylabs fetch failed for %s: %s", url, e)
+        return 0, {}
 
+
+# ---------------------------------------------------------------------------
+# PP API surface
+# ---------------------------------------------------------------------------
+
+
+def fetch_leagues() -> Tuple[int, List[Dict[str, Any]]]:
+    status, body = _oxy_fetch_json(f"{PP_BASE}/leagues")
     if status != 200:
-        logger.error("PP /leagues HTTP %d via Oxylabs", status)
-        return []
-
-    ids: list[int] = []
-    for item in payload.get("data") or []:
-        attrs = item.get("attributes") or {}
-        name = (attrs.get("name") or "").lower()
-        sport = (attrs.get("sport") or "").lower()
-        if "tennis" not in name and "tennis" not in sport:
-            continue
-        # Skip "TENNIS LIVE" — in-game props, no use to us
-        if "live" in name:
-            continue
-        try:
-            ids.append(int(item.get("id")))
-        except (TypeError, ValueError):
-            continue
-
-    if not ids:
-        logger.warning(
-            "PP /leagues returned %d leagues, none tennis (non-live)",
-            len(payload.get("data") or []),
-        )
-    else:
-        logger.info("PP tennis (non-live) league_ids discovered: %s", ids)
-    return ids
+        return status, []
+    leagues = body.get("data", []) or []
+    return 200, leagues
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Projections fetch + parse
-# ─────────────────────────────────────────────────────────────────────
+def fetch_projections(league_id: str) -> Tuple[int, Dict[str, Any]]:
+    url = f"{PP_BASE}/projections?league_id={league_id}&per_page=500&single_stat=true"
+    return _oxy_fetch_json(url)
 
-async def _fetch_projections(league_id: int) -> dict:
-    status, payload = await _http_get_json(
-        f"{PP_BASE}/projections",
-        params={
-            "league_id": league_id,
-            "per_page": 500,
-            "single_stat": "true",
-        },
-    )
+
+def get_tennis_league_ids() -> List[str]:
+    status, leagues = fetch_leagues()
     if status != 200:
-        logger.error("PP /projections HTTP %d for league %d", status, league_id)
-        return {}
-    return payload
+        return []
+    out: List[str] = []
+    for lg in leagues:
+        attr = lg.get("attributes", {}) or {}
+        name = (attr.get("name") or "").strip().upper()
+        if name in TENNIS_LEAGUE_NAME_ALLOW:
+            lid = str(lg.get("id") or "")
+            if lid:
+                out.append(lid)
+    return out
 
 
-def _parse_projections(payload: dict) -> list[dict]:
-    rows: list[dict] = []
-    included = payload.get("included") or []
-    player_lookup: dict[str, str] = {}
+# ---------------------------------------------------------------------------
+# Normalizers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_odds_type(raw: Optional[str]) -> str:
+    """
+    PP `attributes.odds_type` values seen in the wild:
+      - "standard"
+      - "demon"
+      - "goblin"
+    Sometimes None / empty -> treat as standard.
+    """
+    if not raw:
+        return "standard"
+    s = str(raw).strip().lower()
+    if s in {"demon", "goblin", "standard"}:
+        return s
+    return "standard"
+
+
+def _build_player_index(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    idx: Dict[str, Dict[str, Any]] = {}
     for inc in included:
         if (inc.get("type") or "").lower() != "new_player":
             continue
-        attrs = inc.get("attributes") or {}
-        nm = attrs.get("name") or attrs.get("display_name")
-        if nm and inc.get("id"):
-            player_lookup[str(inc["id"])] = nm
-
-    for item in payload.get("data") or []:
-        attrs = item.get("attributes") or {}
-        stat_raw = attrs.get("stat_type") or ""
-        stat_type = STAT_TYPE_WHITELIST.get(stat_raw)
-        if not stat_type:
+        pid = str(inc.get("id") or "")
+        if not pid:
             continue
-        try:
-            line = float(attrs.get("line_score"))
-        except (TypeError, ValueError):
-            continue
-
-        rel = (item.get("relationships") or {}).get("new_player") or {}
-        pdata = rel.get("data") or {}
-        pid = pdata.get("id")
-        if pid is None:
-            continue
-        name = player_lookup.get(str(pid))
-        if not name:
-            continue
-
-        rows.append(
-            {
-                "raw_player_name": name,
-                "stat_type": stat_type,
-                "line": line,
-            }
-        )
-    return rows
+        idx[pid] = inc.get("attributes", {}) or {}
+    return idx
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Main tick
-# ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main ingest
+# ---------------------------------------------------------------------------
 
-async def fetch_tick(sport_code: str = "TEN") -> dict:
-    if sport_code != "TEN":
-        return {"skipped": "not_tennis"}
-    if not _oxy_creds():
-        return {"skipped": "no_oxylabs_creds"}
-    if not await _has_upcoming_matches():
-        return {"skipped": "no_upcoming_matches"}
 
-    league_ids = await _discover_tennis_league_ids()
-    if not league_ids:
-        return {"skipped": "no_tennis_leagues_on_pp"}
-
-    db = get_client()
-    normalizer = PlayerNormalizer(sport="tennis")
-
-    slates = (
-        db.table("slates")
-        .select("id, sport, status, contest_type, is_fallback")
-        .eq("sport", "tennis")
-        .eq("status", "active")
-        .eq("contest_type", "classic")
-        .eq("is_fallback", False)
-        .execute()
-        .data
-        or []
-    )
-    if not slates:
-        return {"skipped": "no_active_slates"}
-
-    matches = (
-        db.table("matches")
-        .select("id, slate_id, player_a_id, player_b_id, start_time")
-        .in_("slate_id", [s["id"] for s in slates])
-        .execute()
-        .data
-        or []
-    )
-    if not matches:
-        return {"skipped": "no_matches"}
-
-    cid_to_slate: dict[str, str] = {}
-    for m in matches:
-        cid_to_slate[m["player_a_id"]] = m["slate_id"]
-        cid_to_slate[m["player_b_id"]] = m["slate_id"]
-
-    collected: list[dict] = []
-    for lid in league_ids:
-        try:
-            payload = await _fetch_projections(lid)
-            parsed = _parse_projections(payload)
-            collected.extend(parsed)
-            logger.info("PP league_id=%d projections=%d", lid, len(parsed))
-        except Exception as e:
-            logger.exception("PP fetch failed league_id=%d: %s", lid, e)
-
-    if not collected:
-        return {"fetched": 0, "matched": 0, "written": 0}
-
-    by_slate_stat: dict[tuple[str, str], list[dict]] = {}
-    matched_count = 0
-    unresolved_sample: list[str] = []
-    skipped_not_in_slate = 0
-    for c in collected:
-        res = normalizer.resolve(
-            c["raw_player_name"], source="prizepicks", create_if_missing=False
-        )
-        if not res.canonical_id:
-            if len(unresolved_sample) < 10:
-                unresolved_sample.append(c["raw_player_name"])
-            continue
-        if res.canonical_id not in cid_to_slate:
-            skipped_not_in_slate += 1
-            continue
-        slate_id = cid_to_slate[res.canonical_id]
-        key = (slate_id, c["stat_type"])
-        by_slate_stat.setdefault(key, []).append(
-            {
-                "slate_id": slate_id,
-                "player_id": res.canonical_id,
-                "raw_player_name": c["raw_player_name"],
-                "stat_type": c["stat_type"],
-                "current_line": c["line"],
-                "league": "tennis",
-                "is_active": True,
-            }
-        )
-        matched_count += 1
-
-    if unresolved_sample:
-        logger.info("PP unresolved player names sample: %s", unresolved_sample)
-
-    written = 0
-    for (slate_id, stat_type), rows in by_slate_stat.items():
-        db.table("prizepicks_lines").update({"is_active": False}).eq(
-            "slate_id", slate_id
-        ).eq("stat_type", stat_type).execute()
-        try:
-            resp = db.table("prizepicks_lines").insert(rows).execute()
-            written += len(getattr(resp, "data", None) or [])
-        except Exception as exc:
-            logger.exception(
-                "PP direct insert failed slate=%s stat=%s rows=%d err=%r",
-                slate_id,
-                stat_type,
-                len(rows),
-                exc,
-            )
-
-    logger.info(
-        "PP direct tick: collected=%d matched=%d written=%d "
-        "skipped_not_on_slate=%d slates=%d stat_types=%d",
-        len(collected),
-        matched_count,
-        written,
-        skipped_not_in_slate,
-        len({k[0] for k in by_slate_stat}),
-        len({k[1] for k in by_slate_stat}),
-    )
-    return {
-        "fetched": len(collected),
-        "matched": matched_count,
-        "written": written,
-        "skipped_not_on_slate": skipped_not_in_slate,
+def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
+    """
+    Pull all tennis projections (excluding TENNIS LIVE), capture all
+    odds_type variants, write to prizepicks_lines.
+    """
+    summary: Dict[str, Any] = {
+        "slate_id": slate_id,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "leagues": [],
+        "wrote": 0,
+        "deactivated": 0,
+        "odds_type_histogram": {},
+        "stat_histogram": {},
+        "errors": [],
     }
+
+    if not (OXY_USER and OXY_PASS):
+        summary["errors"].append("oxylabs_creds_missing")
+        return summary
+
+    league_ids = get_tennis_league_ids()
+    if not league_ids:
+        summary["errors"].append("no_tennis_leagues_resolved")
+        return summary
+
+    sb = get_service_client()
+    overall_odds_hist: Counter = Counter()
+    overall_stat_hist: Counter = Counter()
+    total_wrote = 0
+    total_deactivated = 0
+
+    for lid in league_ids:
+        status, body = fetch_projections(lid)
+        if status != 200:
+            summary["leagues"].append({"id": lid, "http": status, "wrote": 0})
+            continue
+
+        data = body.get("data", []) or []
+        included = body.get("included", []) or []
+        player_idx = _build_player_index(included)
+
+        # Group projections by (stat_type, odds_type) per league for scoped deactivate+insert
+        grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+
+        for proj in data:
+            attr = proj.get("attributes", {}) or {}
+            stat_type = (attr.get("stat_type") or "").strip()
+            if stat_type not in ALLOWED_STAT_TYPES:
+                continue
+            odds_type = _normalize_odds_type(attr.get("odds_type"))
+            line_score = attr.get("line_score")
+            if line_score is None:
+                continue
+
+            rel = (proj.get("relationships") or {}).get("new_player") or {}
+            pdata = rel.get("data") or {}
+            pp_pid = str(pdata.get("id") or "")
+            if not pp_pid:
+                continue
+            pinfo = player_idx.get(pp_pid, {})
+            raw_name = (pinfo.get("name") or "").strip()
+            if not raw_name:
+                continue
+
+            resolved = resolve_player_name(raw_name, slate_id=slate_id)
+            if not resolved:
+                continue
+
+            grouped[(stat_type, odds_type)].append({
+                "slate_id": slate_id,
+                "player_id": resolved,
+                "raw_player_name": raw_name,
+                "stat_type": stat_type,
+                "current_line": float(line_score),
+                "odds_type": odds_type,
+                "league": "TENNIS",
+                "is_active": True,
+                "notes": f"pp_proj_id={proj.get('id')}",
+            })
+            overall_stat_hist[stat_type] += 1
+            overall_odds_hist[odds_type] += 1
+
+        league_wrote = 0
+        league_deact = 0
+
+        for (stat_type, odds_type), rows in grouped.items():
+            # Defensive per-scope dedupe (keep last)
+            seen: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                seen[r["player_id"]] = r
+            deduped = list(seen.values())
+
+            # Deactivate existing active rows for this scope
+            try:
+                resp = (
+                    sb.table("prizepicks_lines")
+                    .update({"is_active": False})
+                    .eq("slate_id", slate_id)
+                    .eq("stat_type", stat_type)
+                    .eq("odds_type", odds_type)
+                    .eq("is_active", True)
+                    .execute()
+                )
+                league_deact += len(resp.data or [])
+            except Exception as e:
+                summary["errors"].append(
+                    f"deactivate_failed[{stat_type}/{odds_type}]: {e}"
+                )
+                continue
+
+            # Insert fresh rows
+            try:
+                resp = sb.table("prizepicks_lines").insert(deduped).execute()
+                league_wrote += len(resp.data or [])
+            except Exception as e:
+                summary["errors"].append(
+                    f"insert_failed[{stat_type}/{odds_type}]: {e}"
+                )
+
+        summary["leagues"].append({
+            "id": lid,
+            "http": 200,
+            "wrote": league_wrote,
+            "deactivated": league_deact,
+        })
+        total_wrote += league_wrote
+        total_deactivated += league_deact
+
+    summary["wrote"] = total_wrote
+    summary["deactivated"] = total_deactivated
+    summary["odds_type_histogram"] = dict(overall_odds_hist)
+    summary["stat_histogram"] = dict(overall_stat_hist)
+    summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+    log.info(
+        "PP ingest done slate=%s wrote=%d deact=%d odds=%s stat=%s",
+        slate_id,
+        total_wrote,
+        total_deactivated,
+        summary["odds_type_histogram"],
+        summary["stat_histogram"],
+    )
+    return summary
