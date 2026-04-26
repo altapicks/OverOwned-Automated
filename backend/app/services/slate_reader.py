@@ -203,6 +203,114 @@ def _fit_poisson_lambda_from_pp(line: float, multiplier: float) -> Optional[floa
     return None
 
 
+def _compute_next_tournament(
+    cpi_rows: list[dict],
+    frontend_matches: list[FrontendMatch],
+    slate_label: Optional[str],
+) -> Optional[dict]:
+    """v6.10: server-side next-tournament resolution.
+
+    Reads the calendar columns (start_date, end_date, tour) on
+    tournament_cpi_base. Identifies the slate's "current" tournament
+    (largest by match count, with substring fallback against slate_label),
+    finds its row, then picks the soonest-starting row whose start_date is
+    on or after current.end_date.
+
+    Returns a serializable dict the frontend can render directly:
+        {
+          "tournament_key": "rome",
+          "display_name":   "Italian Open",
+          "start_date":     "2026-05-05",
+          "end_date":       "2026-05-17",
+          "surface":        "clay",
+          "tour":           "both",
+          "days_until":     9,
+          "ms_until":       777600000,   # ms from now to start_date 00:00 UTC
+        }
+    Or None when:
+      - cpi_rows is empty (migration not run)
+      - no current tournament can be identified
+      - current tournament has no end_date set
+      - no future tournament exists in the calendar
+    """
+    if not cpi_rows:
+        return None
+
+    # Find current tournament from frontend matches. Largest by count.
+    counts: dict[str, int] = {}
+    for fm in frontend_matches:
+        t = (getattr(fm, "tournament", None) or "").strip()
+        if t:
+            counts[t] = counts.get(t, 0) + 1
+    if not counts:
+        # Last resort: try slate_label itself
+        current_name = (slate_label or "").strip()
+    else:
+        current_name = max(counts.items(), key=lambda kv: kv[1])[0]
+    if not current_name:
+        return None
+
+    lc = current_name.lower()
+    current_row: Optional[dict] = None
+    for r in cpi_rows:
+        key = (r.get("tournament_key") or "").lower()
+        dn = (r.get("display_name") or "").lower()
+        if key and key in lc:
+            current_row = r
+            break
+        if dn and (dn in lc or lc in dn):
+            current_row = r
+            break
+    if not current_row:
+        return None
+
+    end_date_str = current_row.get("end_date")
+    if not end_date_str:
+        return None
+    try:
+        current_end = datetime.fromisoformat(
+            f"{end_date_str}T00:00:00+00:00"
+        )
+    except (TypeError, ValueError):
+        return None
+
+    # Pick next: smallest start_date that is on-or-after current_end
+    # AND not the current row itself. Same-day handoff supported with `>=`.
+    candidates: list[tuple[datetime, dict]] = []
+    for r in cpi_rows:
+        if r.get("tournament_key") == current_row.get("tournament_key"):
+            continue
+        sd = r.get("start_date")
+        if not sd:
+            continue
+        try:
+            start_dt = datetime.fromisoformat(f"{sd}T00:00:00+00:00")
+        except (TypeError, ValueError):
+            continue
+        if start_dt >= current_end:
+            candidates.append((start_dt, r))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    next_dt, next_row = candidates[0]
+
+    now = datetime.now(timezone.utc)
+    ms_until = int((next_dt - now).total_seconds() * 1000)
+    days_until = max(0, int((next_dt - now).total_seconds() / 86400))
+
+    return {
+        "tournament_key": next_row.get("tournament_key"),
+        "display_name":   next_row.get("display_name"),
+        "start_date":     next_row.get("start_date"),
+        "end_date":       next_row.get("end_date"),
+        "surface":        next_row.get("surface"),
+        "tour":           next_row.get("tour"),
+        "days_until":     days_until,
+        "ms_until":       ms_until,
+    }
+
+
 def _build_opening_odds_model(raw: Optional[dict]) -> Optional[FrontendMatchOdds]:
     """Flatten stored opening_odds (source-keyed) into FrontendMatchOdds."""
     if not raw or not isinstance(raw, dict):
@@ -645,11 +753,21 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     # without a separate API call. Engine does NOT consume CPI yet — display
     # only. If the table doesn't exist (migration not run), we just skip and
     # the frontend shows "—" for CPI.
+    #
+    # v6.10: Widened SELECT to include start_date / end_date / tour so the
+    # frontend can compute "Next Tournament" countdown. ALSO computes
+    # meta.next_tournament server-side as a convenience block so the
+    # homepage tile doesn't have to redo the date-comparison logic. The
+    # frontend keeps its client-side detector as a fallback for when this
+    # field is absent (e.g. running against an older API).
     cpi_rows: list[dict] = []
     try:
         cpi_rows = (
             db.table("tournament_cpi_base")
-            .select("tournament_key, display_name, base_cpi, surface, source, notes")
+            .select(
+                "tournament_key, display_name, base_cpi, surface, source, "
+                "notes, start_date, end_date, tour"
+            )
             .execute()
             .data
             or []
@@ -658,8 +776,20 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         logger.info(
             "tournament_cpi_base unavailable (likely migration not run): %s", e
         )
+
+    # v6.10: server-side next_tournament resolution. We try to identify the
+    # current tournament from the slate's matches (which now have
+    # tournament populated thanks to the v6.9 slate_label fallback), find
+    # its row in cpi_rows, then locate the soonest-starting row whose
+    # start_date is on or after current.end_date.
+    next_tournament_block = _compute_next_tournament(
+        cpi_rows, frontend_matches, slate.get("slate_label")
+    )
+
     meta = dict(meta) if meta else {}
     meta["tournament_cpi_base"] = cpi_rows
+    if next_tournament_block:
+        meta["next_tournament"] = next_tournament_block
 
     return FrontendSlate(
         date=slate["slate_date"],
