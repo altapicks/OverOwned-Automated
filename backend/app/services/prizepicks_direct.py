@@ -2,9 +2,20 @@
 PrizePicks direct ingest via Oxylabs Web Scraper API.
 
 Captures all 3 PP variants per (player, stat_type): standard / demon / goblin.
-Median across the three feeds the DK engine via slate_reader's posted_lines
-projection — see slate_reader._project_posted_lines_for_match.
+Each variant is persisted as a separate row in prizepicks_lines with its own
+odds_type and multiplier, so the PP tab UI can display the full variant set.
+
+The engine still consumes ONE projection center per (player, stat) via
+slate_reader._aggregate_pp_lines() → match.odds.posted_lines (median across
+variants when standard is absent; standard otherwise).
+
+v6.4 — adds payout_multiplier capture. PP's projections endpoint exposes
+multiplier under attributes.payout_multiplier on goblin/demon variants and
+implicitly = 2.0 on standard. We store the explicit value when present and
+fall back to the typical-by-odds_type inference when absent (older API
+response shapes don't carry the field).
 """
+
 from __future__ import annotations
 
 import json as _json
@@ -26,6 +37,7 @@ OXY_PASS = os.getenv("OXYLABS_PASSWORD", "")
 OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
 
 PP_BASE = "https://api.prizepicks.com"
+
 TENNIS_LEAGUE_NAME_ALLOW = {"TENNIS"}
 
 ALLOWED_STAT_TYPES = {
@@ -37,6 +49,15 @@ ALLOWED_STAT_TYPES = {
     "Total Games Won",
     "Total Sets",
     "Total Tie Breaks",
+}
+
+# Typical PP multiplier defaults when attributes.payout_multiplier is absent.
+# Real multipliers vary per prop and PP can A/B them — these are only used
+# when the API doesn't return an explicit value.
+DEFAULT_MULT_BY_ODDS_TYPE = {
+    "standard": 2.0,
+    "goblin": 1.5,
+    "demon": 3.0,
 }
 
 PP_HEADERS = {
@@ -55,12 +76,8 @@ PP_HEADERS = {
 # ---------------------------------------------------------------------------
 # Player resolver
 # ---------------------------------------------------------------------------
+
 def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
-    """
-    Resolves PP raw player names to canonical_id. Auto-creates new players
-    if not already in the DB so PP-only entrants (qualifiers, ITF crossover,
-    etc.) still land.
-    """
     if not raw_name:
         return None
     try:
@@ -72,9 +89,7 @@ def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
             return result.canonical_id
         log.warning(
             "_resolve_player low_confidence raw=%r best=%r score=%s",
-            raw_name,
-            result.canonical_id,
-            result.score,
+            raw_name, result.canonical_id, result.score,
         )
         return None
     except Exception as e:
@@ -85,6 +100,7 @@ def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Oxylabs fetch
 # ---------------------------------------------------------------------------
+
 def _oxy_payload(url: str, render: bool = False) -> Dict[str, Any]:
     p: Dict[str, Any] = {
         "source": "universal",
@@ -188,6 +204,7 @@ def _oxy_fetch_json(
 # ---------------------------------------------------------------------------
 # PP API surface
 # ---------------------------------------------------------------------------
+
 def fetch_leagues() -> Tuple[int, List[Dict[str, Any]]]:
     status, body, err = _oxy_fetch_json(f"{PP_BASE}/leagues")
     if status != 200:
@@ -202,7 +219,8 @@ def fetch_projections(league_id: str) -> Tuple[int, Dict[str, Any], str]:
     if status == 200:
         return status, body, ""
     log.warning(
-        "fetch_projections plain failed (%s): %s — retrying with render", status, err
+        "fetch_projections plain failed (%s): %s — retrying with render",
+        status, err
     )
     status2, body2, err2 = _oxy_fetch_json(url, render=True)
     if status2 == 200:
@@ -228,6 +246,7 @@ def get_tennis_league_ids() -> List[str]:
 # ---------------------------------------------------------------------------
 # Normalizers
 # ---------------------------------------------------------------------------
+
 def _normalize_odds_type(raw: Optional[str]) -> str:
     if not raw:
         return "standard"
@@ -235,6 +254,30 @@ def _normalize_odds_type(raw: Optional[str]) -> str:
     if s in {"demon", "goblin", "standard"}:
         return s
     return "standard"
+
+
+def _extract_multiplier(attr: Dict[str, Any], odds_type: str) -> float:
+    """
+    Pull the payout multiplier off a PP projection. Tries explicit fields
+    first, falls back to typical-by-odds_type defaults if absent.
+
+    PP's projections endpoint has used several field names across API
+    versions: payout_multiplier (current), odds_type_multiplier (legacy),
+    and flat multiplier (occasional A/B). We check all three. When none
+    exist or all are zero, fall back to the conservative defaults in
+    DEFAULT_MULT_BY_ODDS_TYPE so the row still has a usable number.
+    """
+    for key in ("payout_multiplier", "odds_type_multiplier", "multiplier"):
+        v = attr.get(key)
+        if v is None:
+            continue
+        try:
+            f = float(v)
+            if f > 0:
+                return f
+        except (TypeError, ValueError):
+            continue
+    return DEFAULT_MULT_BY_ODDS_TYPE.get(odds_type, 2.0)
 
 
 def _build_player_index(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -252,6 +295,7 @@ def _build_player_index(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 # ---------------------------------------------------------------------------
 # Main ingest
 # ---------------------------------------------------------------------------
+
 def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "slate_id": slate_id,
@@ -293,6 +337,9 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         included = body.get("included", []) or []
         player_idx = _build_player_index(included)
 
+        # Group by (stat_type, odds_type) so deactivation is per-variant —
+        # a slate refresh that loses goblins but keeps demons should not
+        # nuke the demon rows.
         grouped: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = defaultdict(dict)
 
         for proj in data:
@@ -300,10 +347,18 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             stat_type = (attr.get("stat_type") or "").strip()
             if stat_type not in ALLOWED_STAT_TYPES:
                 continue
+
             odds_type = _normalize_odds_type(attr.get("odds_type"))
             line_score = attr.get("line_score")
             if line_score is None:
                 continue
+
+            try:
+                line_val = float(line_score)
+            except (TypeError, ValueError):
+                continue
+
+            multiplier = _extract_multiplier(attr, odds_type)
 
             rel = (proj.get("relationships") or {}).get("new_player") or {}
             pdata = rel.get("data") or {}
@@ -324,8 +379,9 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
                 "player_id": resolved,
                 "raw_player_name": raw_name,
                 "stat_type": stat_type,
-                "current_line": float(line_score),
+                "current_line": line_val,
                 "odds_type": odds_type,
+                "multiplier": multiplier,
                 "league": "TENNIS",
                 "is_active": True,
                 "notes": f"pp_proj_id={proj.get('id')}",
@@ -391,34 +447,23 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
 
     log.info(
         "PP ingest done slate=%s wrote=%d deact=%d fail=%d odds=%s stat=%s",
-        slate_id,
-        total_wrote,
-        total_deactivated,
-        total_failures,
-        summary["odds_type_histogram"],
-        summary["stat_histogram"],
+        slate_id, total_wrote, total_deactivated, total_failures,
+        summary["odds_type_histogram"], summary["stat_histogram"],
     )
     return summary
 
 
 # ---------------------------------------------------------------------------
 # Scheduler shim
-#
-# slate_watcher and /api/slates/refresh both call:
-#     await pp_direct_svc.fetch_tick("TEN")
-#
-# This shim resolves the active classic tennis slate, then runs the
-# (sync) ingest in a thread so it doesn't block the event loop.
 # ---------------------------------------------------------------------------
+
 async def fetch_tick(sport_code: str = "TEN") -> Dict[str, Any]:
     import asyncio
-
     if sport_code != "TEN":
         return {"skipped": "not_tennis"}
 
     db = get_client()
     now_iso = datetime.now(timezone.utc).isoformat()
-
     rows = (
         db.table("slates")
         .select("id, lock_time, slate_date, first_seen_at")
