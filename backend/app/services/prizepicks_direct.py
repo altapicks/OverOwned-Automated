@@ -36,6 +36,38 @@ v6.5.3 — two important fixes:
         - multiplier changed only:                    UPDATE multiplier    → no movement event written
         - new line never seen:                        INSERT               → trigger fires "new"
         - existing key vanished from fresh feed:      UPDATE is_active=F   → trigger fires "removed"
+
+v6.5.5 — two correctness fixes for production data loss bugs:
+
+  1. PAGINATION. The previous fetch_projections() only fetched page=1 with
+     per_page=500. Tennis routinely has 600-700+ projections per league
+     (~32 players × 4-8 stat types × up to 3 variants). Anything past row
+     500 was silently dropped, and *which* 500 rows came back varied by
+     scrape — so each tick saw a slightly different subset of PP's true
+     state. Combined with the v6.5.3 diff logic, this caused mass false-
+     deactivations: rows that actually existed on PP got marked is_active
+     = false because they happened to land on page 2 of that scrape's
+     response. The user's symptom: 12+ Break Points Won lines deactivated
+     in one tick (Sonmez, Pegula, Noskova, Rybakina, etc.) while those
+     same lines were clearly still live on PP's UI.
+
+     Fix: walk pages until we get an empty page or len(data) < per_page.
+     Dedupe `included` (player records) by id across pages. Hard cap at
+     10 pages as a safety guard against an infinite loop on a malformed
+     response. If page 1 fails, return the error. If page >1 fails, we
+     have a partial fetch; flag it via the _partial key so the caller
+     knows to skip deactivations.
+
+  2. CIRCUIT BREAKER. Even with pagination, transient API failures or
+     PP server-side issues could return abnormally few rows. We now
+     compare fresh_total to existing_total before applying the diff:
+       - if pagination returned _partial=True → skip deactivations
+       - if fresh_total < 50% of existing_total (and existing was
+         meaningful, i.e. >= 50 rows) → skip deactivations
+     In both cases we still apply inserts and updates (better data is
+     always good), but withhold the destructive deactivation pass to
+     prevent a single bad fetch from nuking valid data. Logged loudly
+     so it's visible if it triggers.
 """
 
 from __future__ import annotations
@@ -252,18 +284,92 @@ def fetch_leagues() -> Tuple[int, List[Dict[str, Any]]]:
 
 
 def fetch_projections(league_id: str) -> Tuple[int, Dict[str, Any], str]:
-    url = f"{PP_BASE}/projections?league_id={league_id}&per_page=500&single_stat=true"
-    status, body, err = _oxy_fetch_json(url, render=False)
-    if status == 200:
-        return status, body, ""
-    log.warning(
-        "fetch_projections plain failed (%s): %s — retrying with render",
-        status, err
-    )
-    status2, body2, err2 = _oxy_fetch_json(url, render=True)
-    if status2 == 200:
-        return status2, body2, ""
-    return status2, {}, f"{err} | render_retry: {err2}"
+    """v6.5.5: walk all PP projection pages for a league.
+
+    PP uses standard JSON:API ?page=N pagination. We walk the pages and
+    aggregate `data` + `included` (deduped by id) until either:
+      - an empty `data` page is returned     → no more results
+      - len(data) < per_page                 → last page reached
+      - 10 pages fetched                     → safety guard
+
+    Page 1 failure is fatal (returns the error). Page >1 failure leaves
+    us with a partial fetch — we set ``_partial: True`` in the response
+    so the caller can skip destructive deactivations.
+
+    Tennis routinely has 600-700+ projections per league. Without this
+    pagination, ~200 props per scrape were silently dropped depending on
+    PP's response ordering, and the v6.5.3 diff logic was deactivating
+    them as missing. That's the bug this fixes.
+    """
+    per_page = 500
+    max_pages = 10
+    all_data: List[Dict[str, Any]] = []
+    seen_included: Dict[str, Dict[str, Any]] = {}
+    partial = False
+
+    for page in range(1, max_pages + 1):
+        url = (
+            f"{PP_BASE}/projections"
+            f"?league_id={league_id}"
+            f"&per_page={per_page}"
+            f"&single_stat=true"
+            f"&page={page}"
+        )
+        status, body, err = _oxy_fetch_json(url, render=False)
+        if status != 200:
+            log.warning(
+                "fetch_projections league=%s page=%d plain failed (%s): %s "
+                "— retrying with render",
+                league_id, page, status, err,
+            )
+            status, body, err = _oxy_fetch_json(url, render=True)
+
+        if status != 200:
+            if page == 1:
+                # Page 1 is fatal — no data at all, surface the error.
+                return status, {}, err
+            # Mid-walk failure: return what we have, flag as partial.
+            partial = True
+            log.warning(
+                "fetch_projections league=%s pagination broke at page %d: %s "
+                "— continuing with partial result",
+                league_id, page, err,
+            )
+            break
+
+        page_data = body.get("data", []) or []
+        page_included = body.get("included", []) or []
+
+        # Dedupe `included` across pages — the same player record appears
+        # on every page that has props for that player, but we only need
+        # one copy in the final aggregated index.
+        for inc in page_included:
+            inc_id = str(inc.get("id") or "")
+            if inc_id and inc_id not in seen_included:
+                seen_included[inc_id] = inc
+
+        if not page_data:
+            break  # explicit "no more results"
+
+        all_data.extend(page_data)
+
+        if len(page_data) < per_page:
+            break  # short page = last page
+
+    else:
+        # Loop fell off after max_pages without breaking — capped, treat
+        # as partial since we may not have walked everything.
+        partial = True
+        log.warning(
+            "fetch_projections league=%s hit max_pages=%d cap, treating as partial",
+            league_id, max_pages,
+        )
+
+    return 200, {
+        "data": all_data,
+        "included": list(seen_included.values()),
+        "_partial": partial,
+    }, ""
 
 
 def get_tennis_league_ids() -> List[str]:
@@ -409,6 +515,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
     # ── 2. Pull fresh state from PP across every tennis league ──────────
     fresh_idx: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     skipped_doubles = 0
+    any_partial_fetch = False  # v6.5.5: any league had a partial fetch?
 
     for lid in league_ids:
         status, body, err = fetch_projections(lid)
@@ -418,6 +525,9 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             )
             summary["errors"].append(f"projections_failed[{lid}]: {err}")
             continue
+
+        if body.get("_partial"):
+            any_partial_fetch = True
 
         data = body.get("data", []) or []
         included = body.get("included", []) or []
@@ -480,10 +590,49 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             overall_odds_hist[odds_type] += 1
 
         summary["leagues"].append(
-            {"id": lid, "http": 200, "fresh_rows": league_fresh_count}
+            {
+                "id": lid,
+                "http": 200,
+                "fresh_rows": league_fresh_count,
+                "partial": bool(body.get("_partial")),
+                "raw_data_count": len(data),
+            }
         )
 
     summary["skipped_doubles"] = skipped_doubles
+
+    # ── 2.5 Circuit breaker (v6.5.5) ────────────────────────────────────
+    # The diff loop below has a destructive deactivation pass. If our
+    # fresh data is suspiciously incomplete (partial pagination, transient
+    # API failure, PP server hiccup), running that pass nukes valid rows
+    # that just happen to be missing from this particular response. We
+    # detect two suspicious-fetch signatures and disarm deactivation when
+    # either fires; inserts and updates still apply (better data is good).
+    fresh_total = sum(len(rows) for rows in fresh_idx.values())
+    existing_total = sum(len(rows) for rows in existing_idx.values())
+    summary["fresh_total"] = fresh_total
+    summary["existing_total"] = existing_total
+
+    deactivate_safe = True
+    breaker_reason: Optional[str] = None
+
+    if any_partial_fetch:
+        deactivate_safe = False
+        breaker_reason = "partial_fetch (one or more leagues paginated incompletely)"
+    elif existing_total >= 20 and fresh_total < 0.5 * existing_total:
+        deactivate_safe = False
+        breaker_reason = (
+            f"fresh_total={fresh_total} < 50% of existing_total={existing_total}; "
+            f"likely transient PP API issue"
+        )
+
+    if not deactivate_safe:
+        summary["circuit_breaker"] = breaker_reason
+        log.warning(
+            "PP ingest CIRCUIT BREAKER engaged for slate=%s: %s. "
+            "Inserts/updates will apply; deactivations SKIPPED to prevent data loss.",
+            slate_id, breaker_reason,
+        )
 
     # ── 3. Diff fresh vs existing ───────────────────────────────────────
     inserted = 0
@@ -588,40 +737,44 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
 
         # Pass 5 — leftover existing rows for this key not consumed by
         # any fresh row → PP no longer publishes them, deactivate. Trigger
-        # fires "removed".
-        for ex in existing_list:
-            if ex["id"] in consumed_existing_ids:
-                continue
-            try:
-                db.table("prizepicks_lines").update({
-                    "is_active": False,
-                }).eq("id", ex["id"]).execute()
-                deactivated += 1
-            except Exception as e:
-                row_failures += 1
-                if len(summary["errors"]) < 30:
-                    summary["errors"].append(
-                        f"deactivate_failed[{key}/{ex['id']}]: {str(e)[:200]}"
-                    )
+        # fires "removed". v6.5.5: skipped when circuit breaker engaged.
+        if deactivate_safe:
+            for ex in existing_list:
+                if ex["id"] in consumed_existing_ids:
+                    continue
+                try:
+                    db.table("prizepicks_lines").update({
+                        "is_active": False,
+                    }).eq("id", ex["id"]).execute()
+                    deactivated += 1
+                except Exception as e:
+                    row_failures += 1
+                    if len(summary["errors"]) < 30:
+                        summary["errors"].append(
+                            f"deactivate_failed[{key}/{ex['id']}]: {str(e)[:200]}"
+                        )
 
     # ── 4. Keys present in existing but absent from fresh entirely ─────
     # PP dropped all variants for this (player, stat, odds_type) — could
     # mean the prop got pulled, the player is no longer on the slate, etc.
-    for key, existing_list in existing_idx.items():
-        if key in fresh_idx:
-            continue  # handled above
-        for ex in existing_list:
-            try:
-                db.table("prizepicks_lines").update({
-                    "is_active": False,
-                }).eq("id", ex["id"]).execute()
-                deactivated += 1
-            except Exception as e:
-                row_failures += 1
-                if len(summary["errors"]) < 30:
-                    summary["errors"].append(
-                        f"deactivate_missing_failed[{key}/{ex['id']}]: {str(e)[:200]}"
-                    )
+    # v6.5.5: gated on circuit breaker so a partial / failed fetch can't
+    # mass-deactivate valid data.
+    if deactivate_safe:
+        for key, existing_list in existing_idx.items():
+            if key in fresh_idx:
+                continue  # handled above
+            for ex in existing_list:
+                try:
+                    db.table("prizepicks_lines").update({
+                        "is_active": False,
+                    }).eq("id", ex["id"]).execute()
+                    deactivated += 1
+                except Exception as e:
+                    row_failures += 1
+                    if len(summary["errors"]) < 30:
+                        summary["errors"].append(
+                            f"deactivate_missing_failed[{key}/{ex['id']}]: {str(e)[:200]}"
+                        )
 
     summary["inserted"] = inserted
     summary["updated_line"] = updated_line
@@ -635,9 +788,10 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
 
     log.info(
         "PP ingest done slate=%s ins=%d line_upd=%d mult_upd=%d unchanged=%d deact=%d "
-        "doubles_skipped=%d fail=%d odds=%s stat=%s",
+        "doubles_skipped=%d fail=%d fresh=%d existing=%d breaker=%s odds=%s stat=%s",
         slate_id, inserted, updated_line, updated_mult_only, unchanged,
-        deactivated, skipped_doubles, row_failures,
+        deactivated, skipped_doubles, row_failures, fresh_total, existing_total,
+        breaker_reason or "none",
         summary["odds_type_histogram"], summary["stat_histogram"],
     )
     return summary
