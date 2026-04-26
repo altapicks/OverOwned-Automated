@@ -9,29 +9,20 @@ Pulls Pinnacle odds for the markets the engine actually consumes:
 
 Moneyline (points-*-game-ml-*) is intentionally NOT pulled — Kalshi is
 the sole source of win probability (kalshi_prob_a / kalshi_prob_b).
-Reading SGO moneyline would give us a second, conflicting win-% signal.
 
 set_a_20 / set_a_21 / set_b_20 / set_b_21 are derived from the existing
-matches.odds.kalshi_prob_a + p3set during ingest, so the engine has the
-four set-score American odds hasRichOdds() expects without needing SGO ML.
-
-Top-level promoted keys (engine.js reads these without a source prefix):
-    gw_a_line, gw_a_over, gw_b_line, gw_b_over,
-    set_a_20, set_a_21, set_b_20, set_b_21, p3set
-
+matches.odds.kalshi_prob_a + p3set during ingest.
 
 NAME RESOLUTION
 ───────────────
 SGO returns players by their team-feed full names (e.g. "Catherine McNally")
-which sometimes differ from the names DK / Kalshi use (e.g. "Caty McNally").
-Strict full-name resolution via PlayerNormalizer fails on those divergences,
-so this module layers a last-name + opposing-sides fallback ON TOP of the
-normalizer when create_if_missing=False:
+which sometimes differ from DK / Kalshi names (e.g. "Caty McNally"). To
+handle that durably without false positives, this module layers a last-name
++ opposing-sides fallback ON TOP of the strict normalizer:
 
   1. Try strict full-name resolution first.
-  2. If strict fails, scope to the candidate slate matches already loaded
-     in memory and ask: do these two SGO surnames uniquely identify exactly
-     one slate match, with the two players on opposite sides?
+  2. If strict fails, ask: do these two SGO surnames uniquely identify
+     exactly one slate match, with the two players on opposite sides?
   3. If yes, accept that orientation. False positives are impossible —
      there's only one match it can map to and the orientation is locked.
   4. On success (strict OR fallback), write the SGO-side full name into
@@ -103,11 +94,11 @@ def _strip_accents(s: str) -> str:
 
 
 def _last_name_key(name: str) -> str:
-    """Normalized last-name token. 'Catherine McNally' → 'mcnally',
-    'Vít Kopřiva' → 'kopriva'. Empty string if name is empty.
+    """Normalized last-name token. Handles particles + accents.
 
-    Drops common particles ('de', 'van', 'der', etc.) so 'Alex de Minaur'
-    → 'minaur' rather than 'de'.
+    'Catherine McNally' → 'mcnally'
+    'Vít Kopřiva' → 'kopriva'
+    'Alex de Minaur' → 'minaur'
     """
     if not name:
         return ""
@@ -117,18 +108,8 @@ def _last_name_key(name: str) -> str:
         for p in cleaned.split()
         if p
         not in {
-            "de",
-            "van",
-            "der",
-            "den",
-            "da",
-            "di",
-            "du",
-            "le",
-            "la",
-            "el",
-            "al",
-            "del",
+            "de", "van", "der", "den", "da", "di", "du",
+            "le", "la", "el", "al", "del",
         }
     ]
     if not parts:
@@ -410,14 +391,14 @@ async def fetch_tick(sport_code: str = "TEN") -> dict:
     }
 
 
-# ── Ingest ────────────────────────────────────────────────────────────
+# ── Alias seeding ─────────────────────────────────────────────────────
 
 
 def _seed_alias(canonical_id: str, source: str, raw_name: str) -> bool:
     """Persist a source-specific alias for an existing canonical_id.
 
-    Returns True if a new alias row was actually written, False if the
-    alias was already present (idempotent).
+    Returns True if a new alias was actually written, False if already
+    present (idempotent — safe to call on every successful match).
     """
     if not canonical_id or not raw_name:
         return False
@@ -473,6 +454,9 @@ def _seed_alias(canonical_id: str, source: str, raw_name: str) -> bool:
     return True
 
 
+# ── Surname fallback resolver ─────────────────────────────────────────
+
+
 def _surname_fallback_match(
     sgo_a_name: str,
     sgo_b_name: str,
@@ -481,13 +465,10 @@ def _surname_fallback_match(
 ) -> Optional[dict]:
     """Last-name + opposing-sides fallback resolver.
 
-    Returns the slate match dict if exactly one candidate match has both
-    SGO surnames present on opposite sides. Returns None if no unique
-    match found OR if the surnames map to multiple matches (ambiguous —
-    refuse rather than guess).
-
-    surname_index: {surname_key: [(canonical_id, side), ...]} pre-built
-    from candidate_matches so we don't re-scan on every event.
+    Returns a dict {match, sgo_a_canonical_id, sgo_b_canonical_id, sgo_a_side}
+    if exactly one slate match has both SGO surnames present on opposite
+    sides. Returns None if no unique match found OR if surnames map to
+    multiple matches (ambiguous — refuse rather than guess).
     """
     key_a = _last_name_key(sgo_a_name)
     key_b = _last_name_key(sgo_b_name)
@@ -499,18 +480,15 @@ def _surname_fallback_match(
     if not a_hits or not b_hits:
         return None
 
-    # Find slate match(es) where one player has surname key_a and the
-    # other has surname key_b, on opposite sides.
     candidates_by_match: dict[str, dict] = {m["id"]: m for m in candidate_matches}
     matches_found: list[tuple[str, str]] = []  # (match_id, sgo_a_side)
 
     for cid_a, side_a in a_hits:
         for cid_b, side_b in b_hits:
             if cid_a == cid_b:
-                continue  # same player — degenerate
+                continue
             if side_a == side_b:
-                continue  # both on same side — invalid
-            # Find the match that has cid_a on side_a AND cid_b on side_b
+                continue
             for m in candidate_matches:
                 pa = m.get("player_a_id")
                 pb = m.get("player_b_id")
@@ -519,7 +497,6 @@ def _surname_fallback_match(
                 elif side_a == "b" and pb == cid_a and pa == cid_b:
                     matches_found.append((m["id"], "b"))
 
-    # Deduplicate (same match might be found via multiple cid pairings)
     unique_match_ids = {mf[0] for mf in matches_found}
     if len(unique_match_ids) != 1:
         return None  # zero or ambiguous — refuse
@@ -527,7 +504,6 @@ def _surname_fallback_match(
     match_id = next(iter(unique_match_ids))
     sgo_a_side = next(mf[1] for mf in matches_found if mf[0] == match_id)
     m = candidates_by_match[match_id]
-    # Resolve which canonical_ids correspond to SGO's a and b
     if sgo_a_side == "a":
         sgo_a_cid = m["player_a_id"]
         sgo_b_cid = m["player_b_id"]
@@ -541,6 +517,9 @@ def _surname_fallback_match(
         "sgo_b_canonical_id": sgo_b_cid,
         "sgo_a_side": sgo_a_side,
     }
+
+
+# ── Ingest ────────────────────────────────────────────────────────────
 
 
 async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
@@ -573,8 +552,7 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
         or []
     )
 
-    # Build a surname → [(canonical_id, side), ...] index for fallback.
-    # Pull display names for the candidate-match players in a single round-trip.
+    # Build surname → [(canonical_id, side), ...] index for fallback.
     needed_cids = set()
     for m in candidate_matches:
         if m.get("player_a_id"):
@@ -592,7 +570,9 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
                 .data
                 or []
             )
-            cid_to_display = {p["canonical_id"]: p.get("display_name") or "" for p in prows}
+            cid_to_display = {
+                p["canonical_id"]: p.get("display_name") or "" for p in prows
+            }
         except Exception as e:
             logger.warning("SGO: failed to load player display names: %s", e)
 
@@ -603,7 +583,6 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
             if not cid:
                 continue
             display = cid_to_display.get(cid) or ""
-            # Use the canonical_id last token as a fallback if display is empty
             key_source = display or cid.replace("_", " ")
             key = _last_name_key(key_source)
             if not key:
@@ -615,7 +594,7 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
     aliases_seeded = 0
 
     for row in rows:
-        # Strict path first
+        # Strict full-name resolution first.
         a = normalizer.resolve(
             row.player_a_name, source="sgo", create_if_missing=False
         )
@@ -653,9 +632,9 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
                     target_match = m
                     break
 
+        # Surname + opposing-sides fallback. Only fires when strict path
+        # didn't lock on a slate match. Refuses any ambiguity.
         if target_match is None:
-            # Surname + opposing-sides fallback. Only fires when strict
-            # resolution didn't land on a slate match. Refuses ambiguity.
             fb = _surname_fallback_match(
                 row.player_a_name,
                 row.player_b_name,
@@ -663,7 +642,6 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
                 surname_index,
             )
             if fb is not None:
-                # Time sanity (3h window like strict path)
                 m = fb["match"]
                 m_start = m.get("start_time")
                 ok_time = True
@@ -690,16 +668,16 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
         if target_match is None or sgo_a_cid is None or sgo_b_cid is None:
             continue
 
-        # Auto-seed aliases so next encounter is a strict-path direct hit.
+        # Auto-seed aliases so the next encounter is a strict-path direct hit.
         if _seed_alias(sgo_a_cid, "sgo", row.player_a_name):
             aliases_seeded += 1
         if _seed_alias(sgo_b_cid, "sgo", row.player_b_name):
             aliases_seeded += 1
 
-        # Orientation: our match.player_a_id is "side a". If SGO's home is
-        # actually our side b, swap the engine-fields a/b suffixes.
+        # Orientation: our match.player_a_id is "side a". If SGO's home
+        # is actually our side b, swap engine-fields a/b suffixes.
         pa = target_match["player_a_id"]
-        swap = pa == sgo_b_cid  # our A == their away → swap
+        swap = pa == sgo_b_cid
         eng_fields = row.to_engine_shape()
         if swap:
             eng_fields = _swap_ab_fields(eng_fields)
@@ -743,4 +721,81 @@ def _swap_ab_fields(d: dict) -> dict:
             out[k.replace("_a_", "_b_")] = v
         elif "_b_" in k:
             out[k.replace("_b_", "_a_")] = v
-        else
+        else:
+            out[k] = v
+    return out
+
+
+async def _write_match_odds(
+    *,
+    match_id: str,
+    slate_id: str,
+    source: str,
+    engine_fields: dict,
+    raw_market_payload: dict,
+):
+    """Merge SGO odds into matches.odds[source] + promote engine-flat keys.
+
+    Touches only matches.odds[source] and the engine-flat top-level keys.
+    NEVER modifies matches.odds.kalshi or kalshi_prob_a/_b. Moneyline keys
+    (ml_a / ml_b) are intentionally NOT promoted — Kalshi is the sole
+    source of win probability.
+    """
+    db = get_client()
+    row = (
+        db.table("matches")
+        .select("odds, opening_odds")
+        .eq("id", match_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        return
+
+    current = row.get("odds") or {}
+    if not isinstance(current, dict):
+        current = {}
+    current[source] = engine_fields
+
+    # Engine-flat top-level promotion. Engine.js reads these without a
+    # source prefix; hasRichOdds() gates on set_a_20 + gw_a_line being
+    # non-null. ml_a / ml_b are deliberately excluded.
+    promoted_keys = (
+        "gw_a_line", "gw_a_over", "gw_a_under",
+        "gw_b_line", "gw_b_over", "gw_b_under",
+        "set_a_20", "set_a_21", "set_b_20", "set_b_21",
+        "p3set",
+    )
+    for k in promoted_keys:
+        if k in engine_fields and engine_fields[k] is not None:
+            current[k] = engine_fields[k]
+
+    # Defensive: strip any stale ml_a / ml_b promoted by earlier deploys
+    for stale_key in ("ml_a", "ml_b"):
+        if stale_key in current:
+            current.pop(stale_key, None)
+
+db.table("matches").update({"odds": current}).eq("id", match_id).execute()
+
+    # Opening odds preservation: write per-source first-seen snapshot once.
+    opening = row.get("opening_odds") or {}
+    if not isinstance(opening, dict):
+        opening = {}
+    if source not in opening:
+        opening[source] = engine_fields
+    db.table("matches").update({"opening_odds": opening}).eq(
+        "id", match_id
+    ).execute()
+
+    # Append-only history row for line-movement audits.
+    db.table("odds_history").insert(
+        {
+            "match_id": match_id,
+            "slate_id": slate_id,
+            "source": source,
+            "market": "totals+spreads+per_player_games+set_score",
+            "payload": {"engine_fields": engine_fields, "raw": raw_market_payload},
+        }
+    ).execute()
+    
