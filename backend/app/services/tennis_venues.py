@@ -146,13 +146,39 @@ def lookup_venue(tournament_name: Optional[str]) -> Optional[dict]:
     Walks keys in declaration order so more specific entries win when one is
     a substring of another (e.g., "indian wells" before "wells"). Returns None
     if no key matches — caller should treat as "weather unavailable" and skip.
+
+    v6.8: Two-tier match. The first tier is the original substring check
+    (input contains the key — e.g. "Mutua Madrid Open" contains "madrid open").
+    When that fails — common when slate labels use short forms like
+    "Featured (Madrid)" — fall back to a tokenized match: split the input
+    on non-alphanumerics and check if any token is the *first word* of a
+    key. So "Featured (Madrid)" → tokens ["featured", "madrid"] → matches
+    key "madrid open" because it starts with "madrid". Token must be 4+
+    chars to avoid garbage like "atp" / "wta" / "the" matching keys
+    starting with the same letters by accident.
     """
     if not tournament_name or not isinstance(tournament_name, str):
         return None
     name_lower = tournament_name.lower().strip()
     if not name_lower:
         return None
+
+    # Tier 1: full-substring match (input contains key).
     for key, venue in TENNIS_VENUES.items():
         if key in name_lower:
             return {**venue, "_matched_key": key}
+
+    # Tier 2: tokenized fallback — does any meaningful word in the input
+    # start a venue key? Splits on whitespace AND any non-alphanumeric char,
+    # so parens / hyphens / dots / colons don't trap tokens.
+    import re
+    tokens = [t for t in re.split(r"[^a-z0-9]+", name_lower) if len(t) >= 4]
+    for token in tokens:
+        for key, venue in TENNIS_VENUES.items():
+            # Match if a key's first word equals this token. Prevents
+            # "open" matching "australian open" / "miami open" / etc.
+            first_word = key.split(" ", 1)[0]
+            if first_word == token:
+                return {**venue, "_matched_key": key, "_match_tier": "token"}
+
     return None
