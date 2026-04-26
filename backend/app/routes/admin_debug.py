@@ -1,13 +1,15 @@
 """Admin debug endpoints — read-only diagnostics.
 
-Uses curl_cffi (Chrome TLS impersonation) for PrizePicks calls
-because PP's Cloudflare CDN 403s plain httpx requests.
+PrizePicks calls go through Oxylabs Web Scraper API to bypass Cloudflare.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Any
 
+import httpx
 from fastapi import APIRouter
 
 from app.services.normalizer import PlayerNormalizer
@@ -17,60 +19,99 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin/debug", tags=["admin-debug"])
 
 PP_BASE = "https://api.prizepicks.com"
+OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
 
 
-def _have_curl_cffi() -> bool:
-    try:
-        import curl_cffi.requests  # noqa: F401
-        return True
-    except Exception:
-        return False
+def _oxy_creds() -> tuple[str, str] | None:
+    user = os.getenv("OXYLABS_USERNAME")
+    pw = os.getenv("OXYLABS_PASSWORD")
+    if not user or not pw:
+        return None
+    return user, pw
 
 
 async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dict, int]:
-    """Returns (status, parsed_json, body_size_bytes)."""
-    if _have_curl_cffi():
-        from curl_cffi.requests import AsyncSession
-        async with AsyncSession(impersonate="chrome120") as session:
-            r = await session.get(url, params=params, timeout=20)
-            try:
-                payload = r.json()
-            except Exception:
-                payload = {}
-            return r.status_code, payload, len(r.content)
+    """Returns (target_status, target_json, body_size_bytes_of_envelope)."""
+    creds = _oxy_creds()
+    if not creds:
+        return 0, {"_error": "no oxylabs creds"}, 0
 
-    import httpx
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(url, params=params,
-                             headers={"User-Agent": "Mozilla/5.0",
-                                      "Accept": "application/json"})
-        try:
-            payload = r.json()
-        except Exception:
-            payload = {}
-        return r.status_code, payload, len(r.content)
+    user, pw = creds
+
+    if params:
+        from urllib.parse import urlencode
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{urlencode(params)}"
+
+    body = {
+        "source": "universal",
+        "url": url,
+        "geo_location": "United States",
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            OXY_ENDPOINT,
+            json=body,
+            auth=(user, pw),
+            headers={"Content-Type": "application/json"},
+        )
+
+    if r.status_code != 200:
+        return r.status_code, {"_error": "oxylabs non-200", "body": r.text[:500]}, len(r.content)
+
+    try:
+        env = r.json()
+    except Exception:
+        return 0, {"_error": "oxylabs envelope non-json"}, len(r.content)
+
+    results = env.get("results") or []
+    if not results:
+        return 0, {"_error": "oxylabs no results"}, len(r.content)
+
+    first = results[0]
+    target_status = first.get("status_code") or 0
+    raw_content = first.get("content") or ""
+
+    if isinstance(raw_content, dict):
+        return target_status, raw_content, len(r.content)
+    try:
+        return target_status, json.loads(raw_content), len(r.content)
+    except (TypeError, json.JSONDecodeError):
+        return target_status, {
+            "_error": "target content not json",
+            "first_200": str(raw_content)[:200],
+        }, len(r.content)
 
 
 @router.get("/pp/diagnose")
 async def pp_diagnose() -> dict[str, Any]:
     out: dict[str, Any] = {
-        "curl_cffi_installed": _have_curl_cffi(),
+        "oxylabs_configured": _oxy_creds() is not None,
         "leagues_status": None,
         "tennis_leagues": [],
         "per_league": [],
         "name_resolution": {},
     }
 
+    if not _oxy_creds():
+        out["leagues_status"] = {"error": "OXYLABS_USERNAME/PASSWORD env vars not set"}
+        return out
+
     # 1. /leagues
     try:
         status, payload, size = await _http_get_json(f"{PP_BASE}/leagues")
-        out["leagues_status"] = {"http": status, "body_size": size}
+        out["leagues_status"] = {"http": status, "envelope_size": size}
     except Exception as e:
         out["leagues_status"] = {"error": repr(e)}
         return out
 
-    if status != 200:
-        out["leagues_status"]["error"] = "non-200; check curl_cffi install"
+    if status != 200 or "_error" in payload:
+        out["leagues_status"]["error"] = payload.get("_error", "non-200")
+        if "first_200" in payload:
+            out["leagues_status"]["first_200"] = payload["first_200"]
+        if "body" in payload:
+            out["leagues_status"]["body"] = payload["body"]
         return out
 
     all_leagues = payload.get("data") or []
@@ -109,6 +150,13 @@ async def pp_diagnose() -> dict[str, Any]:
             )
         except Exception as e:
             out["per_league"].append({"league_id": lid, "error": repr(e)})
+            continue
+
+        if pstatus != 200 or "_error" in proj_payload:
+            out["per_league"].append(
+                {"league_id": lid, "league_name": lg["name"],
+                 "http": pstatus, "error": proj_payload.get("_error")}
+            )
             continue
 
         data = proj_payload.get("data") or []
