@@ -156,27 +156,25 @@ def _project_posted_lines_for_match(
                 side_dict[posted_key] = float(agg["line"])
 
         # Derive games_lost from Total Games when both halves are known.
-        # Total Games is a match-level prop posted per player on PP, but
-        # PP's Total Games is the sum of *both* players' games — divide
-        # via wp-weighted share. When wp not available, split 50/50.
+        # On PP tennis singles, Total Games is the player's own line
+        # (their team's total games in the match). games_lost = total - won.
         tg = pp_agg.get((pid, "Total Games"))
         gw = side_dict.get("games_won")
         if tg is not None and gw is not None:
-            # PP Total Games is per-player on tennis (their player line).
-            # games_lost = total_games - games_won when both are about
-            # the same player.
             side_dict["games_lost"] = max(0.0, float(tg["line"]) - gw)
 
         # Derive sets_won from Total Sets when present.
-        # Total Sets on PP is the player's sets won (not match total).
+        # PP Total Sets on a singles player is sets-won by that player.
         ts = pp_agg.get((pid, "Total Sets"))
         if ts is not None:
             side_dict["sets_won"] = float(ts["line"])
             # Best-of-3 expected sets-played by side ≈ 2 + p3set.
-            # Without p3set we approximate: loser averages ~2.3, winner ~2.5.
+            # Without p3set we approximate from wp distance to 0.5.
             if wp_a is not None:
                 this_side_wp = wp_a if side_key == "a" else 1 - wp_a
-                exp_sets_played = 2.0 + 0.3 + 0.4 * (1 - abs(this_side_wp - 0.5) * 2)
+                exp_sets_played = 2.0 + 0.3 + 0.4 * (
+                    1 - abs(this_side_wp - 0.5) * 2
+                )
             else:
                 exp_sets_played = 2.4
             side_dict["sets_lost"] = max(
@@ -192,7 +190,9 @@ def _project_posted_lines_for_match(
             manual_side = existing_posted.get(sk)
             if isinstance(manual_side, dict):
                 merged = sides.get(sk, {})
-                merged.update({k: v for k, v in manual_side.items() if v is not None})
+                merged.update(
+                    {k: v for k, v in manual_side.items() if v is not None}
+                )
                 sides[sk] = merged
 
     return sides or None
@@ -228,7 +228,7 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     )
 
     # Pull every active PP row for this slate, all 3 variants. Aggregate
-    # to one median line per (canonical_id, stat_type) — see _aggregate.
+    # to one median line per (canonical_id, stat_type).
     pp_rows = (
         db.table("prizepicks_lines")
         .select("player_id, raw_player_name, stat_type, current_line, odds_type")
@@ -319,10 +319,10 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # PP tab UI feed: one line per (player, stat) using the median,
-    # source='prizepicks'. PP TAB display filters to Fantasy Score only
-    # via the frontend Supabase query — these other stats here exist so
-    # any PP-tab edge calc that wants them can read them, no extra fetch.
+    # PP tab UI feed: one line per (player, stat) using the median.
+    # PP TAB display filters to Fantasy Score only via the frontend
+    # Supabase query — the other stats are exposed here so any PP-tab
+    # edge calc that wants them can read them without an extra fetch.
     pp_lines_out: list[dict] = []
     seen_pairs: set[tuple[str, str]] = set()
     for (pid, pp_stat), agg in pp_agg.items():
@@ -340,3 +340,89 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
                 "source": "prizepicks",
             }
         )
+
+    return FrontendSlate(
+        date=slate["slate_date"],
+        sport=slate["sport"],
+        slate_label=slate.get("slate_label"),
+        lock_time=slate.get("lock_time"),
+        matches=frontend_matches,
+        dk_players=frontend_players,
+        pp_lines=pp_lines_out,
+        meta=meta,
+    )
+
+
+def get_today_slate(sport: str) -> Optional[FrontendSlate]:
+    """Return the most relevant active slate for a sport."""
+    db = get_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _has_players(slate_id: str) -> bool:
+        result = (
+            db.table("slate_players")
+            .select("slate_id", count="exact")
+            .eq("slate_id", slate_id)
+            .limit(1)
+            .execute()
+        )
+        return (result.count or 0) > 0
+
+    def _pick(contest_type: str) -> Optional[str]:
+        candidates = (
+            db.table("slates")
+            .select("id, lock_time, slate_date, first_seen_at")
+            .eq("sport", sport)
+            .eq("status", "active")
+            .eq("contest_type", contest_type)
+            .order("slate_date", desc=True)
+            .order("first_seen_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+        if not candidates:
+            return None
+        upcoming = [
+            c for c in candidates if c.get("lock_time") and c["lock_time"] > now_iso
+        ]
+        upcoming.sort(key=lambda c: c["lock_time"])
+        for c in upcoming:
+            if _has_players(c["id"]):
+                return c["id"]
+        for c in candidates:
+            if _has_players(c["id"]):
+                return c["id"]
+        return candidates[0]["id"]
+
+    classic_id = _pick("classic")
+    if classic_id:
+        return get_frontend_slate(classic_id)
+    showdown_id = _pick("showdown")
+    if showdown_id:
+        return get_frontend_slate(showdown_id)
+    return None
+
+
+def list_slates(sport: str, limit: int = 30) -> list[dict]:
+    """Archive manifest — what dates do we have slates for?"""
+    db = get_client()
+    rows = (
+        db.table("slates")
+        .select("id, slate_date, slate_label, status")
+        .eq("sport", sport)
+        .order("slate_date", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    return [
+        {
+            "id": r["id"],
+            "date": r["slate_date"],
+            "label": r.get("slate_label"),
+            "status": r.get("status"),
+        }
+        for r in rows
+    ]
