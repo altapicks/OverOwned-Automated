@@ -11,6 +11,12 @@ Schema:
 
 Admin gate: admin_users table. User's auth UUID must exist there to write.
 All reads are public (anon via RLS).
+
+v6.5 — list_lines_for_slate default changed from "Fantasy Score only" to
+ALL stat types. The PP tab UI now has stat-category tabs, defaulting to
+Fantasy Score on the client side. This lets the same endpoint serve the
+PP tab's tab filter without an extra request per stat. Existing callers
+that explicitly pass stat_type are unaffected.
 """
 from __future__ import annotations
 
@@ -55,10 +61,13 @@ def is_admin_user(user_id: Optional[str]) -> bool:
 def list_lines_for_slate(slate_id: str, stat_type: Optional[str] = None) -> list[dict]:
     """List active lines for a slate.
 
-    stat_type behavior:
-      None or omitted    → defaults to Fantasy Score only (PP tab default view)
-      "all"              → return every stat type
+    stat_type behavior (v6.5 — default flipped):
+      None or "all"      → return every stat type (default)
       "<specific name>"  → filter to that stat type exactly
+
+    The PrizePicks tab UI now filters client-side via tabs. Returning all
+    stat types in one shot keeps the tab switch instant — no refetch
+    needed when the user clicks Aces, Double Faults, etc.
     """
     db = get_client()
     q = (
@@ -67,10 +76,7 @@ def list_lines_for_slate(slate_id: str, stat_type: Optional[str] = None) -> list
         .eq("slate_id", slate_id)
         .eq("is_active", True)
     )
-    if stat_type is None:
-        # Default: PP tab shows Fantasy Score only.
-        q = q.eq("stat_type", "Fantasy Score")
-    elif stat_type.lower() != "all":
+    if stat_type is not None and stat_type.lower() != "all":
         q = q.eq("stat_type", stat_type)
     rows = q.order("last_updated_at", desc=True).execute().data or []
     return rows
