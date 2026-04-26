@@ -6,14 +6,36 @@ Each variant is persisted as a separate row in prizepicks_lines with its own
 odds_type and multiplier, so the PP tab UI can display the full variant set.
 
 The engine still consumes ONE projection center per (player, stat) via
-slate_reader._aggregate_pp_lines() → match.odds.posted_lines (median across
-variants when standard is absent; standard otherwise).
+slate_reader._aggregate_pp_lines() → match.odds.posted_lines (multiplier-
+aware Poisson λ-fit per variant, averaged — see slate_reader v6.5).
 
 v6.4 — adds payout_multiplier capture. PP's projections endpoint exposes
 multiplier under attributes.payout_multiplier on goblin/demon variants and
 implicitly = 2.0 on standard. We store the explicit value when present and
 fall back to the typical-by-odds_type inference when absent (older API
 response shapes don't carry the field).
+
+v6.5.3 — two important fixes:
+
+  1. DOUBLES FILTER. PP publishes Fantasy Score lines for doubles teams
+     (e.g. "Hsieh S-W / Kenin S", "Heliovaara H / Patten H"). DK tennis on
+     DraftKings is singles-only, so these lines can't match any DK player
+     and only clutter the PP tab + line-movements feed. We detect them by
+     the " / " separator in the raw_player_name and skip ingestion.
+
+  2. DIFF-BASED PERSISTENCE. The previous ingester deactivated ALL active
+     rows for each (slate, stat_type, odds_type) bucket and re-inserted
+     every fresh row, on every tick. The line_movements trigger interpreted
+     this as "removed" + "new" event pairs even when the actual line value
+     was unchanged — so every line appeared to "move" on every tick (e.g.
+     Polina Kudermetova BP × 5 → 5). The new logic diffs fresh vs. existing
+     keyed by (player, stat, odds_type) and only writes when something
+     actually changed:
+        - exact match (same line + same multiplier): NO-OP — trigger silent
+        - line value changed:                         UPDATE current_line  → trigger fires "up"/"down"
+        - multiplier changed only:                    UPDATE multiplier    → no movement event written
+        - new line never seen:                        INSERT               → trigger fires "new"
+        - existing key vanished from fresh feed:      UPDATE is_active=F   → trigger fires "removed"
 """
 
 from __future__ import annotations
@@ -52,8 +74,6 @@ ALLOWED_STAT_TYPES = {
 }
 
 # Typical PP multiplier defaults when attributes.payout_multiplier is absent.
-# Real multipliers vary per prop and PP can A/B them — these are only used
-# when the API doesn't return an explicit value.
 DEFAULT_MULT_BY_ODDS_TYPE = {
     "standard": 2.0,
     "goblin": 1.5,
@@ -71,6 +91,12 @@ PP_HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
 }
+
+# v6.5.3 tolerance for treating two float values as "the same line". PP
+# always posts at 0.5 increments so anything tighter than this means
+# they really are equal.
+_LINE_EQ_EPS = 0.001
+_MULT_EQ_EPS = 0.005
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +121,18 @@ def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
     except Exception as e:
         log.warning("resolve_player failed for %s: %s", raw_name, e)
         return None
+
+
+def _is_doubles_name(raw_name: str) -> bool:
+    """v6.5.3: heuristic for detecting PP doubles entries.
+
+    PP formats doubles teams as "<player_a> / <player_b>" with a single
+    forward slash flanked by spaces, e.g. "Hsieh S-W / Kenin S" or
+    "Heliovaara H / Patten H". Singles names in tennis never contain that
+    pattern (hyphenated surnames use "-", not "/"). One-shot match catches
+    every doubles row in the feed without needing a tournament-level flag.
+    """
+    return " / " in (raw_name or "")
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +263,7 @@ def fetch_projections(league_id: str) -> Tuple[int, Dict[str, Any], str]:
     status2, body2, err2 = _oxy_fetch_json(url, render=True)
     if status2 == 200:
         return status2, body2, ""
-    return status2, {}, f"plain={err} | render={err2}"
+    return status2, {}, f"{err} | render_retry: {err2}"
 
 
 def get_tennis_league_ids() -> List[str]:
@@ -233,35 +271,29 @@ def get_tennis_league_ids() -> List[str]:
     if status != 200:
         return []
     out: List[str] = []
-    for lg in leagues:
-        attr = lg.get("attributes", {}) or {}
-        name = (attr.get("name") or "").strip().upper()
+    for l in leagues:
+        attr = l.get("attributes", {}) or {}
+        name = (attr.get("name") or "").upper().strip()
         if name in TENNIS_LEAGUE_NAME_ALLOW:
-            lid = str(lg.get("id") or "")
+            lid = str(l.get("id") or "")
             if lid:
                 out.append(lid)
     return out
 
 
-# ---------------------------------------------------------------------------
-# Normalizers
-# ---------------------------------------------------------------------------
-
 def _normalize_odds_type(raw: Optional[str]) -> str:
     if not raw:
         return "standard"
-    s = str(raw).strip().lower()
-    if s in {"demon", "goblin", "standard"}:
-        return s
+    r = str(raw).strip().lower()
+    if r in {"goblin", "demon", "standard"}:
+        return r
     return "standard"
 
 
 def _extract_multiplier(attr: Dict[str, Any], odds_type: str) -> float:
-    """
-    Pull the payout multiplier off a PP projection. Tries explicit fields
-    first, falls back to typical-by-odds_type defaults if absent.
+    """Pull the multiplier off a PP projection attributes payload.
 
-    PP's projections endpoint has used several field names across API
+    PP's response shape has historically exposed it under a few different
     versions: payout_multiplier (current), odds_type_multiplier (legacy),
     and flat multiplier (occasional A/B). We check all three. When none
     exist or all are zero, fall back to the conservative defaults in
@@ -293,6 +325,30 @@ def _build_player_index(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 
 
 # ---------------------------------------------------------------------------
+# Diff helpers (v6.5.3)
+# ---------------------------------------------------------------------------
+
+def _line_eq(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    try:
+        return abs(float(a) - float(b)) <= _LINE_EQ_EPS
+    except (TypeError, ValueError):
+        return False
+
+
+def _mult_eq(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    try:
+        return abs(float(a) - float(b)) <= _MULT_EQ_EPS
+    except (TypeError, ValueError):
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Main ingest
 # ---------------------------------------------------------------------------
 
@@ -301,8 +357,12 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         "slate_id": slate_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "leagues": [],
-        "wrote": 0,
+        "inserted": 0,
+        "updated_line": 0,
+        "updated_mult_only": 0,
+        "unchanged": 0,
         "deactivated": 0,
+        "skipped_doubles": 0,
         "row_failures": 0,
         "odds_type_histogram": {},
         "stat_histogram": {},
@@ -320,15 +380,41 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
     db = get_client()
     overall_odds_hist: Counter = Counter()
     overall_stat_hist: Counter = Counter()
-    total_wrote = 0
-    total_deactivated = 0
-    total_failures = 0
+
+    # ── 1. Fetch existing active rows for the slate ONCE ────────────────
+    # Index by (raw_player_name, stat_type, odds_type). Multiple rows per
+    # key are allowed — PP occasionally A/B-tests two different lines at
+    # the same odds_type (e.g. two demon variants). We carry them as a
+    # list and match on line value during the diff.
+    try:
+        existing_rows = (
+            db.table("prizepicks_lines")
+            .select("id, raw_player_name, stat_type, odds_type, current_line, multiplier, player_id, notes")
+            .eq("slate_id", slate_id)
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        log.exception("Failed to load existing PP rows for slate=%s: %s", slate_id, e)
+        existing_rows = []
+        summary["errors"].append(f"load_existing_failed: {e}")
+
+    existing_idx: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for r in existing_rows:
+        key = (r["raw_player_name"], r["stat_type"], r["odds_type"])
+        existing_idx[key].append(r)
+
+    # ── 2. Pull fresh state from PP across every tennis league ──────────
+    fresh_idx: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    skipped_doubles = 0
 
     for lid in league_ids:
         status, body, err = fetch_projections(lid)
         if status != 200:
             summary["leagues"].append(
-                {"id": lid, "http": status, "wrote": 0, "error": err}
+                {"id": lid, "http": status, "error": err}
             )
             summary["errors"].append(f"projections_failed[{lid}]: {err}")
             continue
@@ -336,11 +422,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         data = body.get("data", []) or []
         included = body.get("included", []) or []
         player_idx = _build_player_index(included)
-
-        # Group by (stat_type, odds_type) so deactivation is per-variant —
-        # a slate refresh that loses goblins but keeps demons should not
-        # nuke the demon rows.
-        grouped: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        league_fresh_count = 0
 
         for proj in data:
             attr = proj.get("attributes", {}) or {}
@@ -370,11 +452,18 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             if not raw_name:
                 continue
 
+            # v6.5.3: drop doubles squares before any normalizer/DB work.
+            # DK tennis is singles-only — these rows can't match a DK
+            # player and just clutter the PP tab + movement feed.
+            if _is_doubles_name(raw_name):
+                skipped_doubles += 1
+                continue
+
             resolved = _resolve_player(raw_name)
             if not resolved:
                 continue
 
-            grouped[(stat_type, odds_type)][resolved] = {
+            fresh_idx[(raw_name, stat_type, odds_type)].append({
                 "slate_id": slate_id,
                 "player_id": resolved,
                 "raw_player_name": raw_name,
@@ -385,69 +474,170 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
                 "league": "TENNIS",
                 "is_active": True,
                 "notes": f"pp_proj_id={proj.get('id')}",
-            }
+            })
+            league_fresh_count += 1
             overall_stat_hist[stat_type] += 1
             overall_odds_hist[odds_type] += 1
 
-        league_wrote = 0
-        league_deact = 0
-        league_failures = 0
+        summary["leagues"].append(
+            {"id": lid, "http": 200, "fresh_rows": league_fresh_count}
+        )
 
-        for (stat_type, odds_type), per_player in grouped.items():
-            rows = list(per_player.values())
-            try:
-                resp = (
-                    db.table("prizepicks_lines")
-                    .update({"is_active": False})
-                    .eq("slate_id", slate_id)
-                    .eq("stat_type", stat_type)
-                    .eq("odds_type", odds_type)
-                    .eq("is_active", True)
-                    .execute()
-                )
-                league_deact += len(resp.data or [])
-            except Exception as e:
-                summary["errors"].append(
-                    f"deactivate_failed[{stat_type}/{odds_type}]: {e}"
-                )
+    summary["skipped_doubles"] = skipped_doubles
+
+    # ── 3. Diff fresh vs existing ───────────────────────────────────────
+    inserted = 0
+    updated_line = 0
+    updated_mult_only = 0
+    unchanged = 0
+    deactivated = 0
+    row_failures = 0
+
+    for key, fresh_list in fresh_idx.items():
+        existing_list = list(existing_idx.get(key, []))  # defensive copy
+        consumed_existing_ids: set[str] = set()
+
+        # Pass 1 — exact matches: same line + same multiplier → no-op.
+        for fresh in fresh_list:
+            match: Optional[Dict[str, Any]] = None
+            for ex in existing_list:
+                if ex["id"] in consumed_existing_ids:
+                    continue
+                if _line_eq(ex.get("current_line"), fresh["current_line"]) and \
+                   _mult_eq(ex.get("multiplier"), fresh["multiplier"]):
+                    match = ex
+                    break
+            if match is not None:
+                consumed_existing_ids.add(match["id"])
+                fresh["_settled"] = True
+                unchanged += 1
+
+        # Pass 2 — line-equal multiplier-different: write multiplier only.
+        # This is rare (PP usually moves the line and the multiplier
+        # together when a price changes) but we handle it cleanly. Multi
+        # update does NOT fire the line_movements trigger because
+        # current_line is unchanged — exactly what we want.
+        for fresh in fresh_list:
+            if fresh.get("_settled"):
                 continue
-
-            for row in rows:
+            match = None
+            for ex in existing_list:
+                if ex["id"] in consumed_existing_ids:
+                    continue
+                if _line_eq(ex.get("current_line"), fresh["current_line"]):
+                    match = ex
+                    break
+            if match is not None:
+                consumed_existing_ids.add(match["id"])
                 try:
-                    resp = db.table("prizepicks_lines").insert(row).execute()
-                    if resp.data:
-                        league_wrote += len(resp.data)
+                    db.table("prizepicks_lines").update({
+                        "multiplier": fresh["multiplier"],
+                        "notes": fresh["notes"],
+                    }).eq("id", match["id"]).execute()
+                    updated_mult_only += 1
+                    fresh["_settled"] = True
                 except Exception as e:
-                    league_failures += 1
-                    msg = str(e)[:200]
+                    row_failures += 1
                     if len(summary["errors"]) < 30:
                         summary["errors"].append(
-                            f"insert_failed[{stat_type}/{odds_type}/{row['player_id']}]: {msg}"
+                            f"mult_update_failed[{key}/{match['id']}]: {str(e)[:200]}"
                         )
 
-        summary["leagues"].append(
-            {
-                "id": lid,
-                "http": 200,
-                "wrote": league_wrote,
-                "deactivated": league_deact,
-                "row_failures": league_failures,
-            }
-        )
-        total_wrote += league_wrote
-        total_deactivated += league_deact
-        total_failures += league_failures
+        # Pass 3 — line moved: pick any leftover existing row at this key
+        # and UPDATE it with the new line. Trigger fires "up"/"down".
+        for fresh in fresh_list:
+            if fresh.get("_settled"):
+                continue
+            target: Optional[Dict[str, Any]] = None
+            for ex in existing_list:
+                if ex["id"] in consumed_existing_ids:
+                    continue
+                target = ex
+                break
+            if target is not None:
+                consumed_existing_ids.add(target["id"])
+                try:
+                    db.table("prizepicks_lines").update({
+                        "current_line": fresh["current_line"],
+                        "multiplier": fresh["multiplier"],
+                        "notes": fresh["notes"],
+                    }).eq("id", target["id"]).execute()
+                    updated_line += 1
+                    fresh["_settled"] = True
+                except Exception as e:
+                    row_failures += 1
+                    if len(summary["errors"]) < 30:
+                        summary["errors"].append(
+                            f"line_update_failed[{key}/{target['id']}]: {str(e)[:200]}"
+                        )
 
-    summary["wrote"] = total_wrote
-    summary["deactivated"] = total_deactivated
-    summary["row_failures"] = total_failures
+        # Pass 4 — brand new line: INSERT. Trigger fires "new".
+        for fresh in fresh_list:
+            if fresh.get("_settled"):
+                continue
+            try:
+                payload = {k: v for k, v in fresh.items() if not k.startswith("_")}
+                db.table("prizepicks_lines").insert(payload).execute()
+                inserted += 1
+            except Exception as e:
+                row_failures += 1
+                if len(summary["errors"]) < 30:
+                    summary["errors"].append(
+                        f"insert_failed[{key}]: {str(e)[:200]}"
+                    )
+
+        # Pass 5 — leftover existing rows for this key not consumed by
+        # any fresh row → PP no longer publishes them, deactivate. Trigger
+        # fires "removed".
+        for ex in existing_list:
+            if ex["id"] in consumed_existing_ids:
+                continue
+            try:
+                db.table("prizepicks_lines").update({
+                    "is_active": False,
+                }).eq("id", ex["id"]).execute()
+                deactivated += 1
+            except Exception as e:
+                row_failures += 1
+                if len(summary["errors"]) < 30:
+                    summary["errors"].append(
+                        f"deactivate_failed[{key}/{ex['id']}]: {str(e)[:200]}"
+                    )
+
+    # ── 4. Keys present in existing but absent from fresh entirely ─────
+    # PP dropped all variants for this (player, stat, odds_type) — could
+    # mean the prop got pulled, the player is no longer on the slate, etc.
+    for key, existing_list in existing_idx.items():
+        if key in fresh_idx:
+            continue  # handled above
+        for ex in existing_list:
+            try:
+                db.table("prizepicks_lines").update({
+                    "is_active": False,
+                }).eq("id", ex["id"]).execute()
+                deactivated += 1
+            except Exception as e:
+                row_failures += 1
+                if len(summary["errors"]) < 30:
+                    summary["errors"].append(
+                        f"deactivate_missing_failed[{key}/{ex['id']}]: {str(e)[:200]}"
+                    )
+
+    summary["inserted"] = inserted
+    summary["updated_line"] = updated_line
+    summary["updated_mult_only"] = updated_mult_only
+    summary["unchanged"] = unchanged
+    summary["deactivated"] = deactivated
+    summary["row_failures"] = row_failures
     summary["odds_type_histogram"] = dict(overall_odds_hist)
     summary["stat_histogram"] = dict(overall_stat_hist)
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
 
     log.info(
-        "PP ingest done slate=%s wrote=%d deact=%d fail=%d odds=%s stat=%s",
-        slate_id, total_wrote, total_deactivated, total_failures,
+        "PP ingest done slate=%s ins=%d line_upd=%d mult_upd=%d unchanged=%d deact=%d "
+        "doubles_skipped=%d fail=%d odds=%s stat=%s",
+        slate_id, inserted, updated_line, updated_mult_only, unchanged,
+        deactivated, skipped_doubles, row_failures,
         summary["odds_type_histogram"], summary["stat_histogram"],
     )
     return summary
