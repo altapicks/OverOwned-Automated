@@ -1,8 +1,13 @@
-"""Direct PrizePicks projections ingest using curl_cffi (Chrome TLS impersonation).
+"""Direct PrizePicks projections ingest via Oxylabs Web Scraper API.
 
-PrizePicks' Cloudflare CDN 403s any non-browser TLS fingerprint, including
-plain httpx. curl_cffi exposes libcurl-impersonate which produces a real
-Chrome JA3/HTTP-2 signature — Cloudflare lets it through.
+PrizePicks' Cloudflare CDN blocks any direct request — including curl_cffi
+TLS impersonation — by serving a JS challenge page. We route through
+Oxylabs Web Scraper API which solves the challenge transparently and
+returns the raw JSON.
+
+Required env vars:
+  OXYLABS_USERNAME
+  OXYLABS_PASSWORD
 
 Schema: writes to prizepicks_lines using deactivate-then-insert per
 (slate_id, stat_type), preserving the manual CSV override path.
@@ -11,8 +16,12 @@ Kalshi win-% is NEVER touched here.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
+
+import httpx
 
 from app.db import get_client
 from app.services.normalizer import PlayerNormalizer
@@ -20,8 +29,8 @@ from app.services.normalizer import PlayerNormalizer
 logger = logging.getLogger(__name__)
 
 PP_BASE = "https://api.prizepicks.com"
+OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
 
-# Stat-type whitelist. Frontend Pivots tab filters on these exact strings.
 STAT_TYPE_WHITELIST = {
     "Fantasy Score": "Fantasy Score",
     "Aces": "Aces",
@@ -33,51 +42,91 @@ STAT_TYPE_WHITELIST = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────
-# HTTP — curl_cffi with httpx fallback
-# ─────────────────────────────────────────────────────────────────────
-
-def _have_curl_cffi() -> bool:
-    try:
-        import curl_cffi.requests  # noqa: F401
-        return True
-    except Exception:
-        return False
+def _oxy_creds() -> tuple[str, str] | None:
+    user = os.getenv("OXYLABS_USERNAME")
+    pw = os.getenv("OXYLABS_PASSWORD")
+    if not user or not pw:
+        return None
+    return user, pw
 
 
 async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dict]:
-    """GET a JSON endpoint with Chrome TLS impersonation.
+    """GET a JSON URL through Oxylabs Web Scraper API.
 
-    Returns (http_status, parsed_json). Falls back to httpx if curl_cffi
-    is missing — but PrizePicks will 403 the fallback. The fallback is
-    only there to keep the rest of the app importable if curl_cffi
-    fails to install on Railway.
+    Oxylabs returns an envelope:
+      {"results":[{"content": "...raw response body...", "status_code": 200}]}
+
+    We parse the inner content as JSON and return (target_status, target_json).
     """
-    if _have_curl_cffi():
-        from curl_cffi.requests import AsyncSession
-        async with AsyncSession(impersonate="chrome120") as session:
-            r = await session.get(url, params=params, timeout=20)
-            try:
-                payload = r.json()
-            except Exception:
-                payload = {}
-            return r.status_code, payload
+    creds = _oxy_creds()
+    if not creds:
+        logger.error("OXYLABS_USERNAME/PASSWORD not set")
+        return 0, {}
 
-    import httpx
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(
-            url,
-            params=params,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-            },
+    user, pw = creds
+
+    # Stitch params onto URL since Oxylabs expects a single fully-built URL
+    if params:
+        from urllib.parse import urlencode
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{urlencode(params)}"
+
+    body = {
+        "source": "universal",
+        "url": url,
+        # No JS rendering needed — PP's API endpoint serves JSON when the
+        # Cloudflare challenge is solved. Oxylabs solves it server-side.
+        "geo_location": "United States",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                OXY_ENDPOINT,
+                json=body,
+                auth=(user, pw),
+                headers={"Content-Type": "application/json"},
+            )
+    except Exception as e:
+        logger.exception("Oxylabs request failed: %s", e)
+        return 0, {}
+
+    if r.status_code != 200:
+        logger.error("Oxylabs HTTP %d: %s", r.status_code, r.text[:500])
+        return r.status_code, {}
+
+    try:
+        env = r.json()
+    except Exception:
+        logger.error("Oxylabs returned non-JSON envelope: %s", r.text[:500])
+        return 0, {}
+
+    results = env.get("results") or []
+    if not results:
+        logger.error("Oxylabs envelope had no results: %s", str(env)[:500])
+        return 0, {}
+
+    first = results[0]
+    target_status = first.get("status_code") or 0
+    raw_content = first.get("content") or ""
+
+    if target_status != 200:
+        logger.error(
+            "Target HTTP %d via Oxylabs (url=%s)", target_status, url
         )
-        try:
-            payload = r.json()
-        except Exception:
-            payload = {}
-        return r.status_code, payload
+        return target_status, {}
+
+    # Content may be a JSON string or already a dict
+    if isinstance(raw_content, dict):
+        return target_status, raw_content
+    try:
+        return target_status, json.loads(raw_content)
+    except (TypeError, json.JSONDecodeError):
+        logger.error(
+            "Target returned 200 but content not JSON-parseable. First 200 chars: %s",
+            str(raw_content)[:200],
+        )
+        return target_status, {}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -118,11 +167,7 @@ async def _discover_tennis_league_ids() -> list[int]:
         return []
 
     if status != 200:
-        logger.error(
-            "PP /leagues HTTP %d (curl_cffi installed=%s)",
-            status,
-            _have_curl_cffi(),
-        )
+        logger.error("PP /leagues HTTP %d via Oxylabs", status)
         return []
 
     ids: list[int] = []
@@ -167,7 +212,6 @@ async def _fetch_projections(league_id: int) -> dict:
 
 
 def _parse_projections(payload: dict) -> list[dict]:
-    """JSONAPI envelope → list of {raw_player_name, stat_type, line}."""
     rows: list[dict] = []
     included = payload.get("included") or []
     player_lookup: dict[str, str] = {}
@@ -216,6 +260,8 @@ def _parse_projections(payload: dict) -> list[dict]:
 async def fetch_tick(sport_code: str = "TEN") -> dict:
     if sport_code != "TEN":
         return {"skipped": "not_tennis"}
+    if not _oxy_creds():
+        return {"skipped": "no_oxylabs_creds"}
     if not await _has_upcoming_matches():
         return {"skipped": "no_upcoming_matches"}
 
