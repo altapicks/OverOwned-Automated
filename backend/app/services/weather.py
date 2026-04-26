@@ -48,6 +48,31 @@ ACCU_BASE = "http://dataservice.accuweather.com"
 MIN_REFRESH_MINUTES = 15
 
 
+# v6.8: Resolve a venue with a slate-label fallback.
+#
+# Why this exists: some slate ingesters leave matches.tournament null even
+# when the slate-level slate_label clearly identifies the tournament (e.g.
+# slate_label = "Featured (Madrid)" but each match.tournament = null).
+# Without this fallback every match gets classified as unknown venue and
+# the whole weather refresh is a no-op. The fallback substring-matches the
+# slate_label against the same venue dictionary, which works because keys
+# like "madrid open" match the substring "madrid" inside the label.
+#
+# Returns (venue, source) where venue is the lookup_venue() result (or None)
+# and source is "tournament" / "slate_label" / "none" for diagnostic logging.
+def _resolve_venue_with_fallback(
+    tournament: Optional[str],
+    slate_label: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    venue = lookup_venue(tournament) if tournament else None
+    if venue:
+        return venue, "tournament"
+    venue = lookup_venue(slate_label) if slate_label else None
+    if venue:
+        return venue, "slate_label"
+    return None, "none"
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Location key resolution (cached)
 # ───────────────────────────────────────────────────────────────────────
@@ -287,10 +312,13 @@ def _compact_forecast(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def fetch_weather_for_match(
     match_row: Dict[str, Any], force: bool = False,
+    slate_label: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Resolve venue → location_key → forecast → persist on matches.weather.
 
     `match_row` should contain at least: id, tournament, start_time, weather.
+    `slate_label` is an optional fallback used when match.tournament is null
+    or doesn't match any venue (see _resolve_venue_with_fallback).
     `force=True` bypasses the MIN_REFRESH_MINUTES freshness check.
 
     Returns the persisted weather dict on success, None if the match couldn't
@@ -301,13 +329,20 @@ def fetch_weather_for_match(
     tournament = match_row.get("tournament")
     start_time = match_row.get("start_time")
 
-    venue = lookup_venue(tournament)
+    venue, venue_source = _resolve_venue_with_fallback(tournament, slate_label)
     if not venue:
         log.info(
-            "weather: no venue match for tournament=%r match=%s — skip",
-            tournament, match_id,
+            "weather: no venue match for tournament=%r slate_label=%r match=%s — skip",
+            tournament, slate_label, match_id,
         )
         return None
+
+    if venue_source == "slate_label":
+        log.info(
+            "weather: resolved venue via slate_label fallback for match=%s "
+            "(tournament was %r, slate_label=%r matched %r)",
+            match_id, tournament, slate_label, venue.get("_matched_key"),
+        )
 
     # Indoor venues skip the API call entirely. Frontend renders "Indoor".
     if venue.get("is_indoor"):
@@ -406,9 +441,35 @@ def refresh_weather_for_slate(slate_id: str, force: bool = False) -> Dict[str, A
         "skipped_unknown_venue": 0,
         "skipped_fresh": 0,
         "failed": 0,
+        "venue_via_slate_label": 0,  # v6.8: count of matches that used the fallback
         "errors": [],
     }
     db = get_client()
+
+    # v6.8: Load the slate's slate_label as a fallback for venue resolution.
+    # Some ingesters leave matches.tournament null even when slate_label
+    # clearly identifies the tournament (e.g. "Featured (Madrid)"). Without
+    # this we'd skip every match as unknown venue. Loaded once per refresh.
+    slate_label: Optional[str] = None
+    try:
+        slate_row = (
+            db.table("slates")
+            .select("slate_label")
+            .eq("id", slate_id)
+            .single()
+            .execute()
+            .data
+        )
+        if slate_row:
+            slate_label = slate_row.get("slate_label")
+    except Exception as e:
+        log.warning(
+            "weather: couldn't load slate_label for slate=%s: %s — proceeding without fallback",
+            slate_id, e,
+        )
+
+    summary["slate_label"] = slate_label
+
     try:
         rows = (
             db.table("matches")
@@ -425,10 +486,14 @@ def refresh_weather_for_slate(slate_id: str, force: bool = False) -> Dict[str, A
     summary["matches_total"] = len(rows)
 
     for m in rows:
-        venue = lookup_venue(m.get("tournament"))
+        venue, venue_source = _resolve_venue_with_fallback(
+            m.get("tournament"), slate_label,
+        )
         if not venue:
             summary["skipped_unknown_venue"] += 1
             continue
+        if venue_source == "slate_label":
+            summary["venue_via_slate_label"] += 1
 
         # Pre-check freshness so the per-match counter is right; reduces a
         # round-trip into fetch_weather_for_match for matches that won't run.
@@ -444,7 +509,9 @@ def refresh_weather_for_slate(slate_id: str, force: bool = False) -> Dict[str, A
             except (TypeError, ValueError):
                 pass
 
-        result = fetch_weather_for_match(m, force=force)
+        # v6.8: pass slate_label through so fetch_weather_for_match
+        # uses the same fallback if called directly elsewhere.
+        result = fetch_weather_for_match(m, force=force, slate_label=slate_label)
         if result is None:
             summary["failed"] += 1
         elif result.get("is_indoor"):
@@ -455,9 +522,11 @@ def refresh_weather_for_slate(slate_id: str, force: bool = False) -> Dict[str, A
 
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
     log.info(
-        "weather refresh slate=%s total=%d ok=%d indoor=%d unknown=%d fresh=%d fail=%d",
-        slate_id, summary["matches_total"], summary["success"],
+        "weather refresh slate=%s slate_label=%r total=%d ok=%d indoor=%d "
+        "unknown=%d fresh=%d fail=%d via_slate_label=%d",
+        slate_id, slate_label, summary["matches_total"], summary["success"],
         summary["skipped_indoor"], summary["skipped_unknown_venue"],
         summary["skipped_fresh"], summary["failed"],
+        summary["venue_via_slate_label"],
     )
     return summary
