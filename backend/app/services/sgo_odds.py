@@ -10,8 +10,13 @@ Pulls Pinnacle odds for the markets the engine actually consumes:
 Moneyline (points-*-game-ml-*) is intentionally NOT pulled — Kalshi is
 the sole source of win probability (kalshi_prob_a / kalshi_prob_b).
 
-set_a_20 / set_a_21 / set_b_20 / set_b_21 are derived from the existing
-matches.odds.kalshi_prob_a + p3set during ingest.
+v6.5 — set 4-way (set_a_20 / _21 / b_20 / b_21) is now derived from the
+DEVIGGED set-spread 2-way market when both sides are present (e.g.,
+A -1.5 @ -350 vs B +1.5 @ +250). The Kalshi-prob × p3set independence
+math is kept as a fallback for rows that don't carry both sides of the
+set spread. The set-spread path is sharper because the spread market
+prices straight-set sweep probability directly, instead of assuming
+that set count is independent of who wins.
 
 NAME RESOLUTION
 ───────────────
@@ -282,9 +287,134 @@ def _parse_event(event: dict) -> Optional[TennisOddsRow]:
     )
 
 
+# ── Set 4-way derivation ──────────────────────────────────────────────
+
+
+def _derive_set_4way_from_spread(
+    eng_fields: dict, kalshi_wp_a: Optional[float]
+) -> bool:
+    """v6.5 — sharp path. Compute set_a_20 / _21 / b_20 / b_21 from the
+    devigged Pinnacle set-spread 2-way market.
+
+    Inputs required (all from eng_fields except wp_a):
+        set_spread_a_line, set_spread_a_odds (American)
+        set_spread_b_line, set_spread_b_odds (American)
+        p3set
+        kalshi_wp_a
+
+    The set spread in tennis bo3 is always ±1.5 — there are only two
+    possible margins (2-0 or 2-1), so -1.5 covers iff the favorite sweeps.
+    Devig math:
+        p_a_devig = (1/A_implied) / ((1/A_implied) + (1/B_implied))
+                    where A_implied = americanToProb(set_spread_a_odds)
+                    (note we already use raw probs, not 1/decimal)
+        Actually: p_a_devig = p_a_raw / (p_a_raw + p_b_raw).
+
+    Then with the favorite's straight-sweep probability anchored:
+        wp_a, wp_b from Kalshi
+        p_a20 = devigged P(A -1.5 covers) = devigged P(A wins 2-0)
+        p_a21 = wp_a - p_a20
+        p_b21 = p3set - p_a21         # because total 3-set prob = p_a21 + p_b21
+        p_b20 = wp_b - p_b21
+
+    All four sum to 1.0 by construction. Returns True on success, False
+    on any precondition miss → caller falls through to the kalshi-only
+    derivation.
+    """
+    a_line = eng_fields.get("set_spread_a_line")
+    b_line = eng_fields.get("set_spread_b_line")
+    a_odds = eng_fields.get("set_spread_a_odds")
+    b_odds = eng_fields.get("set_spread_b_odds")
+    p3set = eng_fields.get("p3set")
+
+    if None in (a_line, b_line, a_odds, b_odds, p3set, kalshi_wp_a):
+        return False
+
+    try:
+        a_line_f = float(a_line)
+        b_line_f = float(b_line)
+        wp_a = float(kalshi_wp_a)
+        p3 = float(p3set)
+    except (TypeError, ValueError):
+        return False
+
+    # Spreads must be a matched ±1.5 pair (or any opposite-sign pair really,
+    # but tennis bo3 only has 1.5).
+    if abs(a_line_f + b_line_f) > 0.01:
+        return False
+    if abs(abs(a_line_f) - 1.5) > 0.01:
+        return False
+    if not (0.0 < wp_a < 1.0) or not (0.0 <= p3 <= 1.0):
+        return False
+
+    p_a_raw = _american_to_prob(a_odds)
+    p_b_raw = _american_to_prob(b_odds)
+    if p_a_raw is None or p_b_raw is None:
+        return False
+    total = p_a_raw + p_b_raw
+    # Sanity: vig should land in a reasonable band. Tennis Pinnacle vig on
+    # set spread is ~1-3%. Anything wildly outside means the market isn't a
+    # true 2-way pair (e.g., one side suspended). Bail to fallback.
+    if total <= 0.95 or total > 1.20:
+        return False
+
+    p_a_devig = p_a_raw / total
+
+    # Translate "side A's spread devig" → "P(A wins 2-0)".
+    # If A's line is -1.5, A covers iff A sweeps → p_a_devig = P(A 2-0).
+    # If A's line is +1.5, A covers iff A wins ≥1 set → 1-p_a_devig = P(B 2-0).
+    if a_line_f < 0:
+        p_a20 = p_a_devig
+    else:
+        # A is the underdog at +1.5. Derive P(B 2-0) directly, then back into
+        # P(A 2-0) via wp + p3set bookkeeping.
+        p_b20_direct = 1.0 - p_a_devig
+        # p_a20 = wp_a - p_a21, where p_a21 = p3set - p_b21 = p3set - (wp_b - p_b20_direct)
+        # → p_a20 = wp_a - p3set + (1 - wp_a) - p_b20_direct
+        #         = 1 - p3set - p_b20_direct
+        p_a20 = 1.0 - p3 - p_b20_direct
+
+    if not (0.0 <= p_a20 <= 1.0):
+        return False
+
+    wp_b = 1.0 - wp_a
+    p_a21 = wp_a - p_a20
+    p_b21 = p3 - p_a21
+    p_b20 = wp_b - p_b21
+
+    # Tolerance for accumulated float noise; clamp tiny negatives to 0.
+    eps = 0.005
+    for nm, val in (("p_a20", p_a20), ("p_a21", p_a21), ("p_b20", p_b20), ("p_b21", p_b21)):
+        if val < -eps:
+            return False
+
+    p_a20 = max(0.0, min(1.0, p_a20))
+    p_a21 = max(0.0, min(1.0, p_a21))
+    p_b20 = max(0.0, min(1.0, p_b20))
+    p_b21 = max(0.0, min(1.0, p_b21))
+
+    pairs = {
+        "set_a_20": p_a20,
+        "set_a_21": p_a21,
+        "set_b_20": p_b20,
+        "set_b_21": p_b21,
+    }
+    for k, prob in pairs.items():
+        am = _prob_to_american(prob)
+        if am is not None:
+            eng_fields[k] = am
+
+    eng_fields["set_4way_source"] = "spread_devig"
+    return True
+
+
 def _augment_set_scores_from_kalshi(
     eng_fields: dict, kalshi_wp_a: Optional[float]
 ) -> None:
+    """Fallback derivation. Assumes outcome ⊥ set count (independence).
+    Used when set-spread devig isn't available (e.g., Pinnacle hasn't
+    posted both sides of the spread, or the line isn't ±1.5).
+    """
     p3set = eng_fields.get("p3set")
     if kalshi_wp_a is None or p3set is None:
         return
@@ -306,6 +436,14 @@ def _augment_set_scores_from_kalshi(
         am = _prob_to_american(prob)
         if am is not None:
             eng_fields[k] = am
+    eng_fields["set_4way_source"] = "kalshi_independence"
+
+
+def _augment_set_scores(eng_fields: dict, kalshi_wp_a: Optional[float]) -> None:
+    """Wrapper: try set-spread devig first; on failure use kalshi independence."""
+    if _derive_set_4way_from_spread(eng_fields, kalshi_wp_a):
+        return
+    _augment_set_scores_from_kalshi(eng_fields, kalshi_wp_a)
 
 
 # ── Schedule gate ─────────────────────────────────────────────────────
@@ -419,16 +557,13 @@ def _seed_alias(canonical_id: str, source: str, raw_name: str) -> bool:
 
     aliases = row.get("aliases") or {}
     existing = aliases.get(source)
-    if existing == raw_name:
-        return False
-    if isinstance(existing, list) and raw_name in existing:
-        return False
-
-    if existing is None:
-        aliases[source] = raw_name
-    elif isinstance(existing, str):
+    if isinstance(existing, str):
+        if existing == raw_name:
+            return False
         aliases[source] = [existing, raw_name]
     elif isinstance(existing, list):
+        if raw_name in existing:
+            return False
         existing.append(raw_name)
         aliases[source] = existing
     else:
@@ -438,23 +573,13 @@ def _seed_alias(canonical_id: str, source: str, raw_name: str) -> bool:
         db.table("players").update({"aliases": aliases}).eq(
             "canonical_id", canonical_id
         ).execute()
+        return True
     except Exception as e:
-        logger.warning(
-            "alias seed: failed to persist %s.%s = %r (%s)",
-            canonical_id,
-            source,
-            raw_name,
-            e,
-        )
+        logger.warning("alias seed: failed to write player %s: %s", canonical_id, e)
         return False
 
-    logger.info(
-        "SGO alias seeded: %s.aliases.%s = %r", canonical_id, source, raw_name
-    )
-    return True
 
-
-# ── Surname fallback resolver ─────────────────────────────────────────
+# ── Surname-pair fallback ─────────────────────────────────────────────
 
 
 def _surname_fallback_match(
@@ -463,63 +588,57 @@ def _surname_fallback_match(
     candidate_matches: list[dict],
     surname_index: dict[str, list[tuple[str, str]]],
 ) -> Optional[dict]:
-    """Last-name + opposing-sides fallback resolver.
-
-    Returns a dict {match, sgo_a_canonical_id, sgo_b_canonical_id, sgo_a_side}
-    if exactly one slate match has both SGO surnames present on opposite
-    sides. Returns None if no unique match found OR if surnames map to
-    multiple matches (ambiguous — refuse rather than guess).
+    """Locate a slate match where the two SGO surnames map uniquely to its
+    two players on opposing sides. Returns dict with the matched canonical
+    ids and the chosen match row, or None if no unambiguous mapping exists.
     """
-    key_a = _last_name_key(sgo_a_name)
-    key_b = _last_name_key(sgo_b_name)
-    if not key_a or not key_b or key_a == key_b:
+    a_key = _last_name_key(sgo_a_name)
+    b_key = _last_name_key(sgo_b_name)
+    if not a_key or not b_key or a_key == b_key:
         return None
 
-    a_hits = surname_index.get(key_a) or []
-    b_hits = surname_index.get(key_b) or []
-    if not a_hits or not b_hits:
+    a_candidates = surname_index.get(a_key) or []
+    b_candidates = surname_index.get(b_key) or []
+    if not a_candidates or not b_candidates:
         return None
 
-    candidates_by_match: dict[str, dict] = {m["id"]: m for m in candidate_matches}
-    matches_found: list[tuple[str, str]] = []  # (match_id, sgo_a_side)
+    matches_to_match: dict[str, dict] = {m["id"]: m for m in candidate_matches}
 
-    for cid_a, side_a in a_hits:
-        for cid_b, side_b in b_hits:
-            if cid_a == cid_b:
-                continue
-            if side_a == side_b:
-                continue
-            for m in candidate_matches:
-                pa = m.get("player_a_id")
-                pb = m.get("player_b_id")
-                if side_a == "a" and pa == cid_a and pb == cid_b:
-                    matches_found.append((m["id"], "a"))
-                elif side_a == "b" and pb == cid_a and pa == cid_b:
-                    matches_found.append((m["id"], "b"))
+    a_by_match: dict[str, set[tuple[str, str]]] = {}
+    for cid, side in a_candidates:
+        for m in candidate_matches:
+            if m["player_a_id"] == cid or m["player_b_id"] == cid:
+                a_by_match.setdefault(m["id"], set()).add((cid, side))
 
-    unique_match_ids = {mf[0] for mf in matches_found}
-    if len(unique_match_ids) != 1:
-        return None  # zero or ambiguous — refuse
+    b_by_match: dict[str, set[tuple[str, str]]] = {}
+    for cid, side in b_candidates:
+        for m in candidate_matches:
+            if m["player_a_id"] == cid or m["player_b_id"] == cid:
+                b_by_match.setdefault(m["id"], set()).add((cid, side))
 
-    match_id = next(iter(unique_match_ids))
-    sgo_a_side = next(mf[1] for mf in matches_found if mf[0] == match_id)
-    m = candidates_by_match[match_id]
-    if sgo_a_side == "a":
-        sgo_a_cid = m["player_a_id"]
-        sgo_b_cid = m["player_b_id"]
-    else:
-        sgo_a_cid = m["player_b_id"]
-        sgo_b_cid = m["player_a_id"]
+    common_match_ids = set(a_by_match.keys()) & set(b_by_match.keys())
+    if len(common_match_ids) != 1:
+        return None
+
+    match_id = next(iter(common_match_ids))
+    a_in = a_by_match[match_id]
+    b_in = b_by_match[match_id]
+    if len(a_in) != 1 or len(b_in) != 1:
+        return None
+
+    a_cid, a_side = next(iter(a_in))
+    b_cid, b_side = next(iter(b_in))
+    if a_cid == b_cid or a_side == b_side:
+        return None
 
     return {
-        "match": m,
-        "sgo_a_canonical_id": sgo_a_cid,
-        "sgo_b_canonical_id": sgo_b_cid,
-        "sgo_a_side": sgo_a_side,
+        "match": matches_to_match[match_id],
+        "sgo_a_canonical_id": a_cid,
+        "sgo_b_canonical_id": b_cid,
     }
 
 
-# ── Ingest ────────────────────────────────────────────────────────────
+# ── Ingest loop ───────────────────────────────────────────────────────
 
 
 async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
@@ -529,31 +648,21 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
     db = get_client()
     normalizer = PlayerNormalizer(sport="tennis")
 
+    cutoff_lo = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+    cutoff_hi = (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat()
     candidate_matches = (
         db.table("matches")
-        .select(
-            "id, slate_id, player_a_id, player_b_id, start_time, odds,"
-            " slates!inner(sport, status, contest_type, is_fallback)"
-        )
-        .gte(
-            "start_time",
-            (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
-        )
-        .lte(
-            "start_time",
-            (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
-        )
-        .eq("slates.sport", "tennis")
-        .eq("slates.status", "active")
-        .eq("slates.contest_type", "classic")
-        .eq("slates.is_fallback", False)
+        .select("id, slate_id, player_a_id, player_b_id, start_time, odds")
+        .gte("start_time", cutoff_lo)
+        .lte("start_time", cutoff_hi)
         .execute()
         .data
         or []
     )
+    if not candidate_matches:
+        return {"matched": 0, "matched_via_fallback": 0, "aliases_seeded": 0}
 
-    # Build surname → [(canonical_id, side), ...] index for fallback.
-    needed_cids = set()
+    needed_cids: set[str] = set()
     for m in candidate_matches:
         if m.get("player_a_id"):
             needed_cids.add(m["player_a_id"])
@@ -688,7 +797,8 @@ async def _ingest_rows(rows: list[TennisOddsRow], league: str) -> dict:
             if isinstance(existing_odds, dict)
             else None
         )
-        _augment_set_scores_from_kalshi(eng_fields, wp_a)
+        # v6.5: prefer set-spread devig; fall back to Kalshi independence.
+        _augment_set_scores(eng_fields, wp_a)
 
         await _write_match_odds(
             match_id=target_match["id"],
@@ -759,13 +869,21 @@ async def _write_match_odds(
     current[source] = engine_fields
 
     # Engine-flat top-level promotion. Engine.js reads these without a
-    # source prefix; hasRichOdds() gates on set_a_20 + gw_a_line being
-    # non-null. ml_a / ml_b are deliberately excluded.
+    # source prefix; hasRichOdds() (v6.1+) gates on a wp source + a set
+    # market + a games market. ml_a / ml_b are deliberately excluded.
     promoted_keys = (
         "gw_a_line", "gw_a_over", "gw_a_under",
         "gw_b_line", "gw_b_over", "gw_b_under",
         "set_a_20", "set_a_21", "set_b_20", "set_b_21",
         "p3set",
+        # v6.5: also expose set + game spread fields top-level so the UI
+        # can show "A -1.5 -350" etc. and so the engine has them around
+        # if a future projection tweak wants to consume them.
+        "set_spread_a_line", "set_spread_a_odds",
+        "set_spread_b_line", "set_spread_b_odds",
+        "game_spread_a_line", "game_spread_a_odds",
+        "game_spread_b_line", "game_spread_b_odds",
+        "set_4way_source",
     )
     for k in promoted_keys:
         if k in engine_fields and engine_fields[k] is not None:
