@@ -1571,70 +1571,99 @@ const SURFACE_COLORS = {
 // ═══════════════════════════════════════════════════════════════════════
 // v6.11 — Color/flair helpers for the homepage tiles.
 //
-// Tournament flag emoji + tinted text: each tournament maps to a country
-// flag emoji and a brand color. Color palette designed to be readable on
-// the dark navy background (no neon, no super-low-contrast hues).
+// v6.12: Country flags now use the flag-icons CSS library (loaded via
+// <link> in index.html) instead of Unicode flag emoji. Reason: Windows
+// renders Unicode regional-indicator flags as letter pairs ("ES"/"IT")
+// by default, which our subscribers were seeing instead of actual flags.
+// flag-icons gives us identical flags across all OSes via CSS sprites.
+//
+// Each tournament now uses an ISO 3166-1 alpha-2 country code (lowercase)
+// instead of a flag emoji string. The <Flag cc="es" /> component renders
+// the actual flag image.
 // ═══════════════════════════════════════════════════════════════════════
 const TOURNAMENT_FLAIR = {
   // Grand Slams
-  'australian open': { flag: '🇦🇺', color: '#FFD93D' },  // gold
-  'roland garros':   { flag: '🇫🇷', color: '#E8B14F' },  // RG mustard/clay-gold
-  'french open':     { flag: '🇫🇷', color: '#E8B14F' },
-  'wimbledon':       { flag: '🇬🇧', color: '#A78BFA' },  // royal purple
-  'us open':         { flag: '🇺🇸', color: '#60A5FA' },  // US Open blue
+  'australian open': { cc: 'au', color: '#FFD93D' },
+  'roland garros':   { cc: 'fr', color: '#E8B14F' },
+  'french open':     { cc: 'fr', color: '#E8B14F' },
+  'wimbledon':       { cc: 'gb', color: '#A78BFA' },
+  'us open':         { cc: 'us', color: '#60A5FA' },
   // ATP Masters 1000 / WTA 1000
-  'indian wells':    { flag: '🇺🇸', color: '#FB923C' },  // desert orange
-  'miami open':      { flag: '🇺🇸', color: '#22D3EE' },  // miami teal
-  'monte carlo':     { flag: '🇲🇨', color: '#F87171' },  // monaco red
-  'madrid open':     { flag: '🇪🇸', color: '#EF4444' },  // spain red
-  'mutua madrid':    { flag: '🇪🇸', color: '#EF4444' },
-  'italian open':    { flag: '🇮🇹', color: '#34D399' },  // italy green
-  'rome masters':    { flag: '🇮🇹', color: '#34D399' },
-  'internazionali':  { flag: '🇮🇹', color: '#34D399' },
-  'canadian open':   { flag: '🇨🇦', color: '#F87171' },
-  'cincinnati':      { flag: '🇺🇸', color: '#60A5FA' },
-  'shanghai':        { flag: '🇨🇳', color: '#FBBF24' },  // china gold
-  'paris masters':   { flag: '🇫🇷', color: '#A78BFA' },
-  // 500s — same flag, slightly different hue from 1000s in same country
-  'doha':            { flag: '🇶🇦', color: '#A78BFA' },
-  'dubai':           { flag: '🇦🇪', color: '#FBBF24' },
-  'china open':      { flag: '🇨🇳', color: '#F87171' },
-  'wuhan':           { flag: '🇨🇳', color: '#F472B6' },
-  'rotterdam':       { flag: '🇳🇱', color: '#FB923C' },
-  'rio open':        { flag: '🇧🇷', color: '#34D399' },
-  'acapulco':        { flag: '🇲🇽', color: '#34D399' },
-  'mexican open':    { flag: '🇲🇽', color: '#34D399' },
-  'barcelona':       { flag: '🇪🇸', color: '#F59E0B' },  // catalan gold
-  'queens':          { flag: '🇬🇧', color: '#34D399' },  // grass green
-  'halle':           { flag: '🇩🇪', color: '#FBBF24' },
-  'hamburg':         { flag: '🇩🇪', color: '#EF4444' },
-  'washington':      { flag: '🇺🇸', color: '#60A5FA' },
-  'tokyo':           { flag: '🇯🇵', color: '#F472B6' },  // sakura pink
-  'vienna':          { flag: '🇦🇹', color: '#F87171' },
-  'basel':           { flag: '🇨🇭', color: '#EF4444' },
+  'indian wells':    { cc: 'us', color: '#FB923C' },
+  'miami open':      { cc: 'us', color: '#22D3EE' },
+  'monte carlo':     { cc: 'mc', color: '#F87171' },
+  'madrid open':     { cc: 'es', color: '#EF4444' },
+  'mutua madrid':    { cc: 'es', color: '#EF4444' },
+  'italian open':    { cc: 'it', color: '#34D399' },
+  'rome masters':    { cc: 'it', color: '#34D399' },
+  'internazionali':  { cc: 'it', color: '#34D399' },
+  'canadian open':   { cc: 'ca', color: '#F87171' },
+  'cincinnati':      { cc: 'us', color: '#60A5FA' },
+  'shanghai':        { cc: 'cn', color: '#FBBF24' },
+  'paris masters':   { cc: 'fr', color: '#A78BFA' },
+  // 500s
+  'doha':            { cc: 'qa', color: '#A78BFA' },
+  'dubai':           { cc: 'ae', color: '#FBBF24' },
+  'china open':      { cc: 'cn', color: '#F87171' },
+  'wuhan':           { cc: 'cn', color: '#F472B6' },
+  'rotterdam':       { cc: 'nl', color: '#FB923C' },
+  'rio open':        { cc: 'br', color: '#34D399' },
+  'acapulco':        { cc: 'mx', color: '#34D399' },
+  'mexican open':    { cc: 'mx', color: '#34D399' },
+  'barcelona':       { cc: 'es', color: '#F59E0B' },
+  'queens':          { cc: 'gb', color: '#34D399' },
+  'halle':           { cc: 'de', color: '#FBBF24' },
+  'hamburg':         { cc: 'de', color: '#EF4444' },
+  'washington':      { cc: 'us', color: '#60A5FA' },
+  'tokyo':           { cc: 'jp', color: '#F472B6' },
+  'vienna':          { cc: 'at', color: '#F87171' },
+  'basel':           { cc: 'ch', color: '#EF4444' },
   // 250s
-  'adelaide':        { flag: '🇦🇺', color: '#22D3EE' },
-  'auckland':        { flag: '🇳🇿', color: '#34D399' },
-  'brisbane':        { flag: '🇦🇺', color: '#FBBF24' },
-  'marseille':       { flag: '🇫🇷', color: '#60A5FA' },
-  'buenos aires':    { flag: '🇦🇷', color: '#60A5FA' },
-  'santiago':        { flag: '🇨🇱', color: '#F87171' },
-  'delray beach':    { flag: '🇺🇸', color: '#22D3EE' },
-  'estoril':         { flag: '🇵🇹', color: '#34D399' },
-  'munich':          { flag: '🇩🇪', color: '#60A5FA' },
-  'bmw open':        { flag: '🇩🇪', color: '#60A5FA' },
-  'geneva':          { flag: '🇨🇭', color: '#F87171' },
-  'lyon':            { flag: '🇫🇷', color: '#A78BFA' },
-  'kitzbuhel':       { flag: '🇦🇹', color: '#FBBF24' },
-  'bogota':          { flag: '🇨🇴', color: '#FBBF24' },
-  'eastbourne':      { flag: '🇬🇧', color: '#34D399' },
-  'newport':         { flag: '🇺🇸', color: '#34D399' },
-  'charleston':      { flag: '🇺🇸', color: '#34D399' },  // green clay
-  'credit one':      { flag: '🇺🇸', color: '#34D399' },
+  'adelaide':        { cc: 'au', color: '#22D3EE' },
+  'auckland':        { cc: 'nz', color: '#34D399' },
+  'brisbane':        { cc: 'au', color: '#FBBF24' },
+  'marseille':       { cc: 'fr', color: '#60A5FA' },
+  'buenos aires':    { cc: 'ar', color: '#60A5FA' },
+  'santiago':        { cc: 'cl', color: '#F87171' },
+  'delray beach':    { cc: 'us', color: '#22D3EE' },
+  'estoril':         { cc: 'pt', color: '#34D399' },
+  'munich':          { cc: 'de', color: '#60A5FA' },
+  'bmw open':        { cc: 'de', color: '#60A5FA' },
+  'geneva':          { cc: 'ch', color: '#F87171' },
+  'lyon':            { cc: 'fr', color: '#A78BFA' },
+  'kitzbuhel':       { cc: 'at', color: '#FBBF24' },
+  'bogota':          { cc: 'co', color: '#FBBF24' },
+  'eastbourne':      { cc: 'gb', color: '#34D399' },
+  'newport':         { cc: 'us', color: '#34D399' },
+  'charleston':      { cc: 'us', color: '#34D399' },
+  'credit one':      { cc: 'us', color: '#34D399' },
   // Year-end finals
-  'atp finals':      { flag: '🇮🇹', color: '#FBBF24' },
-  'wta finals':      { flag: '🇸🇦', color: '#FBBF24' },
+  'atp finals':      { cc: 'it', color: '#FBBF24' },
+  'wta finals':      { cc: 'sa', color: '#FBBF24' },
 };
+
+// Tiny <Flag> component. Uses flag-icons CSS classes — make sure
+// `<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/lipis/flag-icons@7.2.3/css/flag-icons.min.css">`
+// is in index.html. Renders inline, sized to match the tournament title.
+function Flag({ cc, size = 14 }) {
+  if (!cc) return null;
+  return (
+    <span
+      className={`fi fi-${cc}`}
+      style={{
+        display: 'inline-block',
+        width: Math.round(size * 1.33),  // 4:3 flag aspect
+        height: size,
+        marginRight: 8,
+        verticalAlign: '-2px',
+        borderRadius: 2,
+        // Subtle outline so e.g. Japan's white doesn't disappear on dark navy
+        boxShadow: '0 0 0 1px rgba(255,255,255,0.08)',
+      }}
+      aria-hidden="true"
+    />
+  );
+}
 
 function _findTournamentFlair(tournamentName) {
   if (!tournamentName) return null;
@@ -1851,7 +1880,7 @@ function TournamentTile({ matches, meta }) {
           const color = flair?.color || 'var(--text)';
           return (
             <div style={{ fontSize: 15, fontWeight: 700, color, marginTop: 2 }}>
-              {flair?.flag && <span style={{ marginRight: 6 }}>{flair.flag}</span>}
+              {flair?.cc && <Flag cc={flair.cc} size={14} />}
               {primary?.name || '—'}
               {primary?.surface && <SurfaceBadge surface={primary.surface} />}
             </div>
@@ -1874,7 +1903,7 @@ function TournamentTile({ matches, meta }) {
           return (
             <>
               <div style={{ fontSize: 13, fontWeight: 600, color: nextColor, marginTop: 2 }}>
-                {nextFlair?.flag && <span style={{ marginRight: 6 }}>{nextFlair.flag}</span>}
+                {nextFlair?.cc && <Flag cc={nextFlair.cc} size={12} />}
                 {nextChange.name}
               </div>
               <div className="metric-sub">in {fmtCountdown(nextChange.msUntil)}</div>
