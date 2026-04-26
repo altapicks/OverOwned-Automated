@@ -207,20 +207,37 @@ function hasWpFromGames(o) {
   return o.gw_a_line != null && o.gw_b_line != null;
 }
 
-// True if a match row has enough stat-prop fields to run sharp mode.
-// Sharp mode needs: a wp source (Kalshi OR ml OR GW-derived), games won lines,
-// and ace props. Set betting 4-way preferred when present, else derived from
-// p3set + wp.
+// v6.1: Sharp-mode gate decomposed into three named helpers for clarity.
+// Sharp mode runs whenever we have a wp source + a set market + a games
+// market. Ace/DF props are NOT required — Pinnacle (and most non-Underdog
+// books) don't post serve props, so requiring them would force every
+// Pinnacle-only slate into baseline mode and produce 48%-style straight-set
+// probs for 97.5% Kalshi favorites. Per-stat ace/DF/break fallbacks inside
+// processMatch() now handle the missing-prop case via posted_lines →
+// baseline-from-wp three-tier chain.
+function hasWpSource(o) {
+  return (o.kalshi_prob_a != null && o.kalshi_prob_b != null) ||
+         (o.ml_a != null && o.ml_b != null) ||
+         hasWpFromGames(o);
+}
+
+function hasSetMarket(o) {
+  return (o.set_a_20 != null && o.set_a_21 != null &&
+          o.set_b_20 != null && o.set_b_21 != null) ||
+         o.p3set != null;
+}
+
+function hasGamesMarket(o) {
+  return o.gw_a_line != null && o.gw_b_line != null;
+}
+
+// True if a match row has enough market data to run sharp mode.
+// Sharp mode needs: a wp source (Kalshi OR ml OR GW-derived), a set market
+// (4-way OR p3set), and a games market (both gw lines). Ace/DF/break props
+// are nice-to-have but not gating — see helpers above.
 function hasRichOdds(o) {
   if (!o || typeof o !== 'object') return false;
-  const hasWpSource = (o.kalshi_prob_a != null && o.kalshi_prob_b != null) ||
-                      (o.ml_a != null && o.ml_b != null) ||
-                      hasWpFromGames(o);
-  const hasSetMarket = (o.set_a_20 != null && o.set_a_21 != null &&
-                        o.set_b_20 != null && o.set_b_21 != null) ||
-                       o.p3set != null;
-  return hasWpSource && hasSetMarket &&
-         o.gw_a_line != null && o.ace_a_5plus != null;
+  return hasWpSource(o) && hasSetMarket(o) && hasGamesMarket(o);
 }
 
 // ============================================================
@@ -268,6 +285,13 @@ export function processMatch(match) {
 
   // SHARP MODE: stat-prop data available. Use sportsbook math.
 
+  // v6.1: Compute the wp-derived baseline ONCE at the top of sharp mode and
+  // reuse it as the final fallback for any per-stat read where neither the
+  // sportsbook prop nor the PrizePicks posted_line is available. This keeps
+  // a Pinnacle-only slate (no ace/DF/break props) projectable instead of
+  // bottoming out to 0.0 on missing fields.
+  const sharpBaseline = baselineStatsFromWp(wp_a, wp_b);
+
   // Set betting (4-way). Two paths:
   //   (a) Full 4-way market present (bet365-style): use directly, normalize.
   //   (b) Only p3set available (Underdog-style): derive from wp + p3set.
@@ -291,41 +315,80 @@ export function processMatch(match) {
   const gw_a = adjustLine(o.gw_a_line, o.gw_a_over);
   const gw_b = adjustLine(o.gw_b_line, o.gw_b_over);
 
-  // Breaks — two-tier fallback chain, same pattern as wp_a/wp_b above:
-  //   (1) Sharp Poisson fit from Underdog over line + price — preferred,
-  //       uses the lean to shift the projection vs. the posted integer
-  //   (2) posted_lines.{a,b}.breaks as projection center — fallback when
-  //       Underdog never posted Breaks odds for the match (common on
-  //       lower-tier tour stops). Raw line, no vig adjustment available.
-  //
-  // Without this fallback, matches with posted_lines but no sharp odds
-  // silently return 0.0 for breaks on both players, which masks the
-  // real projection and makes every break-related gem/fade signal dead.
+  // v6.1: Per-stat three-tier fallback chain (sharp prop → posted_line →
+  // wp-derived baseline). Was two-tier before, which meant Pinnacle-only
+  // matches without sportsbook ace/DF/break props bottomed out to 0.0 and
+  // broke every break-related gem/fade signal. Posted_lines come from the
+  // PrizePicks/Underdog ingest and reflect the real market when available.
+
+  // Breaks
   let brk_a, brk_b;
   if (o.brk_a_line != null && o.brk_a_over != null) {
     brk_a = poissonEV(o.brk_a_over, Math.ceil(o.brk_a_line));
   } else if (o.posted_lines?.a?.breaks != null) {
     brk_a = o.posted_lines.a.breaks;
   } else {
-    brk_a = 0;
+    brk_a = sharpBaseline.player_a.breaks;
   }
   if (o.brk_b_line != null && o.brk_b_over != null) {
     brk_b = poissonEV(o.brk_b_over, Math.ceil(o.brk_b_line));
   } else if (o.posted_lines?.b?.breaks != null) {
     brk_b = o.posted_lines.b.breaks;
   } else {
-    brk_b = 0;
+    brk_b = sharpBaseline.player_b.breaks;
   }
 
-  // Aces & DFs
-  const ace_a = poissonEV(o.ace_a_5plus, 5);
-  const ace_b = poissonEV(o.ace_b_5plus, 5);
-  const df_a = poissonEV(o.df_a_3plus, 3);
-  const df_b = poissonEV(o.df_b_3plus, 3);
-  const p10ace_a = americanToProb(o.ace_a_10plus);
-  const p10ace_b = americanToProb(o.ace_b_10plus);
-  const pnodf_a = Math.max(0, 1 - americanToProb(o.df_a_2plus));
-  const pnodf_b = Math.max(0, 1 - americanToProb(o.df_b_2plus));
+  // Aces (Pinnacle does not post ace markets — PP posted_line is often the
+  // only signal, so the second tier is the operative one for most slates).
+  let ace_a, ace_b;
+  if (o.ace_a_5plus != null) {
+    ace_a = poissonEV(o.ace_a_5plus, 5);
+  } else if (o.posted_lines?.a?.aces != null) {
+    ace_a = o.posted_lines.a.aces;
+  } else {
+    ace_a = sharpBaseline.player_a.aces;
+  }
+  if (o.ace_b_5plus != null) {
+    ace_b = poissonEV(o.ace_b_5plus, 5);
+  } else if (o.posted_lines?.b?.aces != null) {
+    ace_b = o.posted_lines.b.aces;
+  } else {
+    ace_b = sharpBaseline.player_b.aces;
+  }
+
+  // DFs (same reasoning as aces — Pinnacle does not post DF markets).
+  let df_a, df_b;
+  if (o.df_a_3plus != null) {
+    df_a = poissonEV(o.df_a_3plus, 3);
+  } else if (o.posted_lines?.a?.dfs != null) {
+    df_a = o.posted_lines.a.dfs;
+  } else {
+    df_a = sharpBaseline.player_a.dfs;
+  }
+  if (o.df_b_3plus != null) {
+    df_b = poissonEV(o.df_b_3plus, 3);
+  } else if (o.posted_lines?.b?.dfs != null) {
+    df_b = o.posted_lines.b.dfs;
+  } else {
+    df_b = sharpBaseline.player_b.dfs;
+  }
+
+  // Milestone probs — when the sportsbook milestone prop is missing,
+  // derive from the per-stat projection center using a Poisson model.
+  // 10+ ace prob: tail of Poisson(ace_x) at k=10.
+  // No-DF prob:   P(X=0) = exp(-df_x) for Poisson(df_x).
+  const p10ace_a = o.ace_a_10plus != null
+    ? americanToProb(o.ace_a_10plus)
+    : poissonTail(ace_a, 10);
+  const p10ace_b = o.ace_b_10plus != null
+    ? americanToProb(o.ace_b_10plus)
+    : poissonTail(ace_b, 10);
+  const pnodf_a = o.df_a_2plus != null
+    ? Math.max(0, 1 - americanToProb(o.df_a_2plus))
+    : Math.exp(-df_a);
+  const pnodf_b = o.df_b_2plus != null
+    ? Math.max(0, 1 - americanToProb(o.df_b_2plus))
+    : Math.exp(-df_b);
 
   const posted = o.posted_lines || {};
   return {
@@ -788,4 +851,3 @@ export function bpComparison(bet365Over, bet365Under, ppLine, ppMult) {
     play: edge > 0.03 ? 'MORE ✅' : edge < -0.03 ? 'LESS ✅' : 'SKIP',
   };
 }
-
