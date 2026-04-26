@@ -19,8 +19,6 @@ from app.services.normalizer import PlayerNormalizer
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-
 OXY_USER = os.getenv("OXYLABS_USERNAME", "")
 OXY_PASS = os.getenv("OXYLABS_PASSWORD", "")
 OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
@@ -52,17 +50,22 @@ PP_HEADERS = {
 
 
 # ---------------------------------------------------------------------------
-# Player resolver
+# Player resolver — now creates new players if PP introduces them
 # ---------------------------------------------------------------------------
 
 
 def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
+    """
+    Resolves PP raw player names to canonical_id.
+    Auto-creates new players if not already in the DB so that PP-only
+    entrants (qualifiers, ITF crossover, etc.) still land.
+    """
     if not raw_name:
         return None
     try:
         normalizer = PlayerNormalizer(sport=sport)
-        result = normalizer.resolve(raw_name, source="prizepicks", create_if_missing=False)
-        return result.canonical_id if result.auto_resolved else None
+        result = normalizer.resolve(raw_name, source="prizepicks", create_if_missing=True)
+        return result.canonical_id
     except Exception as e:
         log.warning("resolve_player failed for %s: %s", raw_name, e)
         return None
@@ -87,10 +90,6 @@ def _oxy_payload(url: str, render: bool = False) -> Dict[str, Any]:
 
 
 def oxy_probe(url: str, render: bool = False, timeout: float = 60.0) -> Dict[str, Any]:
-    """
-    Diagnostic helper — returns the FULL raw Oxylabs envelope so we can inspect
-    what's happening (errors, headers, partial bodies, 613 codes, etc.).
-    """
     if not (OXY_USER and OXY_PASS):
         return {"error": "oxylabs_creds_missing"}
     try:
@@ -138,11 +137,6 @@ def oxy_probe(url: str, render: bool = False, timeout: float = 60.0) -> Dict[str
 
 
 def _oxy_fetch_json(url: str, timeout: float = 60.0, render: bool = False) -> Tuple[int, Dict[str, Any], str]:
-    """
-    Returns (effective_status, parsed_body_dict, error_msg)
-    effective_status: real or oxy-mapped HTTP status, 0 if pre-flight fail
-    error_msg: empty string on success, descriptive on failure
-    """
     if not (OXY_USER and OXY_PASS):
         return 0, {}, "oxylabs_creds_missing"
     try:
@@ -194,10 +188,6 @@ def fetch_leagues() -> Tuple[int, List[Dict[str, Any]]]:
 
 
 def fetch_projections(league_id: str) -> Tuple[int, Dict[str, Any], str]:
-    """
-    Returns (status, body, error_msg). Tries plain fetch first, then
-    retries with render=True if first attempt failed (handles JS challenges).
-    """
     url = f"{PP_BASE}/projections?league_id={league_id}&per_page=500&single_stat=true"
     status, body, err = _oxy_fetch_json(url, render=False)
     if status == 200:
@@ -251,7 +241,7 @@ def _build_player_index(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 
 
 # ---------------------------------------------------------------------------
-# Main ingest — per-row insert (no more bulk rollback)
+# Main ingest
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +313,6 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             if not resolved:
                 continue
 
-            # Use dict keyed by player_id so duplicate (player,stat_type,odds_type) collapse to one
             grouped[(stat_type, odds_type)][resolved] = {
                 "slate_id": slate_id,
                 "player_id": resolved,
@@ -345,7 +334,6 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         for (stat_type, odds_type), per_player in grouped.items():
             rows = list(per_player.values())
 
-            # 1) Deactivate existing active rows for this (slate, stat_type, odds_type)
             try:
                 resp = (
                     db.table("prizepicks_lines")
@@ -363,7 +351,6 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
                 )
                 continue
 
-            # 2) Per-row insert so one failure can't kill the whole group
             for row in rows:
                 try:
                     resp = db.table("prizepicks_lines").insert(row).execute()
