@@ -1,210 +1,178 @@
-"""Scheduled in-process watcher.
+"""Watcher: schedules SGO odds, PrizePicks (direct), Kalshi, and DK auto-ingest.
 
-Runs four jobs on APScheduler's AsyncIOScheduler (shares the FastAPI loop):
+4 jobs:
+  - sgo_odds_tick       (every 15 min) — Pinnacle ML/games-won/spreads
+  - prizepicks_direct   (every 15 min) — Aces/DFs/Breaks/Games/Sets/Fantasy Score
+                                          from api.prizepicks.com
+  - kalshi_tick         (every 10 min) — kalshi_prob_a/_b (sole win-% source)
+  - dk_auto_ingest      (cron 11:00 UTC daily) — Featured slate only,
+                          gated by DK_AUTO_INGEST_ENABLED env var
 
-  * SGO odds tick     — every 15 min, ML/games/sets odds for active slates
-  * SGO PrizePicks    — every 15 min, Aces/Break Points/Fantasy Score lines
-                        (feeds the Pivots tab)
-  * Kalshi tick       — every 10 min, ML probabilities for active matches
-  * DK auto-ingest    — once daily at 11:00 UTC, pulls Featured Classic
-                        from DK lobby. Gated by DK_AUTO_INGEST_ENABLED.
-
-Each job uses max_instances=1 + coalesce=True so a slow tick can't stack.
-
-Boot is non-blocking:
-  1. Add jobs (NO next_run_time=now)
-  2. scheduler.start()
-  3. asyncio.create_task(_tick_job()) — fire-and-forget warmup
-  4. yield → /health responds immediately
-
-Public exports:
-    scheduled_watcher        — async cm; main.py uses in lifespan
-    run_slate_watcher_once   — one-shot tick used by /api/slates/refresh
+Pattern (proven): module-level imports (no `from x import y`), no
+`next_run_time=now` in scheduler.add_job (avoids healthcheck timeout),
+boot warmup via asyncio.create_task BEFORE FastAPI yield.
 """
-
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 
-from app.config import get_settings
-from app.services import kalshi as kalshi_svc
 from app.services import sgo_odds as sgo_svc
-from app.services import sgo_prizepicks as sgo_pp_svc
+from app.services import prizepicks_direct as pp_direct_svc
+from app.services import kalshi as kalshi_svc
+from app.services import dk_auto_ingest as dk_auto_svc
 
 logger = logging.getLogger(__name__)
 
+_scheduler: AsyncIOScheduler | None = None
 
-async def _tick_job() -> None:
-    """First-boot warmup: SGO + Kalshi + PP once so UI has fresh data."""
-    settings = get_settings()
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-job wrappers (always async, swallow exceptions so APScheduler
+# doesn't kill the job on transient errors).
+# ─────────────────────────────────────────────────────────────────────
+
+async def _sgo_odds_tick():
     try:
-        if settings.sgo_api_key:
-            logger.info("Boot warmup: SGO odds tick starting")
-            await sgo_svc.fetch_tick()
-            logger.info("Boot warmup: SGO odds tick done")
-        else:
-            logger.info("Boot warmup: SGO key missing, skipping SGO odds tick")
+        result = await sgo_svc.fetch_tick("TEN")
+        logger.info("sgo_odds tick result: %s", result)
     except Exception as e:
-        logger.exception("Boot warmup SGO odds tick failed: %s", e)
+        logger.exception("sgo_odds tick failed: %s", e)
 
+
+async def _prizepicks_tick():
     try:
-        if settings.sgo_api_key:
-            logger.info("Boot warmup: SGO PrizePicks tick starting")
-            await sgo_pp_svc.fetch_tick()
-            logger.info("Boot warmup: SGO PrizePicks tick done")
-        else:
-            logger.info("Boot warmup: SGO key missing, skipping SGO PrizePicks tick")
+        result = await pp_direct_svc.fetch_tick("TEN")
+        logger.info("prizepicks_direct tick result: %s", result)
     except Exception as e:
-        logger.exception("Boot warmup SGO PrizePicks tick failed: %s", e)
+        logger.exception("prizepicks_direct tick failed: %s", e)
 
+
+async def _kalshi_tick():
     try:
-        if settings.kalshi_key_id and settings.kalshi_private_key:
-            logger.info("Boot warmup: Kalshi tick starting")
-            await kalshi_svc.fetch_tick()
-            logger.info("Boot warmup: Kalshi tick done")
-        else:
-            logger.info("Boot warmup: Kalshi creds missing, skipping Kalshi tick")
+        result = await kalshi_svc.fetch_tick()
+        logger.info("kalshi tick result: %s", result)
     except Exception as e:
-        logger.exception("Boot warmup Kalshi tick failed: %s", e)
+        logger.exception("kalshi tick failed: %s", e)
 
 
-async def _sgo_job() -> None:
-    try:
-        await sgo_svc.fetch_tick()
-    except Exception as e:
-        logger.exception("SGO odds tick failed: %s", e)
-
-
-async def _sgo_pp_job() -> None:
-    try:
-        await sgo_pp_svc.fetch_tick()
-    except Exception as e:
-        logger.exception("SGO PrizePicks tick failed: %s", e)
-
-
-async def _kalshi_job() -> None:
-    try:
-        await kalshi_svc.fetch_tick()
-    except Exception as e:
-        logger.exception("Kalshi tick failed: %s", e)
-
-
-async def _dk_auto_ingest_job() -> None:
-    """Daily 11:00 UTC: pull Featured Classic from DK lobby for each sport.
-
-    Imported lazily so the watcher boots cleanly even if dk_auto_ingest
-    has any import-time issues — those would surface only when this job
-    actually runs, not at app startup.
-    """
-    settings = get_settings()
-    if not settings.dk_auto_ingest_enabled:
-        logger.info("DK auto-ingest skipped (DK_AUTO_INGEST_ENABLED=false)")
+async def _dk_auto_ingest_tick():
+    if os.getenv("DK_AUTO_INGEST_ENABLED", "false").lower() != "true":
+        logger.info("dk_auto_ingest skipped: DK_AUTO_INGEST_ENABLED!=true")
         return
     try:
-        from app.services.dk_auto_ingest import run_dk_auto_ingest_tick
-        result = await run_dk_auto_ingest_tick()
-        logger.info("DK auto-ingest result: %s", result)
+        result = await dk_auto_svc.run_daily_ingest(sport="tennis")
+        logger.info("dk_auto_ingest result: %s", result)
     except Exception as e:
-        logger.exception("DK auto-ingest job failed: %s", e)
+        logger.exception("dk_auto_ingest failed: %s", e)
 
 
-async def run_slate_watcher_once() -> dict:
-    """Manual one-shot trigger for /api/slates/refresh.
-    Runs SGO odds + SGO PrizePicks + Kalshi once. Errors logged and
-    surfaced in the result dict but never raised — route returns 200.
-    """
-    settings = get_settings()
-    result: dict = {"sgo": None, "sgo_pp": None, "kalshi": None}
+# ─────────────────────────────────────────────────────────────────────
+# Boot warmup — runs each job once on startup (in background) so the
+# UI populates within ~30s of redeploy instead of waiting for the
+# first scheduled tick.
+# ─────────────────────────────────────────────────────────────────────
 
-    try:
-        if settings.sgo_api_key:
-            await sgo_svc.fetch_tick()
-            result["sgo"] = "ok"
-        else:
-            result["sgo"] = "skipped (no SGO_API_KEY)"
-    except Exception as e:
-        logger.exception("Manual SGO tick failed: %s", e)
-        result["sgo"] = f"error: {e}"
+async def _warmup():
+    logger.info("watcher warmup: starting initial tick of each job")
+    # Run in sequence (not parallel) to avoid Supabase connection pressure on boot
+    await _sgo_odds_tick()
+    await _prizepicks_tick()
+    await _kalshi_tick()
+    # DK auto-ingest is intentionally NOT run on warmup — it's a daily cron only.
+    logger.info("watcher warmup: complete")
 
-    try:
-        if settings.sgo_api_key:
-            await sgo_pp_svc.fetch_tick()
-            result["sgo_pp"] = "ok"
-        else:
-            result["sgo_pp"] = "skipped (no SGO_API_KEY)"
-    except Exception as e:
-        logger.exception("Manual SGO PP tick failed: %s", e)
-        result["sgo_pp"] = f"error: {e}"
 
-    try:
-        if settings.kalshi_key_id and settings.kalshi_private_key:
-            await kalshi_svc.fetch_tick()
-            result["kalshi"] = "ok"
-        else:
-            result["kalshi"] = "skipped (no Kalshi creds)"
-    except Exception as e:
-        logger.exception("Manual Kalshi tick failed: %s", e)
-        result["kalshi"] = f"error: {e}"
-
-    return result
-
+# ─────────────────────────────────────────────────────────────────────
+# Lifespan integration (called from main.py)
+# ─────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
-async def scheduled_watcher():
-    """Start scheduler, run jobs in-process, shut down cleanly on exit."""
-    settings = get_settings()
-    scheduler = AsyncIOScheduler(timezone="UTC")
+async def watcher_lifespan(app):
+    global _scheduler
+    _scheduler = AsyncIOScheduler(timezone="UTC")
 
-    scheduler.add_job(
-        _sgo_job,
-        trigger=IntervalTrigger(minutes=15),
+    _scheduler.add_job(
+        _sgo_odds_tick,
+        "interval",
+        minutes=15,
         id="sgo_odds_tick",
         max_instances=1,
         coalesce=True,
     )
-
-    scheduler.add_job(
-        _sgo_pp_job,
-        trigger=IntervalTrigger(minutes=15),
-        id="sgo_prizepicks_tick",
+    _scheduler.add_job(
+        _prizepicks_tick,
+        "interval",
+        minutes=15,
+        id="prizepicks_direct_tick",
         max_instances=1,
         coalesce=True,
     )
-
-    scheduler.add_job(
-        _kalshi_job,
-        trigger=IntervalTrigger(minutes=10),
+    _scheduler.add_job(
+        _kalshi_tick,
+        "interval",
+        minutes=10,
         id="kalshi_tick",
         max_instances=1,
         coalesce=True,
     )
-
-    scheduler.add_job(
-        _dk_auto_ingest_job,
-        trigger=CronTrigger(hour=11, minute=0, timezone="UTC"),
+    _scheduler.add_job(
+        _dk_auto_ingest_tick,
+        CronTrigger(hour=11, minute=0, timezone="UTC"),
         id="dk_auto_ingest_daily",
         max_instances=1,
         coalesce=True,
     )
 
-    scheduler.start()
+    _scheduler.start()
     logger.info(
-        "Scheduler started: SGO=15min, SGO_PP=15min, Kalshi=10min, "
-        "DK auto-ingest=11:00 UTC daily (enabled=%s)",
-        settings.dk_auto_ingest_enabled,
+        "watcher started: sgo_odds(15m), prizepicks_direct(15m), "
+        "kalshi(10m), dk_auto_ingest(cron 11:00 UTC)"
     )
 
-    asyncio.create_task(_tick_job())
+    # Boot warmup AFTER scheduler is running, BEFORE yield, but as a
+    # background task so /health responds immediately for Railway probe.
+    asyncio.create_task(_warmup())
 
     try:
         yield
     finally:
-        logger.info("Scheduler shutting down")
-        scheduler.shutdown(wait=False)
-        logger.info("Scheduler stopped")
+        if _scheduler:
+            _scheduler.shutdown(wait=False)
+            _scheduler = None
+            logger.info("watcher stopped")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Manual one-shot — used by /api/slates/refresh route.
+# ─────────────────────────────────────────────────────────────────────
+
+async def run_slate_watcher_once() -> dict:
+    """Run all three live-data tasks once on demand. DK auto-ingest is NOT
+    included here — it's a daily cron and the admin endpoint is the manual
+    trigger for it. Returns per-job status."""
+    out: dict = {}
+    try:
+        await sgo_svc.fetch_tick("TEN")
+        out["sgo"] = "ok"
+    except Exception as e:
+        logger.exception("on-demand sgo failed: %s", e)
+        out["sgo"] = f"error: {e!r}"
+    try:
+        await pp_direct_svc.fetch_tick("TEN")
+        out["sgo_pp"] = "ok"  # keep key name for backward compat with current /refresh response
+    except Exception as e:
+        logger.exception("on-demand pp_direct failed: %s", e)
+        out["sgo_pp"] = f"error: {e!r}"
+    try:
+        await kalshi_svc.fetch_tick()
+        out["kalshi"] = "ok"
+    except Exception as e:
+        logger.exception("on-demand kalshi failed: %s", e)
+        out["kalshi"] = f"error: {e!r}"
+    return out
