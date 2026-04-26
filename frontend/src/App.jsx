@@ -1569,6 +1569,113 @@ const SURFACE_COLORS = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════
+// v6.11 — Color/flair helpers for the homepage tiles.
+//
+// Tournament flag emoji + tinted text: each tournament maps to a country
+// flag emoji and a brand color. Color palette designed to be readable on
+// the dark navy background (no neon, no super-low-contrast hues).
+// ═══════════════════════════════════════════════════════════════════════
+const TOURNAMENT_FLAIR = {
+  // Grand Slams
+  'australian open': { flag: '🇦🇺', color: '#FFD93D' },  // gold
+  'roland garros':   { flag: '🇫🇷', color: '#E8B14F' },  // RG mustard/clay-gold
+  'french open':     { flag: '🇫🇷', color: '#E8B14F' },
+  'wimbledon':       { flag: '🇬🇧', color: '#A78BFA' },  // royal purple
+  'us open':         { flag: '🇺🇸', color: '#60A5FA' },  // US Open blue
+  // ATP Masters 1000 / WTA 1000
+  'indian wells':    { flag: '🇺🇸', color: '#FB923C' },  // desert orange
+  'miami open':      { flag: '🇺🇸', color: '#22D3EE' },  // miami teal
+  'monte carlo':     { flag: '🇲🇨', color: '#F87171' },  // monaco red
+  'madrid open':     { flag: '🇪🇸', color: '#EF4444' },  // spain red
+  'mutua madrid':    { flag: '🇪🇸', color: '#EF4444' },
+  'italian open':    { flag: '🇮🇹', color: '#34D399' },  // italy green
+  'rome masters':    { flag: '🇮🇹', color: '#34D399' },
+  'internazionali':  { flag: '🇮🇹', color: '#34D399' },
+  'canadian open':   { flag: '🇨🇦', color: '#F87171' },
+  'cincinnati':      { flag: '🇺🇸', color: '#60A5FA' },
+  'shanghai':        { flag: '🇨🇳', color: '#FBBF24' },  // china gold
+  'paris masters':   { flag: '🇫🇷', color: '#A78BFA' },
+  // 500s — same flag, slightly different hue from 1000s in same country
+  'doha':            { flag: '🇶🇦', color: '#A78BFA' },
+  'dubai':           { flag: '🇦🇪', color: '#FBBF24' },
+  'china open':      { flag: '🇨🇳', color: '#F87171' },
+  'wuhan':           { flag: '🇨🇳', color: '#F472B6' },
+  'rotterdam':       { flag: '🇳🇱', color: '#FB923C' },
+  'rio open':        { flag: '🇧🇷', color: '#34D399' },
+  'acapulco':        { flag: '🇲🇽', color: '#34D399' },
+  'mexican open':    { flag: '🇲🇽', color: '#34D399' },
+  'barcelona':       { flag: '🇪🇸', color: '#F59E0B' },  // catalan gold
+  'queens':          { flag: '🇬🇧', color: '#34D399' },  // grass green
+  'halle':           { flag: '🇩🇪', color: '#FBBF24' },
+  'hamburg':         { flag: '🇩🇪', color: '#EF4444' },
+  'washington':      { flag: '🇺🇸', color: '#60A5FA' },
+  'tokyo':           { flag: '🇯🇵', color: '#F472B6' },  // sakura pink
+  'vienna':          { flag: '🇦🇹', color: '#F87171' },
+  'basel':           { flag: '🇨🇭', color: '#EF4444' },
+  // 250s
+  'adelaide':        { flag: '🇦🇺', color: '#22D3EE' },
+  'auckland':        { flag: '🇳🇿', color: '#34D399' },
+  'brisbane':        { flag: '🇦🇺', color: '#FBBF24' },
+  'marseille':       { flag: '🇫🇷', color: '#60A5FA' },
+  'buenos aires':    { flag: '🇦🇷', color: '#60A5FA' },
+  'santiago':        { flag: '🇨🇱', color: '#F87171' },
+  'delray beach':    { flag: '🇺🇸', color: '#22D3EE' },
+  'estoril':         { flag: '🇵🇹', color: '#34D399' },
+  'munich':          { flag: '🇩🇪', color: '#60A5FA' },
+  'bmw open':        { flag: '🇩🇪', color: '#60A5FA' },
+  'geneva':          { flag: '🇨🇭', color: '#F87171' },
+  'lyon':            { flag: '🇫🇷', color: '#A78BFA' },
+  'kitzbuhel':       { flag: '🇦🇹', color: '#FBBF24' },
+  'bogota':          { flag: '🇨🇴', color: '#FBBF24' },
+  'eastbourne':      { flag: '🇬🇧', color: '#34D399' },
+  'newport':         { flag: '🇺🇸', color: '#34D399' },
+  'charleston':      { flag: '🇺🇸', color: '#34D399' },  // green clay
+  'credit one':      { flag: '🇺🇸', color: '#34D399' },
+  // Year-end finals
+  'atp finals':      { flag: '🇮🇹', color: '#FBBF24' },
+  'wta finals':      { flag: '🇸🇦', color: '#FBBF24' },
+};
+
+function _findTournamentFlair(tournamentName) {
+  if (!tournamentName) return null;
+  const lc = String(tournamentName).toLowerCase();
+  for (const key in TOURNAMENT_FLAIR) {
+    if (lc.includes(key)) return TOURNAMENT_FLAIR[key];
+  }
+  return null;
+}
+
+// Temperature → color. Continuous gradient, with anchor stops at 50/65/78/85°F.
+//   <= 50°F → deep blue (#3B82F6)
+//   50–65   → light blue (#7DD3FC)
+//   65–78   → neutral text (var(--text))
+//   78–85   → orange (#FB923C)
+//   > 85    → red (#EF4444)
+function _tempColor(tempF) {
+  if (tempF == null || !isFinite(tempF)) return 'var(--text)';
+  if (tempF <= 50) return '#3B82F6';
+  if (tempF <= 65) return '#7DD3FC';
+  if (tempF <= 78) return 'var(--text)';
+  if (tempF <= 85) return '#FB923C';
+  return '#EF4444';
+}
+
+// CPI → color. Higher = faster court.
+//   < 22  → blue (slow / clay-y)
+//   22–26 → neutral
+//   26–30 → yellow (medium-fast)
+//   30–34 → orange (fast)
+//   > 34  → red (extreme — Wimbledon / Paris Masters territory)
+function _cpiColor(cpi) {
+  if (cpi == null || !isFinite(cpi)) return 'var(--text)';
+  if (cpi < 22) return '#7DD3FC';
+  if (cpi < 26) return 'var(--text)';
+  if (cpi < 30) return '#FBBF24';
+  if (cpi < 34) return '#FB923C';
+  return '#EF4444';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // v6.7 — TILE COMPONENTS for the tournament/weather/CPI block
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1739,10 +1846,17 @@ function TournamentTile({ matches, meta }) {
     <div className="metric" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
       <div>
         <div className="metric-label"><Icon name="trophy" size={13}/> Current Tournament</div>
-        <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text)', marginTop: 2 }}>
-          {primary?.name || '—'}
-          {primary?.surface && <SurfaceBadge surface={primary.surface} />}
-        </div>
+        {(() => {
+          const flair = _findTournamentFlair(primary?.name);
+          const color = flair?.color || 'var(--text)';
+          return (
+            <div style={{ fontSize: 15, fontWeight: 700, color, marginTop: 2 }}>
+              {flair?.flag && <span style={{ marginRight: 6 }}>{flair.flag}</span>}
+              {primary?.name || '—'}
+              {primary?.surface && <SurfaceBadge surface={primary.surface} />}
+            </div>
+          );
+        })()}
         <div className="metric-sub">
           {primary
             ? `${primary.matchCount} match${primary.matchCount === 1 ? '' : 'es'}`
@@ -1754,14 +1868,19 @@ function TournamentTile({ matches, meta }) {
         <div className="metric-label" style={{ fontSize: 10 }}>
           <Icon name="clock" size={11}/> Next Tournament
         </div>
-        {nextChange ? (
-          <>
-            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', marginTop: 2 }}>
-              {nextChange.name}
-            </div>
-            <div className="metric-sub">in {fmtCountdown(nextChange.msUntil)}</div>
-          </>
-        ) : (
+        {nextChange ? (() => {
+          const nextFlair = _findTournamentFlair(nextChange.name);
+          const nextColor = nextFlair?.color || 'var(--text)';
+          return (
+            <>
+              <div style={{ fontSize: 13, fontWeight: 600, color: nextColor, marginTop: 2 }}>
+                {nextFlair?.flag && <span style={{ marginRight: 6 }}>{nextFlair.flag}</span>}
+                {nextChange.name}
+              </div>
+              <div className="metric-sub">in {fmtCountdown(nextChange.msUntil)}</div>
+            </>
+          );
+        })() : (
           <div className="metric-sub" style={{ marginTop: 2 }}>—</div>
         )}
       </div>
@@ -1784,14 +1903,14 @@ function WeatherCPITile({ matches, meta }) {
   const f = weather?.forecast;
   const isIndoor = weather?.is_indoor === true;
 
-  // Format temp with hot/cold tint.
+  // v6.11: continuous gradient for temp via _tempColor() helper.
   const temp = (f && typeof f.temperature_f === 'number') ? Math.round(f.temperature_f) : null;
-  let tempColor = 'var(--text)';
-  if (temp != null) {
-    if (temp >= 85) tempColor = '#F59E0B';
-    else if (temp <= 50) tempColor = '#60A5FA';
-  }
+  const tempColor = _tempColor(temp);
   const icon = f ? weatherIconFor(f.icon_id) : '';
+
+  // v6.11: CPI gradient — same idea for fast-court flair.
+  const cpiValue = cpiBase ? Number(cpiBase.base_cpi) : null;
+  const cpiColor = _cpiColor(cpiValue);
 
   return (
     <div className="metric" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -1838,7 +1957,7 @@ function WeatherCPITile({ matches, meta }) {
         </div>
         {cpiBase ? (
           <>
-            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginTop: 2 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: cpiColor, marginTop: 2 }}>
               {Number(cpiBase.base_cpi).toFixed(1)}
               <span style={{ fontSize: 10, color: 'var(--text-dim)', marginLeft: 6, fontWeight: 400 }}>
                 base
@@ -3169,7 +3288,8 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
   const traps = useMemo(() => {
     const active = pw.filter(p => p.salary > 0 && (p.val || 0) > 0 && (p.simOwn || 0) > 0);
     if (active.length === 0) return [];
-    const N = (mc || 0) >= 16 ? 4 : 2;
+    // v6.11: minimum 3 entries, 16+ slates → 4, 20+ → 5.
+    const N = (mc || 0) >= 20 ? 5 : (mc || 0) >= 16 ? 4 : 3;
     const scored = active.map(p => ({
       p,
       score: (p.simOwn || 0) - (p.val || 0) * 5
@@ -3195,10 +3315,11 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
   //   4. Lowest sim own in each tier = Hidden Gem for that tier
   // v5.4: same-match block — if a gem's opponent was picked in an earlier
   // tier, skip them and pick the next-lowest-owned in the current tier.
+  // v6.11: minimum 3 entries, 16+ slates → 4, 20+ → 5 (same as Traps).
   const hiddenGems = useMemo(() => {
     const active = pw.filter(p => p.salary > 0 && (p.val || 0) > 0 && (p.simOwn || 0) > 0);
     if (active.length === 0) return [];
-    const N = (mc || 0) >= 16 ? 4 : 2;
+    const N = (mc || 0) >= 20 ? 5 : (mc || 0) >= 16 ? 4 : 3;
     const byVal = [...active].sort((a, b) => (b.val || 0) - (a.val || 0));
     const pool = byVal.slice(0, N * 5);
     const result = [];
