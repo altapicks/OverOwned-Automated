@@ -1,250 +1,273 @@
-"""Admin debug endpoints — read-only diagnostics.
-
-PrizePicks calls go through Oxylabs Web Scraper API to bypass Cloudflare.
 """
+Admin debug routes for diagnosing PP ingest, watcher, and slate state.
+
+All routes are gated by ADMIN_TOKEN env var. Pass via header X-Admin-Token
+or query param ?token=...
+"""
+
 from __future__ import annotations
 
-import json
 import logging
 import os
-from typing import Any
+from collections import Counter
+from typing import Any, Dict, List, Optional
 
-import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query, Request
 
-from app.services.normalizer import PlayerNormalizer
+from app.db.supabase_client import get_service_client
+from app.services import prizepicks_direct as pp_direct
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/debug", tags=["admin-debug"])
 
-PP_BASE = "https://api.prizepicks.com"
-OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
+
+# ---------------------------------------------------------------------------
+# Auth helper
+# ---------------------------------------------------------------------------
 
 
-def _oxy_creds() -> tuple[str, str] | None:
-    user = os.getenv("OXYLABS_USERNAME")
-    pw = os.getenv("OXYLABS_PASSWORD")
-    if not user or not pw:
-        return None
-    return user, pw
+def _check_admin(request: Request, token: Optional[str]) -> None:
+    expected = os.getenv("ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(500, "ADMIN_TOKEN not configured")
+    provided = (
+        request.headers.get("X-Admin-Token")
+        or request.headers.get("x-admin-token")
+        or token
+        or ""
+    )
+    if provided != expected:
+        raise HTTPException(401, "bad admin token")
 
 
-async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dict, int]:
-    """Returns (target_status, target_json, body_size_bytes_of_envelope)."""
-    creds = _oxy_creds()
-    if not creds:
-        return 0, {"_error": "no oxylabs creds"}, 0
+# ---------------------------------------------------------------------------
+# Watcher status
+# ---------------------------------------------------------------------------
 
-    user, pw = creds
 
-    if params:
-        from urllib.parse import urlencode
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}{urlencode(params)}"
+@router.get("/watcher/status")
+def watcher_status(request: Request, token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    _check_admin(request, token)
+    try:
+        from app.workers import slate_watcher as sw
+    except Exception as e:
+        return {"error": f"watcher import failed: {e}"}
 
-    body = {
-        "source": "universal",
-        "url": url,
-        "geo_location": "United States",
+    sched = getattr(sw, "_SCHEDULER", None) or getattr(sw, "scheduler", None)
+    if sched is None:
+        return {"alive": False, "reason": "no scheduler instance"}
+
+    jobs = []
+    try:
+        for j in sched.get_jobs():
+            jobs.append({
+                "id": j.id,
+                "name": j.name,
+                "next_run": str(getattr(j, "next_run_time", None)),
+                "trigger": str(j.trigger),
+            })
+    except Exception as e:
+        jobs = [{"error": str(e)}]
+
+    return {
+        "alive": True,
+        "running": getattr(sched, "running", None),
+        "job_count": len(jobs),
+        "jobs": jobs,
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(
-            OXY_ENDPOINT,
-            json=body,
-            auth=(user, pw),
-            headers={"Content-Type": "application/json"},
-        )
 
-    if r.status_code != 200:
-        return r.status_code, {"_error": "oxylabs non-200", "body": r.text[:500]}, len(r.content)
-
-    try:
-        env = r.json()
-    except Exception:
-        return 0, {"_error": "oxylabs envelope non-json"}, len(r.content)
-
-    results = env.get("results") or []
-    if not results:
-        return 0, {"_error": "oxylabs no results"}, len(r.content)
-
-    first = results[0]
-    target_status = first.get("status_code") or 0
-    raw_content = first.get("content") or ""
-
-    if isinstance(raw_content, dict):
-        return target_status, raw_content, len(r.content)
-    try:
-        return target_status, json.loads(raw_content), len(r.content)
-    except (TypeError, json.JSONDecodeError):
-        return target_status, {
-            "_error": "target content not json",
-            "first_200": str(raw_content)[:200],
-        }, len(r.content)
+# ---------------------------------------------------------------------------
+# PP diagnose: confirm Oxylabs bypass, see real PP envelope shape,
+# show odds_type histogram per league, sample with odds_type included.
+# ---------------------------------------------------------------------------
 
 
 @router.get("/pp/diagnose")
-async def pp_diagnose() -> dict[str, Any]:
-    out: dict[str, Any] = {
-        "oxylabs_configured": _oxy_creds() is not None,
-        "leagues_status": None,
+def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    _check_admin(request, token)
+
+    out: Dict[str, Any] = {
+        "oxylabs_configured": bool(
+            os.getenv("OXYLABS_USERNAME") and os.getenv("OXYLABS_PASSWORD")
+        ),
+        "leagues_status": {},
         "tennis_leagues": [],
         "per_league": [],
+        "raw_first_projection_attributes": None,
         "name_resolution": {},
     }
 
-    if not _oxy_creds():
-        out["leagues_status"] = {"error": "OXYLABS_USERNAME/PASSWORD env vars not set"}
+    # Leagues
+    status, leagues = pp_direct.fetch_leagues()
+    out["leagues_status"] = {
+        "http": status,
+        "total_leagues_returned": len(leagues),
+    }
+    if status != 200:
         return out
 
-    # 1. /leagues
-    try:
-        status, payload, size = await _http_get_json(f"{PP_BASE}/leagues")
-        out["leagues_status"] = {"http": status, "envelope_size": size}
-    except Exception as e:
-        out["leagues_status"] = {"error": repr(e)}
-        return out
+    tennis_lgs: List[Dict[str, Any]] = []
+    for lg in leagues:
+        attr = lg.get("attributes", {}) or {}
+        name = (attr.get("name") or "").strip()
+        if name.upper().startswith("TENNIS"):
+            tennis_lgs.append({
+                "id": str(lg.get("id") or ""),
+                "name": name,
+                "sport": attr.get("sport") or "",
+            })
+    out["tennis_leagues"] = tennis_lgs
 
-    if status != 200 or "_error" in payload:
-        out["leagues_status"]["error"] = payload.get("_error", "non-200")
-        if "first_200" in payload:
-            out["leagues_status"]["first_200"] = payload["first_200"]
-        if "body" in payload:
-            out["leagues_status"]["body"] = payload["body"]
-        return out
+    # Per-league projections
+    raw_first_dump_set = False
+    sample_unresolved: List[str] = []
+    sample_resolved: List[str] = []
+    tested_n = 0
 
-    all_leagues = payload.get("data") or []
-    out["leagues_status"]["total_leagues_returned"] = len(all_leagues)
+    from app.services.player_resolver import resolve_player_name
 
-    tennis_leagues = []
-    for item in all_leagues:
-        attrs = item.get("attributes") or {}
-        name = (attrs.get("name") or "")
-        sport = (attrs.get("sport") or "")
-        if "tennis" in name.lower() or "tennis" in sport.lower():
-            tennis_leagues.append(
-                {"id": item.get("id"), "name": name, "sport": sport}
-            )
-    out["tennis_leagues"] = tennis_leagues
-
-    if not tennis_leagues:
-        out["sample_first_5_leagues"] = [
-            {
-                "id": item.get("id"),
-                "name": (item.get("attributes") or {}).get("name"),
-                "sport": (item.get("attributes") or {}).get("sport"),
-            }
-            for item in all_leagues[:5]
-        ]
-        return out
-
-    # 2. /projections per tennis league
-    sample_names: list[str] = []
-    for lg in tennis_leagues:
-        lid = lg["id"]
-        try:
-            pstatus, proj_payload, _ = await _http_get_json(
-                f"{PP_BASE}/projections",
-                params={"league_id": lid, "per_page": 500, "single_stat": "true"},
-            )
-        except Exception as e:
-            out["per_league"].append({"league_id": lid, "error": repr(e)})
-            continue
-
-        if pstatus != 200 or "_error" in proj_payload:
-            out["per_league"].append(
-                {"league_id": lid, "league_name": lg["name"],
-                 "http": pstatus, "error": proj_payload.get("_error")}
-            )
-            continue
-
-        data = proj_payload.get("data") or []
-        included = proj_payload.get("included") or []
-        player_lookup: dict[str, str] = {}
-        for inc in included:
-            if (inc.get("type") or "").lower() != "new_player":
-                continue
-            attrs = inc.get("attributes") or {}
-            nm = attrs.get("name") or attrs.get("display_name")
-            if nm and inc.get("id"):
-                player_lookup[str(inc["id"])] = nm
-
-        stat_histogram: dict[str, int] = {}
-        samples: list[dict] = []
-        for item in data:
-            attrs = item.get("attributes") or {}
-            stat = attrs.get("stat_type") or ""
-            stat_histogram[stat] = stat_histogram.get(stat, 0) + 1
-            if len(samples) < 5:
-                rel = (item.get("relationships") or {}).get("new_player") or {}
-                pdata = rel.get("data") or {}
-                pid = pdata.get("id")
-                nm = player_lookup.get(str(pid)) if pid else None
-                if nm:
-                    samples.append(
-                        {"player": nm, "stat_type": stat,
-                         "line": attrs.get("line_score")}
-                    )
-                if nm and nm not in sample_names:
-                    sample_names.append(nm)
-
-        out["per_league"].append(
-            {
-                "league_id": lid,
+    for lg in tennis_lgs:
+        if lg["name"].upper() == "TENNIS LIVE":
+            # Skip the live in-game prop league entirely
+            out["per_league"].append({
+                "league_id": lg["id"],
                 "league_name": lg["name"],
-                "http": pstatus,
-                "projections_count": len(data),
-                "included_players_count": len(player_lookup),
-                "stat_histogram": stat_histogram,
-                "sample_projections": samples,
-            }
-        )
+                "skipped": "live_league",
+            })
+            continue
 
-    # 3. Name resolution
-    if sample_names:
-        try:
-            normalizer = PlayerNormalizer(sport="tennis")
-            resolved = []
-            unresolved = []
-            for nm in sample_names[:25]:
-                res = normalizer.resolve(
-                    nm, source="prizepicks", create_if_missing=False
-                )
-                if res.canonical_id:
-                    resolved.append({"name": nm, "cid": res.canonical_id})
-                else:
-                    unresolved.append(nm)
-            out["name_resolution"] = {
-                "tested": len(sample_names[:25]),
-                "resolved_count": len(resolved),
-                "unresolved_count": len(unresolved),
-                "sample_resolved": resolved[:5],
-                "sample_unresolved": unresolved[:10],
-            }
-        except Exception as e:
-            out["name_resolution"] = {"error": repr(e)}
+        lid = lg["id"]
+        status, body = pp_direct.fetch_projections(lid)
+        data = body.get("data", []) or []
+        included = body.get("included", []) or []
+        player_idx = pp_direct._build_player_index(included)
+
+        odds_hist: Counter = Counter()
+        stat_hist: Counter = Counter()
+        sample_projs: List[Dict[str, Any]] = []
+
+        for i, proj in enumerate(data):
+            attr = proj.get("attributes", {}) or {}
+            stat_type = (attr.get("stat_type") or "").strip()
+            odds_type = pp_direct._normalize_odds_type(attr.get("odds_type"))
+            stat_hist[stat_type] += 1
+            odds_hist[odds_type] += 1
+
+            if not raw_first_dump_set and i == 0:
+                out["raw_first_projection_attributes"] = attr
+                raw_first_dump_set = True
+
+            if len(sample_projs) < 8:
+                rel = (proj.get("relationships") or {}).get("new_player") or {}
+                pp_pid = str((rel.get("data") or {}).get("id") or "")
+                pinfo = player_idx.get(pp_pid, {})
+                sample_projs.append({
+                    "player": (pinfo.get("name") or "").strip(),
+                    "stat_type": stat_type,
+                    "odds_type": odds_type,
+                    "line": attr.get("line_score"),
+                })
+
+            # Probe resolver on first ~5 unique players
+            if tested_n < 5:
+                rel = (proj.get("relationships") or {}).get("new_player") or {}
+                pp_pid = str((rel.get("data") or {}).get("id") or "")
+                pinfo = player_idx.get(pp_pid, {})
+                raw_name = (pinfo.get("name") or "").strip()
+                if raw_name and raw_name not in sample_resolved + sample_unresolved:
+                    tested_n += 1
+                    res = resolve_player_name(raw_name)
+                    if res:
+                        sample_resolved.append(raw_name)
+                    else:
+                        sample_unresolved.append(raw_name)
+
+        out["per_league"].append({
+            "league_id": lid,
+            "league_name": lg["name"],
+            "http": status,
+            "projections_count": len(data),
+            "included_players_count": len(player_idx),
+            "odds_type_histogram": dict(odds_hist),
+            "stat_histogram": dict(stat_hist),
+            "sample_projections": sample_projs,
+        })
+
+    out["name_resolution"] = {
+        "tested": tested_n,
+        "resolved_count": len(sample_resolved),
+        "unresolved_count": len(sample_unresolved),
+        "sample_resolved": sample_resolved[:10],
+        "sample_unresolved": sample_unresolved[:10],
+    }
 
     return out
 
 
-@router.get("/watcher/status")
-async def watcher_status() -> dict[str, Any]:
-    try:
-        from app.workers.slate_watcher import _scheduler
-    except Exception as e:
-        return {"alive": False, "import_error": repr(e)}
+# ---------------------------------------------------------------------------
+# Force a PP ingest tick for a slate
+# ---------------------------------------------------------------------------
 
-    if _scheduler is None:
-        return {"alive": False, "reason": "scheduler is None (lifespan not started)"}
 
-    jobs = []
-    for j in _scheduler.get_jobs():
-        jobs.append(
-            {
-                "id": j.id,
-                "next_run": str(j.next_run_time) if j.next_run_time else None,
-                "trigger": str(j.trigger),
-            }
-        )
-    return {"alive": True, "running": _scheduler.running, "jobs": jobs}
+@router.post("/pp/run")
+def pp_run(
+    request: Request,
+    slate_id: str = Query(...),
+    token: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    _check_admin(request, token)
+    return pp_direct.run_prizepicks_direct(slate_id)
+
+
+# Allow GET for convenience in browser
+@router.get("/pp/run")
+def pp_run_get(
+    request: Request,
+    slate_id: str = Query(...),
+    token: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    _check_admin(request, token)
+    return pp_direct.run_prizepicks_direct(slate_id)
+
+
+# ---------------------------------------------------------------------------
+# Inspect current prizepicks_lines for a slate
+# ---------------------------------------------------------------------------
+
+
+@router.get("/pp/lines")
+def pp_lines(
+    request: Request,
+    slate_id: str = Query(...),
+    token: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    _check_admin(request, token)
+    sb = get_service_client()
+    resp = (
+        sb.table("prizepicks_lines")
+        .select("player_id,raw_player_name,stat_type,odds_type,current_line,is_active")
+        .eq("slate_id", slate_id)
+        .eq("is_active", True)
+        .order("raw_player_name")
+        .order("stat_type")
+        .order("odds_type")
+        .execute()
+    )
+    rows = resp.data or []
+    by_stat: Counter = Counter()
+    by_odds: Counter = Counter()
+    by_stat_odds: Counter = Counter()
+    for r in rows:
+        by_stat[r["stat_type"]] += 1
+        by_odds[r["odds_type"]] += 1
+        by_stat_odds[(r["stat_type"], r["odds_type"])] += 1
+    return {
+        "slate_id": slate_id,
+        "row_count": len(rows),
+        "by_stat_type": dict(by_stat),
+        "by_odds_type": dict(by_odds),
+        "by_stat_and_odds": {f"{k[0]}|{k[1]}": v for k, v in by_stat_odds.items()},
+        "sample": rows[:30],
+    }
