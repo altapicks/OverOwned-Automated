@@ -13,10 +13,8 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from app.db import get_client
-from app.services import notifier
 from app.services.normalizer import PlayerNormalizer
 
 logger = logging.getLogger(__name__)
@@ -31,12 +29,12 @@ STAT_TYPE_WHITELIST = {
     "Breaks": "Breaks",
     "Total Games Won": "Total Games Won",
     "Sets Won": "Sets Won",
-    "Games Won": "Total Games Won",  # alt spelling some seasons
+    "Games Won": "Total Games Won",
 }
 
 
 # ─────────────────────────────────────────────────────────────────────
-# HTTP — curl_cffi with httpx fallback (so deploy never fully breaks)
+# HTTP — curl_cffi with httpx fallback
 # ─────────────────────────────────────────────────────────────────────
 
 def _have_curl_cffi() -> bool:
@@ -65,7 +63,6 @@ async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dic
                 payload = {}
             return r.status_code, payload
 
-    # Fallback (will 403 against PP, but keeps imports working)
     import httpx
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await client.get(
@@ -84,7 +81,7 @@ async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dic
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Schedule gate — only fetch if there are upcoming tennis matches
+# Schedule gate
 # ─────────────────────────────────────────────────────────────────────
 
 async def _has_upcoming_matches() -> bool:
@@ -121,8 +118,11 @@ async def _discover_tennis_league_ids() -> list[int]:
         return []
 
     if status != 200:
-        logger.error("PP /leagues HTTP %d (curl_cffi installed=%s)",
-                     status, _have_curl_cffi())
+        logger.error(
+            "PP /leagues HTTP %d (curl_cffi installed=%s)",
+            status,
+            _have_curl_cffi(),
+        )
         return []
 
     ids: list[int] = []
@@ -138,8 +138,10 @@ async def _discover_tennis_league_ids() -> list[int]:
             continue
 
     if not ids:
-        logger.warning("PP /leagues returned %d leagues, none tennis",
-                       len(payload.get("data") or []))
+        logger.warning(
+            "PP /leagues returned %d leagues, none tennis",
+            len(payload.get("data") or []),
+        )
     else:
         logger.info("PP tennis league_ids discovered: %s", ids)
     return ids
@@ -279,8 +281,6 @@ async def fetch_tick(sport_code: str = "TEN") -> dict:
                 unresolved_sample.append(c["raw_player_name"])
             continue
         if res.canonical_id not in cid_to_slate:
-            # Player isn't on the current DK slate — drop for now.
-            # (The PP-board feature will keep these once we open scope.)
             continue
         slate_id = cid_to_slate[res.canonical_id]
         key = (slate_id, c["stat_type"])
@@ -311,8 +311,22 @@ async def fetch_tick(sport_code: str = "TEN") -> dict:
         except Exception as exc:
             logger.exception(
                 "PP direct insert failed slate=%s stat=%s rows=%d err=%r",
-                slate_id, stat_type, len(rows), exc,
+                slate_id,
+                stat_type,
+                len(rows),
+                exc,
             )
 
     logger.info(
-        "PP dire
+        "PP direct tick: collected=%d matched=%d written=%d slates=%d stat_types=%d",
+        len(collected),
+        matched_count,
+        written,
+        len({k[0] for k in by_slate_stat}),
+        len({k[1] for k in by_slate_stat}),
+    )
+    return {
+        "fetched": len(collected),
+        "matched": matched_count,
+        "written": written,
+    }
