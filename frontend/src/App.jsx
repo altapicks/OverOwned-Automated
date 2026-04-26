@@ -645,7 +645,7 @@ function buildProjections(data) {
   if (!data || !data.matches || !data.dk_players) return { dkPlayers: [], ppRows: [] };
   const dkMap = {}; data.dk_players.forEach(p => { dkMap[p.name] = p; });
   const oppMap = {}; data.matches.forEach(m => { oppMap[m.player_a] = m.player_b; oppMap[m.player_b] = m.player_a; });
-  const mtMap = {}; data.matches.forEach(m => { mtMap[m.player_a] = { time: m.start_time, t: m.tournament }; mtMap[m.player_b] = { time: m.start_time, t: m.tournament }; });
+  const mtMap = {}; data.matches.forEach(m => { mtMap[m.player_a] = { time: m.start_time, t: m.tournament, weather: m.weather }; mtMap[m.player_b] = { time: m.start_time, t: m.tournament, weather: m.weather }; });
   const dkPlayers = [];
   data.matches.forEach(match => {
     const stats = processMatch(match);
@@ -674,7 +674,7 @@ function buildProjections(data) {
       const name = match[side]; const dk = dkMap[name]; if (!dk) return;
       const proj = dkProjection(s);
       const val = dk.salary > 0 ? Math.round(proj / (dk.salary / 1000) * 100) / 100 : 0;
-      dkPlayers.push({ name, salary: dk.salary, id: dk.id, avgPPG: dk.avg_ppg, opponent: oppMap[name] || '', tournament: mtMap[name]?.t || '', startTime: mtMap[name]?.time || '', wp: s.wp, proj, val, pStraight: s.pStraightWin, p3set: s.p3set, gw: s.gw, gl: s.gl, sw: s.setsWon, sl: s.setsLost, aces: s.aces, dfs: s.dfs, breaks: s.breaks, p10ace: s.p10ace, pNoDF: s.pNoDF, ppProj: ppProjection(s), stats: s,
+      dkPlayers.push({ name, salary: dk.salary, id: dk.id, avgPPG: dk.avg_ppg, opponent: oppMap[name] || '', tournament: mtMap[name]?.t || '', startTime: mtMap[name]?.time || '', weather: mtMap[name]?.weather || null, wp: s.wp, proj, val, pStraight: s.pStraightWin, p3set: s.p3set, gw: s.gw, gl: s.gl, sw: s.setsWon, sl: s.setsLost, aces: s.aces, dfs: s.dfs, breaks: s.breaks, p10ace: s.p10ace, pNoDF: s.pNoDF, ppProj: ppProjection(s), stats: s,
         // Odds display: probability + source (kalshi | market | null)
         // These are the LOCKED values once the slate has locked.
         oddsProb: oddsForPlayer[abKey].prob,
@@ -1391,6 +1391,99 @@ const fmt = (n, d = 1) => typeof n === 'number' ? n.toFixed(d) : '-';
 const fmtPct = n => typeof n === 'number' ? (n * 100).toFixed(0) + '%' : '-';
 const fmtSal = n => '$' + n.toLocaleString();
 const fmtTime = s => { if (!s) return '-'; const m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(AM|PM)/i); if (m) { let h = parseInt(m[4]); const ap = m[6].toUpperCase(); if (ap === 'PM' && h !== 12) h += 12; if (ap === 'AM' && h === 12) h = 0; return (h > 12 ? h - 12 : h || 12) + ':' + m[5] + ' ' + ap; } try { const d = new Date(s); if (!isNaN(d)) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); } catch {} return s; };
+
+// ═══════════════════════════════════════════════════════════════════════
+// WeatherPill — v6.6 inline weather widget for the player table.
+// Renders a compact icon + temperature next to the match time. Hover shows
+// full forecast (condition, feels-like, wind, humidity, precip, venue).
+// Display-only — engine projections do not consume weather.
+// ═══════════════════════════════════════════════════════════════════════
+function weatherIconFor(iconId) {
+  // AccuWeather icon IDs map to a small set of single-char glyphs. See
+  // https://developer.accuweather.com/weather-icons for the full table.
+  const id = Number(iconId);
+  if (!isFinite(id)) return '';
+  if (id >= 1  && id <= 5)  return '\u2600';  // ☀  sunny / mostly sunny / partly sunny
+  if (id >= 6  && id <= 8)  return '\u2601';  // ☁  cloudy
+  if (id === 11)            return '\u2601';  // fog
+  if (id >= 12 && id <= 18) return '\u2602';  // ☂  rain / showers / t-storms
+  if (id >= 19 && id <= 29) return '\u2744';  // ❄  snow / sleet / ice
+  if (id === 30)            return '\u2600';  // hot
+  if (id === 31)            return '\u2744';  // cold
+  if (id === 32)            return '\u2248';  // ≈  windy (no good single-glyph for wind)
+  if (id >= 33 && id <= 38) return '\u263E';  // ☾  clear / partly cloudy night
+  if (id >= 39 && id <= 44) return '\u2602';  // night rain / snow / t-storms
+  return '';
+}
+
+function WeatherPill({ weather }) {
+  if (!weather || typeof weather !== 'object') return null;
+
+  // Indoor: show a static "Indoor" badge — weather doesn't affect play.
+  if (weather.is_indoor) {
+    return (
+      <span style={{
+        display: 'inline-block',
+        marginLeft: 6,
+        padding: '1px 5px',
+        fontSize: 10,
+        background: 'rgba(139,154,186,0.10)',
+        border: '1px solid rgba(139,154,186,0.30)',
+        borderRadius: 3,
+        color: 'var(--text-dim)',
+        verticalAlign: 'middle',
+      }} title={weather.venue_name || 'Indoor venue'}>
+        Indoor
+      </span>
+    );
+  }
+
+  const f = weather.forecast;
+  if (!f) return null;
+  const temp = (typeof f.temperature_f === 'number') ? Math.round(f.temperature_f) : null;
+  const icon = weatherIconFor(f.icon_id);
+
+  // Tooltip — single line of all relevant fields, separated by middots.
+  const parts = [];
+  if (f.condition)                                 parts.push(f.condition);
+  if (temp != null)                                parts.push(`${temp}\u00B0F`);
+  if (typeof f.feels_like_f === 'number')          parts.push(`feels ${Math.round(f.feels_like_f)}\u00B0`);
+  if (typeof f.wind_speed_mph === 'number') {
+    const dir = f.wind_direction ? ` ${f.wind_direction}` : '';
+    parts.push(`wind ${Math.round(f.wind_speed_mph)} mph${dir}`);
+  }
+  if (typeof f.humidity_pct === 'number')          parts.push(`humidity ${f.humidity_pct}%`);
+  if (typeof f.precipitation_pct === 'number')     parts.push(`precip ${f.precipitation_pct}%`);
+  if (weather.venue_name)                          parts.push(weather.venue_name);
+  const tooltip = parts.join(' \u00B7 ');
+
+  // Color the temp slightly so the pill is scannable: warm = amber, cold =
+  // blue, neutral = default text. Subtle so it doesn't compete with table data.
+  let tempColor = 'var(--text)';
+  if (temp != null) {
+    if (temp >= 85)      tempColor = '#F59E0B';   // hot
+    else if (temp <= 50) tempColor = '#60A5FA';   // cold
+  }
+
+  return (
+    <span style={{
+      display: 'inline-block',
+      marginLeft: 6,
+      padding: '1px 5px',
+      fontSize: 10,
+      background: 'rgba(139,154,186,0.06)',
+      border: '1px solid rgba(139,154,186,0.20)',
+      borderRadius: 3,
+      color: tempColor,
+      cursor: 'help',
+      verticalAlign: 'middle',
+      whiteSpace: 'nowrap',
+    }} title={tooltip}>
+      {icon ? <span style={{ marginRight: 3 }}>{icon}</span> : null}
+      {temp != null ? `${temp}\u00B0` : '\u2014'}
+    </span>
+  );
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // BUILD ANIMATION (v3.24.13) — "Lineup Ticker" loading state shown in
@@ -2916,7 +3009,7 @@ function DKTab({ players, mc, own, onOverride, overrides, lockedPlayers = [], ex
         <td className="num"><span className={is ? 'cell-top3' : ''}>{fmtPct(p.pStraight)}</span></td>
         <td className="num">{fmt(p.gw)}</td><td className="num muted">{fmt(p.gl)}</td><td className="num">{fmt(p.sw)}</td><td className="num muted">{fmt(p.sl)}</td>
         <td className="num">{fmt(p.aces)}</td><td className="num muted">{fmt(p.dfs)}</td><td className="num">{fmt(p.breaks)}</td>
-        <td className="muted">{fmtTime(p.startTime)}</td>
+        <td className="muted">{fmtTime(p.startTime)}<WeatherPill weather={p.weather} /></td>
         <td style={{ textAlign: 'right', paddingRight: 10 }}><LockExcludeButtons name={p.name} isLocked={lockedPlayers.includes(p.name)} isExcluded={excludedPlayers.includes(p.name)} onToggleLock={onToggleLock} onToggleExclude={onToggleExclude} /></td>
       </tr>; })}</tbody></table></div>
   </>);
