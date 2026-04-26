@@ -58,6 +58,18 @@ from app.models import (
     FrontendSlate,
 )
 
+# v6.9: lookup_venue used to derive match.tournament/surface from the slate's
+# slate_label when the upstream ingester left match.tournament null. Same
+# venue lookup the weather pipeline uses (with token-fallback so labels like
+# "Featured (Madrid)" still resolve to the "madrid open" key). Wrapped in a
+# try/except so this file remains importable even if tennis_venues.py is
+# missing in some deployment.
+try:
+    from app.services.tennis_venues import lookup_venue
+except ImportError:
+    def lookup_venue(_name):  # type: ignore
+        return None
+
 logger = logging.getLogger(__name__)
 
 # v6.6: weather support is gated on FrontendMatch having a `weather` field.
@@ -488,6 +500,42 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     # (player, stat). v6.5.
     pp_agg = _aggregate_pp_lines_for_engine(pp_rows)
 
+    # v6.9: Resolve the slate's slate_label against the venue dictionary
+    # ONCE up front. When the upstream ingester writes matches with
+    # tournament=null (which it does on Featured slates — slate_label
+    # carries the tournament identity instead), every match gets these
+    # values as a fallback. Same lookup_venue() the weather pipeline uses,
+    # so what worked there works here too.
+    slate_label = slate.get("slate_label")
+    fallback_venue = lookup_venue(slate_label) if slate_label else None
+    fallback_tournament_name: Optional[str] = None
+    fallback_surface: Optional[str] = None
+    if fallback_venue:
+        # venue["name"] is the stadium ("Caja Mágica") — for tournament we
+        # want a clean tournament-style label. The matched_key (e.g.
+        # "madrid open") titlecased is closest. If you'd rather show the
+        # stadium name, swap to fallback_venue.get("name").
+        matched_key = fallback_venue.get("_matched_key") or ""
+        if matched_key:
+            # Title-case with overrides for acronyms — naive .title() turns
+            # "us open" into "Us Open". Apply a small override pass.
+            _ACRONYM_FIX = {
+                "Us Open": "US Open",
+                "Atp Finals": "ATP Finals",
+                "Wta Finals": "WTA Finals",
+                "Bmw Open": "BMW Open",
+                "Atp": "ATP",
+                "Wta": "WTA",
+            }
+            titled = matched_key.title()
+            fallback_tournament_name = _ACRONYM_FIX.get(titled, titled)
+        fallback_surface = fallback_venue.get("surface")
+        logger.info(
+            "slate_reader: using slate_label fallback for matches: "
+            "slate_label=%r → tournament=%r surface=%r",
+            slate_label, fallback_tournament_name, fallback_surface,
+        )
+
     frontend_matches: list[FrontendMatch] = []
     for m in matches:
         pa_id = m["player_a_id"]
@@ -518,8 +566,14 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
             "player_a": pa_name,
             "player_b": pb_name,
             "start_time": m.get("start_time"),
-            "tournament": m.get("tournament") or "",
-            "surface": m.get("surface"),
+            # v6.9: tournament+surface fallback — when the DB row has a
+            # populated tournament, use it. Otherwise fall back to the
+            # slate-label-derived tournament name (precomputed above).
+            # Frontend tiles check `match.tournament` first; this ensures
+            # the homepage tile resolves on Featured slates that ship
+            # with null per-match tournament strings.
+            "tournament": (m.get("tournament") or fallback_tournament_name or ""),
+            "surface": (m.get("surface") or fallback_surface),
             "odds": FrontendMatchOdds(**odds),
             "opening_odds": _build_opening_odds_model(m.get("opening_odds")),
             "closing_odds": _build_opening_odds_model(m.get("closing_odds")),
@@ -574,6 +628,10 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         "contest_type": slate.get("contest_type") or "classic",
         "is_fallback": bool(slate.get("is_fallback")),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        # v6.9: slate_label also exposed at the top level of FrontendSlate,
+        # but consumers (e.g. homepage tiles) sometimes look in meta.
+        # Cheap to mirror, no breakage risk.
+        "slate_label": slate.get("slate_label"),
     }
 
     # PP tab UI feed: every variant per (player, stat) emitted as a separate
