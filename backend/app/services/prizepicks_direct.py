@@ -1,6 +1,9 @@
 """
 PrizePicks direct ingest via Oxylabs Web Scraper API.
+
 Captures all 3 PP variants per (player, stat_type): standard / demon / goblin.
+Median across the three feeds the DK engine via slate_reader's posted_lines
+projection — see slate_reader._project_posted_lines_for_match.
 """
 
 from __future__ import annotations
@@ -24,7 +27,9 @@ OXY_PASS = os.getenv("OXYLABS_PASSWORD", "")
 OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
 
 PP_BASE = "https://api.prizepicks.com"
+
 TENNIS_LEAGUE_NAME_ALLOW = {"TENNIS"}
+
 ALLOWED_STAT_TYPES = {
     "Aces",
     "Break Points Won",
@@ -50,22 +55,48 @@ PP_HEADERS = {
 
 
 # ---------------------------------------------------------------------------
-# Player resolver — now creates new players if PP introduces them
+# Player resolver
+#
+# The normalizer can return three classes of result:
+#   1. auto_resolved=True            — exact alias or high-confidence fuzzy.
+#                                      Always safe to use canonical_id.
+#   2. was_new=True                  — we just created this player.
+#                                      Safe to use canonical_id.
+#   3. auto_resolved=False           — low-confidence guess. canonical_id
+#                                      may point at a DIFFERENT player
+#                                      who happens to share a first name
+#                                      (this is how "Arthur Rinderknech"
+#                                      was being aliased to arthur_fils).
+#                                      NEVER use canonical_id here.
+#
+# The current normalizer with create_if_missing=True will always either
+# auto_resolve or create — it no longer returns class (3). But we keep
+# this guard so the ingest is robust regardless of future resolver tweaks.
 # ---------------------------------------------------------------------------
-
-
 def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
     """
     Resolves PP raw player names to canonical_id.
-    Auto-creates new players if not already in the DB so that PP-only
+    Auto-creates new players if not already in the DB so PP-only
     entrants (qualifiers, ITF crossover, etc.) still land.
     """
     if not raw_name:
         return None
     try:
         normalizer = PlayerNormalizer(sport=sport)
-        result = normalizer.resolve(raw_name, source="prizepicks", create_if_missing=True)
-        return result.canonical_id
+        result = normalizer.resolve(
+            raw_name, source="prizepicks", create_if_missing=True
+        )
+        if result.auto_resolved or result.was_new:
+            return result.canonical_id
+        # Low-confidence guess — refuse to attach a line to a possibly-
+        # wrong player. Better to drop the row than poison the engine.
+        log.warning(
+            "_resolve_player low_confidence raw=%r best=%r score=%s",
+            raw_name,
+            result.canonical_id,
+            result.score,
+        )
+        return None
     except Exception as e:
         log.warning("resolve_player failed for %s: %s", raw_name, e)
         return None
@@ -74,8 +105,6 @@ def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Oxylabs fetch
 # ---------------------------------------------------------------------------
-
-
 def _oxy_payload(url: str, render: bool = False) -> Dict[str, Any]:
     p: Dict[str, Any] = {
         "source": "universal",
@@ -136,7 +165,9 @@ def oxy_probe(url: str, render: bool = False, timeout: float = 60.0) -> Dict[str
         return {"error": f"probe_exception: {e}"}
 
 
-def _oxy_fetch_json(url: str, timeout: float = 60.0, render: bool = False) -> Tuple[int, Dict[str, Any], str]:
+def _oxy_fetch_json(
+    url: str, timeout: float = 60.0, render: bool = False
+) -> Tuple[int, Dict[str, Any], str]:
     if not (OXY_USER and OXY_PASS):
         return 0, {}, "oxylabs_creds_missing"
     try:
@@ -177,8 +208,6 @@ def _oxy_fetch_json(url: str, timeout: float = 60.0, render: bool = False) -> Tu
 # ---------------------------------------------------------------------------
 # PP API surface
 # ---------------------------------------------------------------------------
-
-
 def fetch_leagues() -> Tuple[int, List[Dict[str, Any]]]:
     status, body, err = _oxy_fetch_json(f"{PP_BASE}/leagues")
     if status != 200:
@@ -192,7 +221,9 @@ def fetch_projections(league_id: str) -> Tuple[int, Dict[str, Any], str]:
     status, body, err = _oxy_fetch_json(url, render=False)
     if status == 200:
         return status, body, ""
-    log.warning("fetch_projections plain failed (%s): %s — retrying with render", status, err)
+    log.warning(
+        "fetch_projections plain failed (%s): %s — retrying with render", status, err
+    )
     status2, body2, err2 = _oxy_fetch_json(url, render=True)
     if status2 == 200:
         return status2, body2, ""
@@ -217,8 +248,6 @@ def get_tennis_league_ids() -> List[str]:
 # ---------------------------------------------------------------------------
 # Normalizers
 # ---------------------------------------------------------------------------
-
-
 def _normalize_odds_type(raw: Optional[str]) -> str:
     if not raw:
         return "standard"
@@ -243,8 +272,6 @@ def _build_player_index(included: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 # ---------------------------------------------------------------------------
 # Main ingest
 # ---------------------------------------------------------------------------
-
-
 def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "slate_id": slate_id,
@@ -257,11 +284,9 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         "stat_histogram": {},
         "errors": [],
     }
-
     if not (OXY_USER and OXY_PASS):
         summary["errors"].append("oxylabs_creds_missing")
         return summary
-
     league_ids = get_tennis_league_ids()
     if not league_ids:
         summary["errors"].append("no_tennis_leagues_resolved")
@@ -277,9 +302,9 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
     for lid in league_ids:
         status, body, err = fetch_projections(lid)
         if status != 200:
-            summary["leagues"].append({
-                "id": lid, "http": status, "wrote": 0, "error": err,
-            })
+            summary["leagues"].append(
+                {"id": lid, "http": status, "wrote": 0, "error": err}
+            )
             summary["errors"].append(f"projections_failed[{lid}]: {err}")
             continue
 
@@ -288,7 +313,6 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         player_idx = _build_player_index(included)
 
         grouped: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = defaultdict(dict)
-
         for proj in data:
             attr = proj.get("attributes", {}) or {}
             stat_type = (attr.get("stat_type") or "").strip()
@@ -298,7 +322,6 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             line_score = attr.get("line_score")
             if line_score is None:
                 continue
-
             rel = (proj.get("relationships") or {}).get("new_player") or {}
             pdata = rel.get("data") or {}
             pp_pid = str(pdata.get("id") or "")
@@ -308,11 +331,9 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             raw_name = (pinfo.get("name") or "").strip()
             if not raw_name:
                 continue
-
             resolved = _resolve_player(raw_name)
             if not resolved:
                 continue
-
             grouped[(stat_type, odds_type)][resolved] = {
                 "slate_id": slate_id,
                 "player_id": resolved,
@@ -330,10 +351,8 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         league_wrote = 0
         league_deact = 0
         league_failures = 0
-
         for (stat_type, odds_type), per_player in grouped.items():
             rows = list(per_player.values())
-
             try:
                 resp = (
                     db.table("prizepicks_lines")
@@ -364,13 +383,15 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
                             f"insert_failed[{stat_type}/{odds_type}/{row['player_id']}]: {msg}"
                         )
 
-        summary["leagues"].append({
-            "id": lid,
-            "http": 200,
-            "wrote": league_wrote,
-            "deactivated": league_deact,
-            "row_failures": league_failures,
-        })
+        summary["leagues"].append(
+            {
+                "id": lid,
+                "http": 200,
+                "wrote": league_wrote,
+                "deactivated": league_deact,
+                "row_failures": league_failures,
+            }
+        )
         total_wrote += league_wrote
         total_deactivated += league_deact
         total_failures += league_failures
