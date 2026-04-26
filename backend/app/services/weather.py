@@ -1,3 +1,4 @@
+# ─── START — app/routes/weather.py — replace entire file with this ───
 """Admin routes for weather refresh.
 
 Exposed:
@@ -11,8 +12,7 @@ Exposed:
 
 Both endpoints are admin-gated via a self-contained header check
 (X-Admin-Token must match the ADMIN_TOKEN env var). Self-contained because
-v6.5 codebase doesn't standardize an `admin_required` dependency yet —
-when you add one, swap the Depends line back in.
+the v6.5 codebase doesn't standardize an admin_required dependency yet.
 """
 
 from __future__ import annotations
@@ -32,16 +32,11 @@ router = APIRouter(prefix="/api/admin/weather", tags=["admin", "weather"])
 
 
 def _check_admin(x_admin_token: Optional[str]) -> None:
-    """Self-contained admin gate. Compares X-Admin-Token header to
-    ADMIN_TOKEN env var. Raises 401/403 on mismatch.
-
-    If you have a centralized admin auth dependency in your codebase, swap
-    this for `Depends(admin_required)` in each route. Until then, this
-    keeps the weather routes deployable without coupling to other modules.
+    """Self-contained admin gate. Compares X-Admin-Token header to the
+    ADMIN_TOKEN env var. Raises 401 on mismatch and 500 if env var unset.
     """
     expected = os.getenv("ADMIN_TOKEN", "").strip()
     if not expected:
-        # If no token is set at all, hard-fail rather than silently allowing.
         raise HTTPException(
             500,
             "ADMIN_TOKEN env var not set on the server; admin routes "
@@ -61,7 +56,7 @@ def post_refresh(
 
     `force=true` bypasses the per-match freshness check and re-fetches every
     match's forecast, regardless of how recently it was last updated. Use
-    sparingly — eats API budget.
+    sparingly — eats AccuWeather API budget.
     """
     _check_admin(x_admin_token)
     if not slate_id:
@@ -115,3 +110,4 @@ def get_status(
         "match_count": len(out_matches),
         "matches": out_matches,
     }
+# ─── END — app/routes/weather.py ───
