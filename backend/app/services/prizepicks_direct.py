@@ -31,14 +31,23 @@ logger = logging.getLogger(__name__)
 PP_BASE = "https://api.prizepicks.com"
 OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
 
+# Real PrizePicks tennis stat_type labels (verified via diagnose endpoint).
+# Map raw PP labels → normalized labels we store in prizepicks_lines.stat_type.
+# Frontend Pivots tab + future PP board both filter on these strings, so
+# keep them consistent.
 STAT_TYPE_WHITELIST = {
     "Fantasy Score": "Fantasy Score",
     "Aces": "Aces",
     "Double Faults": "Double Faults",
-    "Breaks": "Breaks",
-    "Total Games Won": "Total Games Won",
-    "Sets Won": "Sets Won",
+    "Break Points Won": "Break Points Won",
+    "Total Games": "Total Games",         # match-level games o/u
+    "Total Games Won": "Total Games Won", # per-player games
+    "Total Sets": "Total Sets",
+    "Total Tie Breaks": "Total Tie Breaks",
+    # Legacy / alternate spellings just in case PP changes labels mid-season
+    "Breaks": "Break Points Won",
     "Games Won": "Total Games Won",
+    "Sets Won": "Total Sets",
 }
 
 
@@ -51,13 +60,7 @@ def _oxy_creds() -> tuple[str, str] | None:
 
 
 async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dict]:
-    """GET a JSON URL through Oxylabs Web Scraper API.
-
-    Oxylabs returns an envelope:
-      {"results":[{"content": "...raw response body...", "status_code": 200}]}
-
-    We parse the inner content as JSON and return (target_status, target_json).
-    """
+    """GET a JSON URL through Oxylabs Web Scraper API."""
     creds = _oxy_creds()
     if not creds:
         logger.error("OXYLABS_USERNAME/PASSWORD not set")
@@ -65,7 +68,6 @@ async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dic
 
     user, pw = creds
 
-    # Stitch params onto URL since Oxylabs expects a single fully-built URL
     if params:
         from urllib.parse import urlencode
         sep = "&" if "?" in url else "?"
@@ -74,8 +76,6 @@ async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dic
     body = {
         "source": "universal",
         "url": url,
-        # No JS rendering needed — PP's API endpoint serves JSON when the
-        # Cloudflare challenge is solved. Oxylabs solves it server-side.
         "geo_location": "United States",
     }
 
@@ -111,12 +111,9 @@ async def _http_get_json(url: str, params: dict | None = None) -> tuple[int, dic
     raw_content = first.get("content") or ""
 
     if target_status != 200:
-        logger.error(
-            "Target HTTP %d via Oxylabs (url=%s)", target_status, url
-        )
+        logger.error("Target HTTP %d via Oxylabs (url=%s)", target_status, url)
         return target_status, {}
 
-    # Content may be a JSON string or already a dict
     if isinstance(raw_content, dict):
         return target_status, raw_content
     try:
@@ -177,6 +174,9 @@ async def _discover_tennis_league_ids() -> list[int]:
         sport = (attrs.get("sport") or "").lower()
         if "tennis" not in name and "tennis" not in sport:
             continue
+        # Skip "TENNIS LIVE" — in-game props, no use to us
+        if "live" in name:
+            continue
         try:
             ids.append(int(item.get("id")))
         except (TypeError, ValueError):
@@ -184,11 +184,11 @@ async def _discover_tennis_league_ids() -> list[int]:
 
     if not ids:
         logger.warning(
-            "PP /leagues returned %d leagues, none tennis",
+            "PP /leagues returned %d leagues, none tennis (non-live)",
             len(payload.get("data") or []),
         )
     else:
-        logger.info("PP tennis league_ids discovered: %s", ids)
+        logger.info("PP tennis (non-live) league_ids discovered: %s", ids)
     return ids
 
 
@@ -318,6 +318,7 @@ async def fetch_tick(sport_code: str = "TEN") -> dict:
     by_slate_stat: dict[tuple[str, str], list[dict]] = {}
     matched_count = 0
     unresolved_sample: list[str] = []
+    skipped_not_in_slate = 0
     for c in collected:
         res = normalizer.resolve(
             c["raw_player_name"], source="prizepicks", create_if_missing=False
@@ -327,6 +328,7 @@ async def fetch_tick(sport_code: str = "TEN") -> dict:
                 unresolved_sample.append(c["raw_player_name"])
             continue
         if res.canonical_id not in cid_to_slate:
+            skipped_not_in_slate += 1
             continue
         slate_id = cid_to_slate[res.canonical_id]
         key = (slate_id, c["stat_type"])
@@ -364,10 +366,12 @@ async def fetch_tick(sport_code: str = "TEN") -> dict:
             )
 
     logger.info(
-        "PP direct tick: collected=%d matched=%d written=%d slates=%d stat_types=%d",
+        "PP direct tick: collected=%d matched=%d written=%d "
+        "skipped_not_on_slate=%d slates=%d stat_types=%d",
         len(collected),
         matched_count,
         written,
+        skipped_not_in_slate,
         len({k[0] for k in by_slate_stat}),
         len({k[1] for k in by_slate_stat}),
     )
@@ -375,4 +379,5 @@ async def fetch_tick(sport_code: str = "TEN") -> dict:
         "fetched": len(collected),
         "matched": matched_count,
         "written": written,
+        "skipped_not_on_slate": skipped_not_in_slate,
     }
