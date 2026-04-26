@@ -1,8 +1,9 @@
 """
 Admin debug routes for diagnosing PP ingest, watcher, and slate state.
 
-All routes are gated by ADMIN_TOKEN env var. Pass via header X-Admin-Token
-or query param ?token=...
+Read-only endpoints (/pp/diagnose, /pp/lines, /watcher/status) are open
+because they don't write or cost anything. Write/expensive endpoints
+(/pp/run) require ADMIN_TOKEN.
 """
 
 from __future__ import annotations
@@ -32,13 +33,17 @@ def _check_admin(request: Request, token: Optional[str]) -> None:
         or token
         or ""
     )
-    if provided != expected:
+    if provided.strip() != expected.strip():
         raise HTTPException(401, "bad admin token")
 
 
+# ---------------------------------------------------------------------------
+# Read-only — no auth
+# ---------------------------------------------------------------------------
+
+
 @router.get("/watcher/status")
-def watcher_status(request: Request, token: Optional[str] = Query(None)) -> Dict[str, Any]:
-    _check_admin(request, token)
+def watcher_status() -> Dict[str, Any]:
     try:
         from app.workers import slate_watcher as sw
     except Exception as e:
@@ -69,9 +74,7 @@ def watcher_status(request: Request, token: Optional[str] = Query(None)) -> Dict
 
 
 @router.get("/pp/diagnose")
-def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[str, Any]:
-    _check_admin(request, token)
-
+def pp_diagnose() -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "oxylabs_configured": bool(
             os.getenv("OXYLABS_USERNAME") and os.getenv("OXYLABS_PASSWORD")
@@ -184,33 +187,8 @@ def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[st
     return out
 
 
-@router.post("/pp/run")
-def pp_run(
-    request: Request,
-    slate_id: str = Query(...),
-    token: Optional[str] = Query(None),
-) -> Dict[str, Any]:
-    _check_admin(request, token)
-    return pp_direct.run_prizepicks_direct(slate_id)
-
-
-@router.get("/pp/run")
-def pp_run_get(
-    request: Request,
-    slate_id: str = Query(...),
-    token: Optional[str] = Query(None),
-) -> Dict[str, Any]:
-    _check_admin(request, token)
-    return pp_direct.run_prizepicks_direct(slate_id)
-
-
 @router.get("/pp/lines")
-def pp_lines(
-    request: Request,
-    slate_id: str = Query(...),
-    token: Optional[str] = Query(None),
-) -> Dict[str, Any]:
-    _check_admin(request, token)
+def pp_lines(slate_id: str = Query(...)) -> Dict[str, Any]:
     db = get_client()
     resp = (
         db.table("prizepicks_lines")
@@ -238,3 +216,28 @@ def pp_lines(
         "by_stat_and_odds": {f"{k[0]}|{k[1]}": v for k, v in by_stat_odds.items()},
         "sample": rows[:30],
     }
+
+
+# ---------------------------------------------------------------------------
+# Write — keeps token gate (costs Oxylabs credits + writes to DB)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/pp/run")
+def pp_run(
+    request: Request,
+    slate_id: str = Query(...),
+    token: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    _check_admin(request, token)
+    return pp_direct.run_prizepicks_direct(slate_id)
+
+
+@router.get("/pp/run")
+def pp_run_get(
+    request: Request,
+    slate_id: str = Query(...),
+    token: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    _check_admin(request, token)
+    return pp_direct.run_prizepicks_direct(slate_id)
