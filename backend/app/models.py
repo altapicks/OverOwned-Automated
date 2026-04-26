@@ -100,6 +100,17 @@ class FrontendMatch(BaseModel):
     closing_odds: Optional[FrontendMatchOdds] = None
     adj_a: float = 0
     adj_b: float = 0
+    # v6.6: AccuWeather forecast for the match's venue + start time. Display-
+    # only — engine projections do NOT consume weather data. Populated by
+    # app.services.weather.fetch_weather_for_match() and stored in
+    # matches.weather (jsonb). None when:
+    #   - venue is unknown (tournament not in tennis_venues.py)
+    #   - venue is indoor (then weather.is_indoor=True with no forecast)
+    #   - AccuWeather lookup hasn't run yet for this match
+    #   - AccuWeather call failed (rate limit, key invalid, etc.)
+    # Schema is the dict written by weather.py — see that file for keys.
+    # Typed as `dict` rather than a strict model so backend changes to the
+    # forecast shape (new fields, etc.) don't require a schema migration.
     weather: Optional[dict] = None
 
 
