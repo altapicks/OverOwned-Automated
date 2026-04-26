@@ -15,6 +15,7 @@ own process.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import sentry_sdk
@@ -27,11 +28,13 @@ from app.routes import (
     admin_debug,
     admin_dk,
     admin_slate,
+    dk_auto,
     health,
     players,
     prizepicks,
     slates,
     tracker,
+    weather,
 )
 
 
@@ -120,6 +123,17 @@ def _log_provider_diagnostics(settings):
         "set" if settings.discord_webhook_slates else "not set",
         "set" if settings.discord_webhook_errors else "not set",
     )
+    # DK auto-tracker — separate from dk_auto_ingest. Tracker polls live
+    # contest standings post-lock for the leverage tracker. See dk_auto/.
+    dk_auto_enabled = os.getenv("ENABLE_DK_AUTO_TRACKER", "false").lower() == "true"
+    dk_user = os.getenv("DK_USERNAME", "")
+    dk_pass = os.getenv("DK_PASSWORD", "")
+    logger.info(
+        "DK auto-tracker config: enabled=%s, creds=%s, poll_seconds=%s",
+        "true" if dk_auto_enabled else "false",
+        "set" if (dk_user and dk_pass) else "MISSING (manual paste only)",
+        os.getenv("DK_AUTO_POLL_INTERVAL_SECONDS", "300"),
+    )
 
 
 def create_app() -> FastAPI:
@@ -153,6 +167,8 @@ def create_app() -> FastAPI:
     app.include_router(admin_slate.router)
     app.include_router(admin_dk.router)
     app.include_router(admin_debug.router)
+    app.include_router(weather.router)
+    app.include_router(dk_auto.router)
     return app
 
 
