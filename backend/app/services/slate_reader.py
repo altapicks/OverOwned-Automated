@@ -1,7 +1,6 @@
 """Read-side service: builds the frontend-facing FrontendSlate from DB rows.
-
-This is what the API returns to the React app. The shape matches the
-existing slate.json schema exactly so no UI changes are needed.
+This is what the API returns to the React app. The shape matches the existing
+slate.json schema exactly so no UI changes are needed.
 """
 from __future__ import annotations
 
@@ -21,24 +20,23 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 
+# PP stat_type → canonical name used by frontend engine. PP's wire labels
+# already match what we want for most, but we normalize a couple to keep
+# the engine happy and consistent with the Underdog UD_STAT_MAP shape.
+PP_STAT_TO_ENGINE = {
+    "Aces": "Aces",
+    "Double Faults": "Double Faults",
+    "Break Points Won": "Breakpoints Won",  # match UD label
+    "Fantasy Score": "Fantasy Score",
+    "Total Games": "Total Games",
+    "Total Games Won": "Games Won",          # match UD label
+    "Total Sets": "Total Sets",
+    "Total Tie Breaks": "Total Tie Breaks",
+}
+
+
 def _build_opening_odds_model(raw: Optional[dict]) -> Optional[FrontendMatchOdds]:
-    """Flatten stored opening_odds (source-keyed) into FrontendMatchOdds.
-
-    Stored shape:
-      {"kalshi": {"implied_prob_a": 0.62, "implied_prob_b": 0.38, ...},
-       "the_odds_api": {"ml_a": -175, "ml_b": 137, ...}}
-
-    Flat keys used by engine.js/frontend:
-      - kalshi_prob_a / kalshi_prob_b   from kalshi.implied_prob_*
-      - ml_a / ml_b                     from the_odds_api.ml_*
-
-    v6.0d: Returns None when no real data is available — previously returned
-    a default FrontendMatchOdds() for empty/null raw, which Pydantic
-    serialized as {ml_a: null, ..., kalshi_prob_a: null, ...} (26 null keys).
-    The frontend's Object.keys().length > 0 check then incorrectly chose
-    closing_odds over live odds for slates that hadn't locked yet, displaying
-    "Not Live" on every match and killing posted_lines override.
-    """
+    """Flatten stored opening_odds (source-keyed) into FrontendMatchOdds."""
     if not raw or not isinstance(raw, dict):
         return None
     flat: dict = {}
@@ -65,7 +63,6 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
     if not slate:
         return None
 
-    # Match rows
     matches = (
         db.table("matches")
         .select("*, player_a:player_a_id(display_name), player_b:player_b_id(display_name)")
@@ -75,7 +72,6 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         or []
     )
 
-    # Slate player rows with display names
     players = (
         db.table("slate_players")
         .select("*, player:player_id(display_name)")
@@ -85,7 +81,6 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         or []
     )
 
-    # ── Build matches ─────────────────────────────────────────────────
     frontend_matches: list[FrontendMatch] = []
     for m in matches:
         pa_name = (m.get("player_a") or {}).get("display_name") or m["player_a_id"]
@@ -98,41 +93,24 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
                 tournament=m.get("tournament") or "",
                 surface=m.get("surface"),
                 odds=FrontendMatchOdds(**(m.get("odds") or {})),
-                # opening_odds may include kalshi_prob_a/kalshi_prob_b sub-keys
-                # nested under 'kalshi'. Flatten the flat keys to the top level
-                # so the frontend reads match.opening_odds.kalshi_prob_a without
-                # drilling. Mirrors how live odds are laid out.
                 opening_odds=_build_opening_odds_model(m.get("opening_odds")),
-                # closing_odds uses the same nested shape as opening_odds,
-                # captured at slate lock time. Frontend uses it everywhere
-                # except the Live Leverage Tracker.
                 closing_odds=_build_opening_odds_model(m.get("closing_odds")),
                 adj_a=0,
                 adj_b=0,
             )
         )
 
-    # ── Collapse slate_players into per-canonical entries ─────────────
-    # For showdown, multiple roster_positions per player get merged with
-    # per-position salaries/ids on one row. For classic, just one row.
     by_canonical: dict[str, dict] = {}
     for sp in players:
         cid = sp["player_id"]
-        display = (sp.get("player") or {}).get("display_name") or sp.get(
-            "dk_display_name"
-        )
+        display = (sp.get("player") or {}).get("display_name") or sp.get("dk_display_name")
         entry = by_canonical.setdefault(
             cid,
             {"name": display, "id": 0, "salary": 0, "avg_ppg": 0},
         )
         rp = sp.get("roster_position") or "P"
-        # v5.10: prefer dk_player_id_override when set. The slate_watcher
-        # worker overwrites dk_player_id on every 15-min poll, so any manual
-        # SQL correction to dk_player_id gets clobbered. Override column is
-        # never touched by the worker — operators set it and it persists.
         effective_dk_id = sp.get("dk_player_id_override") or sp["dk_player_id"]
         if rp in ("P", "FLEX"):
-            # Classic: P. Showdown flex: FLEX.
             entry["id"] = effective_dk_id
             entry["salary"] = sp["salary"]
             entry["avg_ppg"] = float(sp["avg_ppg"] or 0)
@@ -144,10 +122,6 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         elif rp == "ACPT":
             entry["acpt_id"] = effective_dk_id
             entry["acpt_salary"] = sp["salary"]
-        # ss_pool_own — set on any row for this player (usually the P/FLEX
-        # row). None-safe: float(None) would throw, so only cast if present.
-        # Overrides subsequent overwrites only if currently unset, so a CPT
-        # row with NULL doesn't wipe a P row's value.
         val = sp.get("ss_pool_own")
         if val is not None and entry.get("ss_pool_own") is None:
             try:
@@ -167,36 +141,39 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # PP lines: pull active rows from prizepicks_lines table for this slate
-    # and include posted_lines (Underdog stat props) from matches.odds for
-    # multi-stat edge detection. Frontend buildProjections uses this to
-    # compute ppEdge per player, which feeds Hidden Gem + PP Fade signals
-    # in the DK tab and OverOwned Build ruleset.
+    # PP lines: only the STANDARD variant feeds the engine. Demon/goblin
+    # lines are shifted away from true and would corrupt projections if
+    # the engine averaged across all three. The PP tab UI shows each
+    # variant separately for edge analysis; the DK engine just needs the
+    # truthful base line per stat.
     pp_rows = (
         db.table("prizepicks_lines")
-        .select("raw_player_name, stat_type, current_line")
+        .select("raw_player_name, stat_type, current_line, odds_type")
         .eq("slate_id", slate_id)
         .eq("is_active", True)
+        .eq("odds_type", "standard")
         .execute()
         .data
         or []
     )
-    pp_lines_out = [
-        {
-            "player": r["raw_player_name"],
-            "stat": r["stat_type"],
-            "line": float(r["current_line"]),
-            "mult": "",  # multiplier not tracked in current admin UI
-            "source": "prizepicks",
-        }
-        for r in pp_rows
-    ]
+    pp_lines_out = []
+    for r in pp_rows:
+        engine_stat = PP_STAT_TO_ENGINE.get(r["stat_type"], r["stat_type"])
+        pp_lines_out.append(
+            {
+                "player": r["raw_player_name"],
+                "stat": engine_stat,
+                "line": float(r["current_line"]),
+                "mult": "",
+                "source": "prizepicks",
+            }
+        )
 
-    # Also add Underdog stat-prop lines from matches.odds.posted_lines as
-    # a second source. Each match row has {"a": {games_won, aces, dfs, ...},
-    # "b": {...}} written by the Underdog ingestion SQL. Convert to the
-    # same flat {player, stat, line} shape as pp_lines so the frontend's
-    # ppRows builder can process both uniformly.
+    # Underdog stat-prop lines from matches.odds.posted_lines (kept as a
+    # secondary source — when both PP and UD have a line for the same
+    # player+stat, engine.js currently uses whichever is added last.
+    # PP rows are added first here so UD wins ties, which is the existing
+    # behavior. Don't reorder without checking engine.js.)
     UD_STAT_MAP = {
         "games_won": "Games Won",
         "aces": "Aces",
@@ -243,27 +220,7 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
 
 
 def get_today_slate(sport: str) -> Optional[FrontendSlate]:
-    """Return the most relevant active slate for a sport.
-
-    v5.15 selection logic — fixes the bug where an empty freshly-ingested
-    slate for tomorrow (UTC rollover) would win over today's populated
-    slate that users are actively working with.
-
-    Preference order:
-      1. Classic slate with dk_players populated AND lock_time in the future
-         (the upcoming slate users are building lineups for). Prefers the
-         SOONEST lock among those.
-      2. Classic slate with dk_players populated (any lock_time, most recent).
-         Covers the post-lock / in-progress / archived browsing case.
-      3. Any Classic slate (even empty) — last-resort fallback so the UI
-         doesn't 404; might render empty but at least the shell loads.
-      4. Showdown fallback with same 3-tier preference.
-
-    "Populated" = has at least one slate_players row. Slates that were
-    created by the watcher but not yet hydrated by the DK draftables fetch
-    are intentionally deprioritized — showing an empty shell when a full
-    slate exists is a bug.
-    """
+    """Return the most relevant active slate for a sport."""
     db = get_client()
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -292,34 +249,25 @@ def get_today_slate(sport: str) -> Optional[FrontendSlate]:
         )
         if not candidates:
             return None
-
-        # Tier 1: populated + upcoming (lock_time > now), soonest lock first
         upcoming = [
             c for c in candidates
             if c.get("lock_time") and c["lock_time"] > now_iso
         ]
-        # Sort ascending by lock_time — want the NEXT lock, not the latest
         upcoming.sort(key=lambda c: c["lock_time"])
         for c in upcoming:
             if _has_players(c["id"]):
                 return c["id"]
-
-        # Tier 2: populated (any lock_time), most recent first
         for c in candidates:
             if _has_players(c["id"]):
                 return c["id"]
-
-        # Tier 3: fallback to the most recent candidate, even if empty
         return candidates[0]["id"]
 
     classic_id = _pick("classic")
     if classic_id:
         return get_frontend_slate(classic_id)
-
     showdown_id = _pick("showdown")
     if showdown_id:
         return get_frontend_slate(showdown_id)
-
     return None
 
 
