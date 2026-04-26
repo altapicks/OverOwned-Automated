@@ -1,17 +1,17 @@
 """FastAPI application entrypoint.
 
 Runs as a single Railway service that does BOTH:
-  1. Serves HTTP (uvicorn running this app)
-  2. Runs the scheduled slate + odds watcher in-process via FastAPI lifespan
+1. Serves HTTP (uvicorn running this app)
+2. Runs the scheduled slate + odds watcher in-process via FastAPI lifespan
 
-The watcher uses APScheduler's AsyncIOScheduler, which shares the event loop
-with FastAPI. max_instances=1 + coalesce=True on each job prevents overlap.
+The watcher uses APScheduler's AsyncIOScheduler, which shares the
+event loop with FastAPI. max_instances=1 + coalesce=True on each job
+prevents overlap.
 
 If you ever split into separate services, set ENABLE_IN_PROCESS_WORKER=false
-on the api service and run `python -m app.workers.slate_watcher` as its own
-process.
+on the api service and run `python -m app.workers.slate_watcher` as its
+own process.
 """
-
 from __future__ import annotations
 
 import logging
@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__
 from app.config import get_settings
 from app.routes import (
+    admin_debug,
     admin_dk,
     admin_slate,
     health,
@@ -53,7 +54,6 @@ async def lifespan(app: FastAPI):
     if settings.enable_in_process_worker:
         try:
             from app.workers.slate_watcher import scheduled_watcher
-
             logger.info(
                 "Starting in-process slate watcher (sports=%s, types=%s, fallback=%s, dk_auto_ingest=%s)",
                 settings.sports_list,
@@ -75,29 +75,21 @@ async def lifespan(app: FastAPI):
 
 def _log_provider_diagnostics(settings):
     """Report provider config status at boot. Never crashes — purely informational."""
-
-    # Supabase (critical — app won't function without)
     logger.info(
         "Supabase config: url=%s, service_key=%s",
         "OK" if settings.supabase_url else "MISSING",
         "OK" if settings.supabase_service_key else "MISSING",
     )
-
-    # SportsGameOdds (primary tennis odds + PrizePicks props)
     sgo_key = settings.sgo_api_key or ""
     logger.info(
         "SportsGameOdds config: key=%s",
         f"set (len={len(sgo_key)})" if sgo_key else "MISSING — SGO ticks will skip",
     )
-
-    # The Odds API (legacy fallback)
     oa_key = settings.odds_api_key or ""
     logger.info(
         "The Odds API config (legacy): key=%s",
         f"set (len={len(oa_key)})" if oa_key else "not set",
     )
-
-    # Kalshi — eagerly try loading the key so PEM issues surface at boot
     kk = settings.kalshi_key_id or ""
     kpk = settings.kalshi_private_key or ""
     kb = settings.kalshi_api_base or ""
@@ -118,15 +110,11 @@ def _log_provider_diagnostics(settings):
                 )
         except Exception as e:
             logger.warning("Kalshi eager-load raised: %s", e)
-
-    # DK auto-ingest (daily Featured-Classic pull)
     logger.info(
         "DK auto-ingest config: enabled=%s, sports=%s, schedule=11:00 UTC daily",
         "true" if settings.dk_auto_ingest_enabled else "false (manual-only via /api/admin/dk/fetch-featured)",
         settings.sports_list,
     )
-
-    # Discord webhooks (optional)
     logger.info(
         "Discord webhooks: slates=%s, errors=%s",
         "set" if settings.discord_webhook_slates else "not set",
@@ -137,7 +125,6 @@ def _log_provider_diagnostics(settings):
 def create_app() -> FastAPI:
     settings = get_settings()
     _configure_logging(settings.log_level)
-
     if settings.sentry_dsn:
         sentry_sdk.init(
             dsn=settings.sentry_dsn,
@@ -145,14 +132,12 @@ def create_app() -> FastAPI:
             traces_sample_rate=0.1 if settings.environment == "production" else 0,
             release=__version__,
         )
-
     app = FastAPI(
         title="OverOwned API",
         version=__version__,
         description="Ingestion and slate API for OverOwned DFS.",
         lifespan=lifespan,
     )
-
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins_list,
@@ -160,7 +145,6 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
-
     app.include_router(health.router)
     app.include_router(slates.router)
     app.include_router(players.router)
@@ -168,6 +152,7 @@ def create_app() -> FastAPI:
     app.include_router(tracker.router)
     app.include_router(admin_slate.router)
     app.include_router(admin_dk.router)
+    app.include_router(admin_debug.router)
     return app
 
 
