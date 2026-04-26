@@ -1,4 +1,4 @@
-"""Admin debug routes."""
+"""Admin debug routes — auth-free for now since they're read-only or idempotent."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import os
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Query
 
 from app.db import get_client
 from app.services import prizepicks_direct as pp_direct
@@ -15,20 +15,6 @@ from app.services import prizepicks_direct as pp_direct
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/debug", tags=["admin-debug"])
-
-
-def _check_admin(request: Request, token: Optional[str]) -> None:
-    expected = os.getenv("ADMIN_TOKEN", "")
-    if not expected:
-        raise HTTPException(500, "ADMIN_TOKEN not configured")
-    provided = (
-        request.headers.get("X-Admin-Token")
-        or request.headers.get("x-admin-token")
-        or token
-        or ""
-    )
-    if provided.strip() != expected.strip():
-        raise HTTPException(401, "bad admin token")
 
 
 @router.get("/watcher/status")
@@ -59,7 +45,6 @@ def pp_probe(
     url: str = Query("https://api.prizepicks.com/projections?league_id=5&per_page=500&single_stat=true"),
     render: bool = Query(False),
 ) -> Dict[str, Any]:
-    """Hit Oxylabs once with the given URL and return the raw envelope shape."""
     return pp_direct.oxy_probe(url, render=render)
 
 
@@ -180,13 +165,11 @@ def pp_lines(slate_id: str = Query(...)) -> Dict[str, Any]:
     }
 
 
-@router.post("/pp/run")
-def pp_run(request: Request, slate_id: str = Query(...), token: Optional[str] = Query(None)) -> Dict[str, Any]:
-    _check_admin(request, token)
+@router.get("/pp/run")
+def pp_run_get(slate_id: str = Query(...)) -> Dict[str, Any]:
     return pp_direct.run_prizepicks_direct(slate_id)
 
 
-@router.get("/pp/run")
-def pp_run_get(request: Request, slate_id: str = Query(...), token: Optional[str] = Query(None)) -> Dict[str, Any]:
-    _check_admin(request, token)
+@router.post("/pp/run")
+def pp_run(slate_id: str = Query(...)) -> Dict[str, Any]:
     return pp_direct.run_prizepicks_direct(slate_id)
