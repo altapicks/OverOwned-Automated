@@ -772,9 +772,13 @@ async def _write_match_odds(
             current[k] = engine_fields[k]
 
     # Defensive: strip any stale ml_a / ml_b promoted by earlier deploys
-    for stale_key in ("ml_a", "ml_b"):
+for stale_key in ("ml_a", "ml_b"):
         if stale_key in current:
             current.pop(stale_key, None)
+
+    db.table("matches").update({"odds": current}).eq("id", match_id).execute()
+
+    # Opening odds preservation: write per-source first-seen snapshot once.
 
 db.table("matches").update({"odds": current}).eq("id", match_id).execute()
 
