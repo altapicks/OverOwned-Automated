@@ -1,27 +1,13 @@
-"""Admin routes for weather refresh.
-
-Exposed:
-    POST /api/admin/weather/refresh?slate_id=X&force=false
-        Refreshes weather for every match on the slate. Idempotent within
-        the MIN_REFRESH_MINUTES window unless force=true.
-
-    GET  /api/admin/weather/status?slate_id=X
-        Per-match weather state for a slate. Lightweight diagnostic — useful
-        when troubleshooting why a match isn't showing weather.
-
-Both endpoints are admin-gated via the existing admin_required dependency,
-matching the pattern used by /api/admin/contest-ownership.
-"""
-
+"""Admin routes for weather refresh."""
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app.db import get_client
-from app.deps import admin_required
 from app.services.weather import refresh_weather_for_slate
 from app.services.tennis_venues import lookup_venue
 
@@ -29,18 +15,21 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin/weather", tags=["admin", "weather"])
 
 
+def _check_admin(x_admin_token: Optional[str]) -> None:
+    expected = os.getenv("ADMIN_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(500, "ADMIN_TOKEN env var not set on server")
+    if not x_admin_token or x_admin_token.strip() != expected:
+        raise HTTPException(401, "missing or invalid X-Admin-Token header")
+
+
 @router.post("/refresh")
 def post_refresh(
     slate_id: str = Query(...),
     force: bool = Query(False),
-    _: Any = Depends(admin_required),
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
 ) -> Dict[str, Any]:
-    """Trigger a weather refresh for the given slate.
-
-    `force=true` bypasses the per-match freshness check and re-fetches every
-    match's forecast, regardless of how recently it was last updated. Use
-    sparingly — eats API budget.
-    """
+    _check_admin(x_admin_token)
     if not slate_id:
         raise HTTPException(400, "slate_id required")
     return refresh_weather_for_slate(slate_id, force=force)
@@ -49,9 +38,9 @@ def post_refresh(
 @router.get("/status")
 def get_status(
     slate_id: str = Query(...),
-    _: Any = Depends(admin_required),
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
 ) -> Dict[str, Any]:
-    """Return per-match weather diagnostic data for a slate."""
+    _check_admin(x_admin_token)
     if not slate_id:
         raise HTTPException(400, "slate_id required")
 
