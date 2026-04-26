@@ -5,7 +5,6 @@ Captures all 3 PP variants per (player, stat_type): standard / demon / goblin.
 Median across the three feeds the DK engine via slate_reader's posted_lines
 projection — see slate_reader._project_posted_lines_for_match.
 """
-
 from __future__ import annotations
 
 import json as _json
@@ -27,7 +26,6 @@ OXY_PASS = os.getenv("OXYLABS_PASSWORD", "")
 OXY_ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
 
 PP_BASE = "https://api.prizepicks.com"
-
 TENNIS_LEAGUE_NAME_ALLOW = {"TENNIS"}
 
 ALLOWED_STAT_TYPES = {
@@ -56,28 +54,12 @@ PP_HEADERS = {
 
 # ---------------------------------------------------------------------------
 # Player resolver
-#
-# The normalizer can return three classes of result:
-#   1. auto_resolved=True            — exact alias or high-confidence fuzzy.
-#                                      Always safe to use canonical_id.
-#   2. was_new=True                  — we just created this player.
-#                                      Safe to use canonical_id.
-#   3. auto_resolved=False           — low-confidence guess. canonical_id
-#                                      may point at a DIFFERENT player
-#                                      who happens to share a first name
-#                                      (this is how "Arthur Rinderknech"
-#                                      was being aliased to arthur_fils).
-#                                      NEVER use canonical_id here.
-#
-# The current normalizer with create_if_missing=True will always either
-# auto_resolve or create — it no longer returns class (3). But we keep
-# this guard so the ingest is robust regardless of future resolver tweaks.
 # ---------------------------------------------------------------------------
 def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
     """
-    Resolves PP raw player names to canonical_id.
-    Auto-creates new players if not already in the DB so PP-only
-    entrants (qualifiers, ITF crossover, etc.) still land.
+    Resolves PP raw player names to canonical_id. Auto-creates new players
+    if not already in the DB so PP-only entrants (qualifiers, ITF crossover,
+    etc.) still land.
     """
     if not raw_name:
         return None
@@ -88,8 +70,6 @@ def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
         )
         if result.auto_resolved or result.was_new:
             return result.canonical_id
-        # Low-confidence guess — refuse to attach a line to a possibly-
-        # wrong player. Better to drop the row than poison the engine.
         log.warning(
             "_resolve_player low_confidence raw=%r best=%r score=%s",
             raw_name,
@@ -128,39 +108,39 @@ def oxy_probe(url: str, render: bool = False, timeout: float = 60.0) -> Dict[str
                 auth=(OXY_USER, OXY_PASS),
                 json=_oxy_payload(url, render=render),
             )
-        out: Dict[str, Any] = {
-            "envelope_status": r.status_code,
-            "envelope_size": len(r.content),
-        }
-        try:
-            env = r.json()
-        except Exception:
-            out["envelope_raw_first_1000"] = r.text[:1000]
-            return out
-        results = env.get("results", []) or []
-        out["job"] = env.get("job", {})
-        out["result_count"] = len(results)
-        if results:
-            first = results[0]
-            content = first.get("content")
-            content_preview: Any = None
-            if isinstance(content, str):
-                content_preview = content[:600]
-            elif isinstance(content, dict):
-                content_preview = {
-                    k: (str(v)[:200] if not isinstance(v, (dict, list)) else type(v).__name__)
-                    for k, v in list(content.items())[:10]
-                }
-            out["first_result"] = {
-                "status_code": first.get("status_code"),
-                "url": first.get("url"),
-                "task_id": first.get("task_id"),
-                "created_at": first.get("created_at"),
-                "updated_at": first.get("updated_at"),
-                "content_type": type(content).__name__,
-                "content_preview": content_preview,
+            out: Dict[str, Any] = {
+                "envelope_status": r.status_code,
+                "envelope_size": len(r.content),
             }
-        return out
+            try:
+                env = r.json()
+            except Exception:
+                out["envelope_raw_first_1000"] = r.text[:1000]
+                return out
+            results = env.get("results", []) or []
+            out["job"] = env.get("job", {})
+            out["result_count"] = len(results)
+            if results:
+                first = results[0]
+                content = first.get("content")
+                content_preview: Any = None
+                if isinstance(content, str):
+                    content_preview = content[:600]
+                elif isinstance(content, dict):
+                    content_preview = {
+                        k: (str(v)[:200] if not isinstance(v, (dict, list)) else type(v).__name__)
+                        for k, v in list(content.items())[:10]
+                    }
+                out["first_result"] = {
+                    "status_code": first.get("status_code"),
+                    "url": first.get("url"),
+                    "task_id": first.get("task_id"),
+                    "created_at": first.get("created_at"),
+                    "updated_at": first.get("updated_at"),
+                    "content_type": type(content).__name__,
+                    "content_preview": content_preview,
+                }
+            return out
     except Exception as e:
         return {"error": f"probe_exception: {e}"}
 
@@ -177,30 +157,30 @@ def _oxy_fetch_json(
                 auth=(OXY_USER, OXY_PASS),
                 json=_oxy_payload(url, render=render),
             )
-        if r.status_code != 200:
-            return r.status_code, {}, f"oxy_envelope_http_{r.status_code}: {r.text[:300]}"
-        env = r.json()
-        results = env.get("results", []) or []
-        if not results:
-            return 0, {}, f"oxy_zero_results: job={env.get('job', {})}"
-        first = results[0]
-        inner_status = first.get("status_code", 0)
-        content = first.get("content")
-        if inner_status != 200:
-            preview = ""
+            if r.status_code != 200:
+                return r.status_code, {}, f"oxy_envelope_http_{r.status_code}: {r.text[:300]}"
+            env = r.json()
+            results = env.get("results", []) or []
+            if not results:
+                return 0, {}, f"oxy_zero_results: job={env.get('job', {})}"
+            first = results[0]
+            inner_status = first.get("status_code", 0)
+            content = first.get("content")
+            if inner_status != 200:
+                preview = ""
+                if isinstance(content, str):
+                    preview = content[:300]
+                elif isinstance(content, dict):
+                    preview = _json.dumps(content)[:300]
+                return inner_status, {}, f"pp_inner_http_{inner_status}: {preview}"
             if isinstance(content, str):
-                preview = content[:300]
-            elif isinstance(content, dict):
-                preview = _json.dumps(content)[:300]
-            return inner_status, {}, f"pp_inner_http_{inner_status}: {preview}"
-        if isinstance(content, str):
-            try:
-                content = _json.loads(content)
-            except Exception as e:
-                return 0, {}, f"json_decode_failed: {e} :: {content[:300]}"
-        if not isinstance(content, dict):
-            return 0, {}, f"unexpected_content_type: {type(content).__name__}"
-        return 200, content, ""
+                try:
+                    content = _json.loads(content)
+                except Exception as e:
+                    return 0, {}, f"json_decode_failed: {e} :: {content[:300]}"
+            if not isinstance(content, dict):
+                return 0, {}, f"unexpected_content_type: {type(content).__name__}"
+            return 200, content, ""
     except Exception as e:
         return 0, {}, f"oxy_exception: {e}"
 
@@ -287,6 +267,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
     if not (OXY_USER and OXY_PASS):
         summary["errors"].append("oxylabs_creds_missing")
         return summary
+
     league_ids = get_tennis_league_ids()
     if not league_ids:
         summary["errors"].append("no_tennis_leagues_resolved")
@@ -313,6 +294,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         player_idx = _build_player_index(included)
 
         grouped: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = defaultdict(dict)
+
         for proj in data:
             attr = proj.get("attributes", {}) or {}
             stat_type = (attr.get("stat_type") or "").strip()
@@ -322,6 +304,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             line_score = attr.get("line_score")
             if line_score is None:
                 continue
+
             rel = (proj.get("relationships") or {}).get("new_player") or {}
             pdata = rel.get("data") or {}
             pp_pid = str(pdata.get("id") or "")
@@ -331,9 +314,11 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
             raw_name = (pinfo.get("name") or "").strip()
             if not raw_name:
                 continue
+
             resolved = _resolve_player(raw_name)
             if not resolved:
                 continue
+
             grouped[(stat_type, odds_type)][resolved] = {
                 "slate_id": slate_id,
                 "player_id": resolved,
@@ -351,6 +336,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         league_wrote = 0
         league_deact = 0
         league_failures = 0
+
         for (stat_type, odds_type), per_player in grouped.items():
             rows = list(per_player.values())
             try:
@@ -402,6 +388,7 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
     summary["odds_type_histogram"] = dict(overall_odds_hist)
     summary["stat_histogram"] = dict(overall_stat_hist)
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+
     log.info(
         "PP ingest done slate=%s wrote=%d deact=%d fail=%d odds=%s stat=%s",
         slate_id,
@@ -412,3 +399,45 @@ def run_prizepicks_direct(slate_id: str) -> Dict[str, Any]:
         summary["stat_histogram"],
     )
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Scheduler shim
+#
+# slate_watcher and /api/slates/refresh both call:
+#     await pp_direct_svc.fetch_tick("TEN")
+#
+# This shim resolves the active classic tennis slate, then runs the
+# (sync) ingest in a thread so it doesn't block the event loop.
+# ---------------------------------------------------------------------------
+async def fetch_tick(sport_code: str = "TEN") -> Dict[str, Any]:
+    import asyncio
+
+    if sport_code != "TEN":
+        return {"skipped": "not_tennis"}
+
+    db = get_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    rows = (
+        db.table("slates")
+        .select("id, lock_time, slate_date, first_seen_at")
+        .eq("sport", "tennis")
+        .eq("status", "active")
+        .eq("contest_type", "classic")
+        .eq("is_fallback", False)
+        .order("slate_date", desc=True)
+        .order("first_seen_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+    if not rows:
+        log.info("pp_direct fetch_tick: no active classic tennis slate")
+        return {"skipped": "no_active_slate"}
+
+    upcoming = [r for r in rows if r.get("lock_time") and r["lock_time"] > now_iso]
+    upcoming.sort(key=lambda c: c["lock_time"])
+    slate_id = upcoming[0]["id"] if upcoming else rows[0]["id"]
+
+    return await asyncio.to_thread(run_prizepicks_direct, slate_id)
