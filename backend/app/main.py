@@ -25,7 +25,6 @@ from app import __version__
 from app.config import get_settings
 from app.routes import (
     admin_debug,
-    admin_debug_extra,
     admin_dk,
     admin_slate,
     health,
