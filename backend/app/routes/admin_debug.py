@@ -14,17 +14,12 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from app.db.supabase_client import get_service_client
+from app.db import get_client
 from app.services import prizepicks_direct as pp_direct
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/debug", tags=["admin-debug"])
-
-
-# ---------------------------------------------------------------------------
-# Auth helper
-# ---------------------------------------------------------------------------
 
 
 def _check_admin(request: Request, token: Optional[str]) -> None:
@@ -39,11 +34,6 @@ def _check_admin(request: Request, token: Optional[str]) -> None:
     )
     if provided != expected:
         raise HTTPException(401, "bad admin token")
-
-
-# ---------------------------------------------------------------------------
-# Watcher status
-# ---------------------------------------------------------------------------
 
 
 @router.get("/watcher/status")
@@ -78,12 +68,6 @@ def watcher_status(request: Request, token: Optional[str] = Query(None)) -> Dict
     }
 
 
-# ---------------------------------------------------------------------------
-# PP diagnose: confirm Oxylabs bypass, see real PP envelope shape,
-# show odds_type histogram per league, sample with odds_type included.
-# ---------------------------------------------------------------------------
-
-
 @router.get("/pp/diagnose")
 def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[str, Any]:
     _check_admin(request, token)
@@ -99,7 +83,6 @@ def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[st
         "name_resolution": {},
     }
 
-    # Leagues
     status, leagues = pp_direct.fetch_leagues()
     out["leagues_status"] = {
         "http": status,
@@ -120,17 +103,13 @@ def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[st
             })
     out["tennis_leagues"] = tennis_lgs
 
-    # Per-league projections
     raw_first_dump_set = False
     sample_unresolved: List[str] = []
     sample_resolved: List[str] = []
     tested_n = 0
 
-    from app.services.player_resolver import resolve_player_name
-
     for lg in tennis_lgs:
         if lg["name"].upper() == "TENNIS LIVE":
-            # Skip the live in-game prop league entirely
             out["per_league"].append({
                 "league_id": lg["id"],
                 "league_name": lg["name"],
@@ -170,7 +149,6 @@ def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[st
                     "line": attr.get("line_score"),
                 })
 
-            # Probe resolver on first ~5 unique players
             if tested_n < 5:
                 rel = (proj.get("relationships") or {}).get("new_player") or {}
                 pp_pid = str((rel.get("data") or {}).get("id") or "")
@@ -178,7 +156,7 @@ def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[st
                 raw_name = (pinfo.get("name") or "").strip()
                 if raw_name and raw_name not in sample_resolved + sample_unresolved:
                     tested_n += 1
-                    res = resolve_player_name(raw_name)
+                    res = pp_direct._resolve_player(raw_name)
                     if res:
                         sample_resolved.append(raw_name)
                     else:
@@ -206,11 +184,6 @@ def pp_diagnose(request: Request, token: Optional[str] = Query(None)) -> Dict[st
     return out
 
 
-# ---------------------------------------------------------------------------
-# Force a PP ingest tick for a slate
-# ---------------------------------------------------------------------------
-
-
 @router.post("/pp/run")
 def pp_run(
     request: Request,
@@ -221,7 +194,6 @@ def pp_run(
     return pp_direct.run_prizepicks_direct(slate_id)
 
 
-# Allow GET for convenience in browser
 @router.get("/pp/run")
 def pp_run_get(
     request: Request,
@@ -232,11 +204,6 @@ def pp_run_get(
     return pp_direct.run_prizepicks_direct(slate_id)
 
 
-# ---------------------------------------------------------------------------
-# Inspect current prizepicks_lines for a slate
-# ---------------------------------------------------------------------------
-
-
 @router.get("/pp/lines")
 def pp_lines(
     request: Request,
@@ -244,9 +211,9 @@ def pp_lines(
     token: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     _check_admin(request, token)
-    sb = get_service_client()
+    db = get_client()
     resp = (
-        sb.table("prizepicks_lines")
+        db.table("prizepicks_lines")
         .select("player_id,raw_player_name,stat_type,odds_type,current_line,is_active")
         .eq("slate_id", slate_id)
         .eq("is_active", True)
