@@ -77,6 +77,7 @@ import logging
 import os
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -139,7 +140,7 @@ def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
     if not raw_name:
         return None
     try:
-        normalizer = PlayerNormalizer(sport=sport)
+        normalizer = _get_normalizer(sport)
         result = normalizer.resolve(
             raw_name, source="prizepicks", create_if_missing=True
         )
@@ -153,6 +154,40 @@ def _resolve_player(raw_name: str, sport: str = "tennis") -> Optional[str]:
     except Exception as e:
         log.warning("resolve_player failed for %s: %s", raw_name, e)
         return None
+
+
+# v6.5.6 — module-level cached normalizer per sport.
+#
+# Why this exists:
+# Before this fix, _resolve_player() instantiated PlayerNormalizer(sport)
+# on every call. PlayerNormalizer._ensure_loaded() does a Supabase SELECT
+# of every player for the sport (~203 rows for tennis) on first .resolve()
+# call, then caches the lookup tables on `self`. Because we threw away
+# the instance each call, the cache never paid off — every PP projection
+# triggered a fresh 203-row fetch.
+#
+# A typical PP scraper tick processes ~600-700 projections, so that's
+# ~600 Supabase round trips and ~120k player rows transferred per tick.
+# Under load this saturated the Supabase connection pool, surfaced as
+# ConnectionTerminated errors in resolve_player, and starved the
+# FastAPI request handler — users saw 503s on /api/slates/today and the
+# frontend fell back to its static slate cache.
+#
+# Why lru_cache(None) is safe here:
+# - PlayerNormalizer is designed to be long-lived. Its internal mutators
+#   (`_create_player`, `_record_alias`) update the same in-memory cache
+#   they read from, so reusing one instance across ticks keeps newly-
+#   resolved players hot.
+# - The unbounded cache only ever holds at most ~3 entries (one per
+#   sport: tennis, mma, nba). No memory concern.
+# - Process restarts (Railway redeploys) clear the cache and force a
+#   fresh load on first scraper run, which is exactly the right behavior.
+#
+# If you ever need to invalidate manually (e.g. after a bulk player
+# import), call _get_normalizer.cache_clear().
+@lru_cache(maxsize=None)
+def _get_normalizer(sport: str) -> PlayerNormalizer:
+    return PlayerNormalizer(sport=sport)
 
 
 def _is_doubles_name(raw_name: str) -> bool:
