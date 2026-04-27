@@ -158,3 +158,112 @@ export function parseCsvLines(text) {
   }
   return rows;
 }
+// ═══════════════════════════════════════════════════════════════════════
+// v6.13 — ADD THESE TWO FUNCTIONS to your existing prizepicks-api.js
+//
+// File location: frontend/src/lib/prizepicks-api.js
+//
+// Just paste these at the bottom of the file (after the existing exports).
+//
+// Auth: matches the existing createLine / patchLine / deleteLine pattern
+// — Authorization: Bearer <supabase-jwt> header. The backend verifies the
+// JWT via supabase auth and gates against the admin_users table.
+//
+// IMPORTANT: this file imports `supabase` from './supabase' — make sure
+// that import is already present at the top of your prizepicks-api.js
+// (it almost certainly is, since the existing functions do the same thing).
+// If your existing file uses a different helper to grab the JWT (e.g.
+// a `getAuthHeaders()` helper), look at how createLine builds its
+// fetch headers and copy that pattern instead — see "Adapting to your
+// existing pattern" note below.
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Fetch the admin's gem + trap picks for a slate. Public — no auth needed.
+ *
+ * Returns:
+ *   {
+ *     slate_id, gem_player_name, trap_player_name,
+ *     gem_set_at, trap_set_at, gem_set_by, trap_set_by
+ *   }
+ *   Fields are null when nothing has been picked yet. The shape is
+ *   stable so callers don't need to handle 404s.
+ */
+export async function fetchAdminPicks(slateId) {
+  if (!slateId) return null;
+  // API_BASE — same constant your existing fetchLines / fetchRecentMovements
+  // functions use. If your file uses a different constant name, swap it in.
+  const r = await fetch(
+    `${API_BASE}/api/prizepicks/admin-picks?slate_id=${encodeURIComponent(slateId)}`,
+    { method: 'GET' }
+  );
+  if (!r.ok) {
+    throw new Error(`fetchAdminPicks failed: ${r.status} ${await r.text().catch(() => '')}`);
+  }
+  return r.json();
+}
+
+/**
+ * Set or clear the admin's gem or trap pick for a slate.
+ * Admin-gated server-side via Bearer JWT.
+ *
+ * @param {Object} args
+ * @param {string} args.slateId - the active slate UUID
+ * @param {'gem'|'trap'} args.kind - which pick to set
+ * @param {string|null} args.rawPlayerName - player name to mark, or null/'' to clear
+ * @returns {Promise<Object>} the updated picks row
+ */
+export async function setAdminPick({ slateId, kind, rawPlayerName }) {
+  if (!slateId) throw new Error('slateId required');
+  if (kind !== 'gem' && kind !== 'trap') {
+    throw new Error("kind must be 'gem' or 'trap'");
+  }
+
+  // Get current Supabase session for the JWT. Same approach as createLine.
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.access_token) {
+    throw new Error('Not signed in');
+  }
+  const userEmail = session?.user?.email || null;
+
+  const r = await fetch(`${API_BASE}/api/prizepicks/admin-picks`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify({
+      slate_id: slateId,
+      kind,
+      raw_player_name: rawPlayerName,
+      set_by_label: userEmail,
+    }),
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    throw new Error(`setAdminPick failed: ${r.status} ${text}`);
+  }
+  return r.json();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Adapting to your existing pattern
+// ═══════════════════════════════════════════════════════════════════════
+//
+// If your existing prizepicks-api.js has a helper like:
+//
+//   async function getAuthHeaders() {
+//     const { data: { session } } = await supabase.auth.getSession();
+//     return { 'Authorization': `Bearer ${session.access_token}` };
+//   }
+//
+// then replace the inline session/header logic in setAdminPick with:
+//
+//   const headers = {
+//     'Content-Type': 'application/json',
+//     ...(await getAuthHeaders()),
+//   };
+//
+// The semantics are identical; this just keeps style consistent with the
+// rest of your file.
+// ═══════════════════════════════════════════════════════════════════════
