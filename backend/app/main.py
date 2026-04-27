@@ -30,6 +30,7 @@ from app.routes import (
     admin_slate,
     health,
     players,
+    pp_admin_picks_routes,
     prizepicks,
     slates,
     tracker,
@@ -151,6 +152,7 @@ def create_app() -> FastAPI:
     app.include_router(slates.router)
     app.include_router(players.router)
     app.include_router(prizepicks.router)
+    app.include_router(pp_admin_picks_routes.router)
     app.include_router(tracker.router)
     app.include_router(admin_slate.router)
     app.include_router(admin_dk.router)
