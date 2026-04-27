@@ -26,6 +26,8 @@ import {
   fetchLines, fetchRecentMovements,
   createLine, updateLine, deleteLine, bulkUpsertLines,
   checkIsAdmin, subscribeToLines, subscribeToMovements, parseCsvLines,
+  // v6.13: admin daily picks (gem + trap)
+  fetchAdminPicks, setAdminPick,
 } from '../lib/prizepicks-api';
 
 const STAT_TABS = [
@@ -56,6 +58,8 @@ export function PrizePicksTab({ slateId, players = [] }) {
   const [sortDir, setSortDir] = useState('desc');
   const [activeStat, setActiveStat] = useState(DEFAULT_TAB);
   const [searchQ, setSearchQ] = useState('');
+  // v6.13: admin daily picks. { gem_player_name, trap_player_name, ... } or null.
+  const [adminPicks, setAdminPicks] = useState(null);
 
   useEffect(() => {
     if (!slateId) return;
@@ -65,11 +69,13 @@ export function PrizePicksTab({ slateId, players = [] }) {
       fetchLines(slateId, 'all'),
       fetchRecentMovements(slateId, 50),
       checkIsAdmin(),
-    ]).then(([ls, ms, admin]) => {
+      fetchAdminPicks(slateId),
+    ]).then(([ls, ms, admin, picks]) => {
       if (cancelled) return;
       setLines(ls);
       setMovements(ms);
       setIsAdmin(admin);
+      setAdminPicks(picks);
     }).catch(e => !cancelled && setError(e.message)).finally(() => !cancelled && setLoading(false));
     return () => { cancelled = true; };
   }, [slateId]);
@@ -221,13 +227,66 @@ export function PrizePicksTab({ slateId, players = [] }) {
     });
   }, [enrichedLines, activeStat, searchQ]);
 
-  // Top 3 PP fades — only meaningful on Fantasy Score now (other tabs have
-  // null edge so this Set will always be empty for them).
-  const topFadeIds = useMemo(() => {
-    const withEdge = filteredLines.filter(l => l.edge != null && l.edge < -0.5);
-    withEdge.sort((a, b) => a.edge - b.edge);
-    return new Set(withEdge.slice(0, 3).map(l => l.id));
-  }, [filteredLines]);
+  // v6.13: replace algorithmic "Top PP Fade" with admin-curated picks.
+  // The gem/trap row of the active stat tab gets highlighted; rows of
+  // other stats from the same player aren't highlighted. This means
+  // for non-Fantasy-Score tabs, the gem/trap may not appear — that's
+  // intentional, the admin picks are made against the FS slate context.
+  const gemPlayerName  = adminPicks?.gem_player_name || null;
+  const trapPlayerName = adminPicks?.trap_player_name || null;
+
+  // Set of line IDs to badge as gem / trap on the current tab. Use line.id
+  // because the same player has multiple lines (one per stat type).
+  const gemLineIds = useMemo(() => {
+    if (!gemPlayerName) return new Set();
+    return new Set(
+      filteredLines
+        .filter(l => l.raw_player_name === gemPlayerName)
+        .map(l => l.id)
+    );
+  }, [filteredLines, gemPlayerName]);
+
+  const trapLineIds = useMemo(() => {
+    if (!trapPlayerName) return new Set();
+    return new Set(
+      filteredLines
+        .filter(l => l.raw_player_name === trapPlayerName)
+        .map(l => l.id)
+    );
+  }, [filteredLines, trapPlayerName]);
+
+  // v6.13: admin actions — toggle gem/trap on a player. Click the
+  // gem/trap icon in the player column to set; click again on the
+  // currently-marked player to clear.
+  const onToggleGem = useCallback(async (playerName) => {
+    if (!isAdmin) return;
+    const isCurrentlyMarked = adminPicks?.gem_player_name === playerName;
+    try {
+      const updated = await setAdminPick({
+        slateId,
+        kind: 'gem',
+        rawPlayerName: isCurrentlyMarked ? null : playerName,
+      });
+      setAdminPicks(updated);
+    } catch (e) {
+      setError(`Set gem failed: ${e.message}`);
+    }
+  }, [isAdmin, adminPicks, slateId]);
+
+  const onToggleTrap = useCallback(async (playerName) => {
+    if (!isAdmin) return;
+    const isCurrentlyMarked = adminPicks?.trap_player_name === playerName;
+    try {
+      const updated = await setAdminPick({
+        slateId,
+        kind: 'trap',
+        rawPlayerName: isCurrentlyMarked ? null : playerName,
+      });
+      setAdminPicks(updated);
+    } catch (e) {
+      setError(`Set trap failed: ${e.message}`);
+    }
+  }, [isAdmin, adminPicks, slateId]);
 
   const sortedLines = useMemo(() => {
     const arr = [...filteredLines];
@@ -343,6 +402,54 @@ export function PrizePicksTab({ slateId, players = [] }) {
           </span>
         </div>
 
+        {/* v6.13: Today's admin picks. Hidden when neither is set so the
+            banner doesn't take space on a blank slate. */}
+        {(gemPlayerName || trapPlayerName) && (
+          <div style={{
+            display: 'flex', gap: 12, marginBottom: 12,
+            fontSize: 12,
+          }}>
+            {gemPlayerName && (
+              <div style={{
+                flex: 1,
+                background: 'rgba(74,222,128,0.08)',
+                border: '1px solid rgba(74,222,128,0.30)',
+                color: 'var(--text-muted)',
+                padding: '8px 12px',
+                borderRadius: 6,
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <span style={{ fontSize: 14 }}>💎</span>
+                <div>
+                  <div style={{ color: '#4ADE80', fontWeight: 600, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase' }}>
+                    Hidden Gem
+                  </div>
+                  <div style={{ color: 'var(--text)', fontWeight: 600 }}>{gemPlayerName}</div>
+                </div>
+              </div>
+            )}
+            {trapPlayerName && (
+              <div style={{
+                flex: 1,
+                background: 'rgba(239,68,68,0.08)',
+                border: '1px solid rgba(239,68,68,0.30)',
+                color: 'var(--text-muted)',
+                padding: '8px 12px',
+                borderRadius: 6,
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <span style={{ fontSize: 14 }}>⚠️</span>
+                <div>
+                  <div style={{ color: '#EF4444', fontWeight: 600, fontSize: 11, letterSpacing: 0.4, textTransform: 'uppercase' }}>
+                    Biggest Trap
+                  </div>
+                  <div style={{ color: 'var(--text)', fontWeight: 600 }}>{trapPlayerName}</div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {error && <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#EF4444', padding: 10, borderRadius: 6, marginBottom: 12, fontSize: 12 }}>{error} <span style={{ cursor: 'pointer', marginLeft: 10 }} onClick={() => setError(null)}>✕</span></div>}
 
         <div className="table-wrap">
@@ -370,31 +477,83 @@ export function PrizePicksTab({ slateId, players = [] }) {
                 </td></tr>
               )}
               {sortedLines.map(line => {
-                const isFade = topFadeIds.has(line.id);
+                const isGem  = gemLineIds.has(line.id);
+                const isTrap = trapLineIds.has(line.id);
                 const isFlash = flashId === line.id;
                 const cellBg = isFlash
                   ? 'rgba(245,197,24,0.15)'
-                  : isFade
-                    ? 'rgba(74,222,128,0.10)'
-                    : 'transparent';
+                  : isGem
+                    ? 'rgba(74,222,128,0.10)'   // green tint for gem rows
+                    : isTrap
+                      ? 'rgba(239,68,68,0.10)'  // red tint for trap rows
+                      : 'transparent';
                 const cellStyle = { background: cellBg, transition: 'background 0.3s' };
+                const isThisPlayerMarkedGem  = adminPicks?.gem_player_name  === line.raw_player_name;
+                const isThisPlayerMarkedTrap = adminPicks?.trap_player_name === line.raw_player_name;
                 return (
                 <tr key={line.id}>
                   <td style={{ ...cellStyle, textAlign: 'center', padding: '6px 4px' }}>
-                    {isFade && (
-                      <span title="Top PP Fade — model projects significantly under the posted line">
+                    {isGem && (
+                      <span title="Hidden Gem (admin pick)">
                         <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
                              stroke="#4ADE80" strokeWidth="1.75"
                              strokeLinecap="round" strokeLinejoin="round"
                              style={{ display: 'block', margin: '0 auto' }}>
-                          <path d="M6 3h12l3 6-9 12L3 9z"/>
-                          <path d="M3 9h18"/>
-                          <path d="M9 3l3 6 3-6"/>
+                          <path d="M6 3h12l4 6-10 13L2 9z"/>
+                          <path d="M11 3l-2 6h6l-2-6"/>
+                          <path d="M2 9h20"/>
+                        </svg>
+                      </span>
+                    )}
+                    {isTrap && (
+                      <span title="Biggest Trap (admin pick)">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+                             stroke="#EF4444" strokeWidth="1.75"
+                             strokeLinecap="round" strokeLinejoin="round"
+                             style={{ display: 'block', margin: '0 auto' }}>
+                          <circle cx="12" cy="12" r="10"/>
+                          <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
                         </svg>
                       </span>
                     )}
                   </td>
-                  <td className="name" style={cellStyle}>{line.raw_player_name}</td>
+                  <td className="name" style={cellStyle}>
+                    {line.raw_player_name}
+                    {isAdmin && (
+                      <span style={{ marginLeft: 8, display: 'inline-flex', gap: 4, verticalAlign: 'middle' }}>
+                        <button
+                          onClick={() => onToggleGem(line.raw_player_name)}
+                          title={isThisPlayerMarkedGem ? 'Unmark as Hidden Gem' : 'Mark as Hidden Gem'}
+                          style={{
+                            background: isThisPlayerMarkedGem ? 'rgba(74,222,128,0.20)' : 'transparent',
+                            border: `1px solid ${isThisPlayerMarkedGem ? '#4ADE80' : 'var(--border-light)'}`,
+                            color: isThisPlayerMarkedGem ? '#4ADE80' : 'var(--text-dim)',
+                            cursor: 'pointer',
+                            padding: '2px 6px',
+                            borderRadius: 4,
+                            fontSize: 11,
+                            fontWeight: 600,
+                            lineHeight: 1,
+                          }}
+                        >💎</button>
+                        <button
+                          onClick={() => onToggleTrap(line.raw_player_name)}
+                          title={isThisPlayerMarkedTrap ? 'Unmark as Biggest Trap' : 'Mark as Biggest Trap'}
+                          style={{
+                            background: isThisPlayerMarkedTrap ? 'rgba(239,68,68,0.20)' : 'transparent',
+                            border: `1px solid ${isThisPlayerMarkedTrap ? '#EF4444' : 'var(--border-light)'}`,
+                            color: isThisPlayerMarkedTrap ? '#EF4444' : 'var(--text-dim)',
+                            cursor: 'pointer',
+                            padding: '2px 6px',
+                            borderRadius: 4,
+                            fontSize: 11,
+                            fontWeight: 600,
+                            lineHeight: 1,
+                          }}
+                        >⚠️</button>
+                      </span>
+                    )}
+                  </td>
                   <td className="muted" style={cellStyle}>{line.stat_type}</td>
                   <td className="num" style={cellStyle}>
                     {isAdmin ? (
