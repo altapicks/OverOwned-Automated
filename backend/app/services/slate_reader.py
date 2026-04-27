@@ -883,10 +883,23 @@ def get_frontend_slate(slate_id: str) -> Optional[FrontendSlate]:
         cpi_rows, frontend_matches, slate.get("slate_label")
     )
 
+    # v6.13: PrizePicks admin daily picks. Replaces algorithmic PP fade
+    # detection with admin's curated gem + trap. Read is anon-public via
+    # RLS, so this works regardless of the requester's auth state. Empty
+    # row (no admin picks set yet) is fine — frontend handles null.
+    pp_picks = None
+    try:
+        from app.services.pp_admin_picks import get_picks as _get_pp_picks
+        pp_picks = _get_pp_picks(slate.get("id"))
+    except Exception as e:
+        logger.info("pp_admin_picks unavailable (likely migration not run): %s", e)
+
     meta = dict(meta) if meta else {}
     meta["tournament_cpi_base"] = cpi_rows
     if next_tournament_block:
         meta["next_tournament"] = next_tournament_block
+    if pp_picks:
+        meta["pp_admin_picks"] = pp_picks
 
     return FrontendSlate(
         date=slate["slate_date"],
